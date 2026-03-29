@@ -32,6 +32,8 @@ CATALOG(pg_qx_session,9526,QxSessionRelationId)
 	Oid			oid;			/* oid */
 	Oid			qxsessiondbid BKI_LOOKUP(pg_database);	/* database */
 	Oid			qxsessionagentid BKI_LOOKUP(pg_qx_agent);	/* owning agent */
+	Oid			qxsessionnamespacepolicyid BKI_LOOKUP(pg_qx_namespace);	/* snapped namespace policy */
+	Oid			qxsessionidentityid BKI_LOOKUP(pg_qx_identity);	/* runtime identity */
 	Oid			qxsessionowner BKI_LOOKUP(pg_authid);	/* starter */
 	char		qxsessionstatus;	/* see QX_SESSION_STATUS_* */
 

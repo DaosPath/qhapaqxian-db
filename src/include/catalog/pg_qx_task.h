@@ -37,9 +37,19 @@ CATALOG(pg_qx_task,9532,QxTaskRelationId)
 	Oid			qxtaskdbid BKI_LOOKUP(pg_database);	/* database */
 	Oid			qxtasksessionid BKI_LOOKUP(pg_qx_session);	/* parent session */
 	Oid			qxtaskagentid BKI_LOOKUP(pg_qx_agent);	/* denormalized owner */
+	Oid			qxtasknamespacepolicyid BKI_LOOKUP(pg_qx_namespace);	/* snapped namespace policy */
+	Oid			qxtaskidentityid BKI_LOOKUP(pg_qx_identity);	/* execution identity */
 	Oid			qxtaskowner BKI_LOOKUP(pg_authid);	/* request owner */
 	Oid			qxtasklastattemptid BKI_DEFAULT(0) BKI_LOOKUP_OPT(pg_qx_attempt);	/* last attempt */
 	Oid			qxtasklastcheckpointid BKI_DEFAULT(0) BKI_LOOKUP_OPT(pg_qx_checkpoint);	/* last durable checkpoint */
+	int32		qxtaskbudgettokens BKI_DEFAULT(0);	/* snapshot token ceiling */
+	int32		qxtaskbudgetcost BKI_DEFAULT(0);	/* snapshot cost ceiling */
+	int32		qxtaskauthorizedtooltokens BKI_DEFAULT(0);	/* snapped tool token units */
+	int32		qxtaskauthorizedtoolcost BKI_DEFAULT(0);	/* snapped tool cost units */
+	int32		qxtaskestimatedtokens BKI_DEFAULT(0);	/* reserved token estimate */
+	int32		qxtaskestimatedcost BKI_DEFAULT(0);	/* reserved cost estimate */
+	int32		qxtaskconsumedtokens BKI_DEFAULT(0);	/* metered runtime token usage */
+	int32		qxtaskconsumedcost BKI_DEFAULT(0);	/* metered runtime cost usage */
 	char		qxtaskstate;	/* see QX_TASK_STATE_* */
 
 #ifdef CATALOG_VARLEN
@@ -47,6 +57,7 @@ CATALOG(pg_qx_task,9532,QxTaskRelationId)
 	text		qxtaskgoal BKI_FORCE_NULL;	/* goal text */
 	pg_node_tree qxtaskinput BKI_FORCE_NULL;	/* serialized raw input expr */
 	text		qxtaskpriority BKI_FORCE_NULL;	/* priority label */
+	pg_node_tree qxtaskauthorizedtools BKI_FORCE_NULL;	/* serialized List<String> */
 #endif
 } FormData_pg_qx_task;
 

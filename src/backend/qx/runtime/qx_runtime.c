@@ -23,6 +23,8 @@
 #include "catalog/pg_qx_attempt.h"
 #include "catalog/pg_qx_checkpoint.h"
 #include "catalog/pg_qx_event.h"
+#include "catalog/pg_qx_identity.h"
+#include "catalog/pg_qx_namespace.h"
 #include "catalog/pg_qx_session.h"
 #include "catalog/pg_qx_step.h"
 #include "catalog/pg_qx_task.h"
@@ -137,6 +139,66 @@ qx_update_attempt_state(Relation attemptrel, Oid attemptoid, char state)
 
 	heap_freetuple(newtup);
 	ReleaseSysCache(attempttup);
+	CommandCounterIncrement();
+}
+
+static void
+qx_charge_task_budget(Relation taskrel, Oid taskoid,
+					  int32 token_delta, int32 cost_delta,
+					  const char *charge_name)
+{
+	HeapTuple	tasktup;
+	HeapTuple	newtup;
+	Form_pg_qx_task taskform;
+	Datum		values[Natts_pg_qx_task];
+	bool		nulls[Natts_pg_qx_task];
+	bool		replaces[Natts_pg_qx_task];
+	int32		new_tokens;
+	int32		new_cost;
+
+	tasktup = SearchSysCache1(QXTASKOID, ObjectIdGetDatum(taskoid));
+	if (!HeapTupleIsValid(tasktup))
+		elog(ERROR, "cache lookup failed for QhapaqXian task %u", taskoid);
+
+	taskform = (Form_pg_qx_task) GETSTRUCT(tasktup);
+	new_tokens = taskform->qxtaskconsumedtokens + token_delta;
+	new_cost = taskform->qxtaskconsumedcost + cost_delta;
+
+	if (taskform->qxtaskbudgettokens > 0 && new_tokens > taskform->qxtaskbudgettokens)
+	{
+		ReleaseSysCache(tasktup);
+		ereport(ERROR,
+				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+				 errmsg("runtime token budget exceeded for task %u", taskoid),
+				 errdetail("Charge \"%s\" would move token usage to %d, above the ceiling %d.",
+						   charge_name, new_tokens, taskform->qxtaskbudgettokens)));
+	}
+
+	if (taskform->qxtaskbudgetcost > 0 && new_cost > taskform->qxtaskbudgetcost)
+	{
+		ReleaseSysCache(tasktup);
+		ereport(ERROR,
+				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+				 errmsg("runtime cost budget exceeded for task %u", taskoid),
+				 errdetail("Charge \"%s\" would move cost usage to %d, above the ceiling %d.",
+						   charge_name, new_cost, taskform->qxtaskbudgetcost)));
+	}
+
+	memset(values, 0, sizeof(values));
+	memset(nulls, false, sizeof(nulls));
+	memset(replaces, false, sizeof(replaces));
+
+	values[Anum_pg_qx_task_qxtaskconsumedtokens - 1] = Int32GetDatum(new_tokens);
+	values[Anum_pg_qx_task_qxtaskconsumedcost - 1] = Int32GetDatum(new_cost);
+	replaces[Anum_pg_qx_task_qxtaskconsumedtokens - 1] = true;
+	replaces[Anum_pg_qx_task_qxtaskconsumedcost - 1] = true;
+
+	newtup = heap_modify_tuple(tasktup, RelationGetDescr(taskrel),
+							   values, nulls, replaces);
+	CatalogTupleUpdate(taskrel, &tasktup->t_self, newtup);
+
+	heap_freetuple(newtup);
+	ReleaseSysCache(tasktup);
 	CommandCounterIncrement();
 }
 
@@ -356,12 +418,28 @@ qx_runtime_insert_task(Relation taskrel, const QxRuntimeTaskRequest *request)
 		ObjectIdGetDatum(request->sessionoid);
 	values[Anum_pg_qx_task_qxtaskagentid - 1] =
 		ObjectIdGetDatum(request->agentoid);
+	values[Anum_pg_qx_task_qxtasknamespacepolicyid - 1] =
+		ObjectIdGetDatum(request->namespace_policy_oid);
+	values[Anum_pg_qx_task_qxtaskidentityid - 1] =
+		ObjectIdGetDatum(request->identityoid);
 	values[Anum_pg_qx_task_qxtaskowner - 1] =
 		ObjectIdGetDatum(request->ownerid);
 	values[Anum_pg_qx_task_qxtasklastattemptid - 1] =
 		ObjectIdGetDatum(InvalidOid);
 	values[Anum_pg_qx_task_qxtasklastcheckpointid - 1] =
 		ObjectIdGetDatum(InvalidOid);
+	values[Anum_pg_qx_task_qxtaskbudgettokens - 1] =
+		Int32GetDatum(request->budget_tokens);
+	values[Anum_pg_qx_task_qxtaskbudgetcost - 1] =
+		Int32GetDatum(request->budget_cost);
+	values[Anum_pg_qx_task_qxtaskauthorizedtooltokens - 1] =
+		Int32GetDatum(request->authorized_tool_tokens);
+	values[Anum_pg_qx_task_qxtaskauthorizedtoolcost - 1] =
+		Int32GetDatum(request->authorized_tool_cost);
+	values[Anum_pg_qx_task_qxtaskestimatedtokens - 1] =
+		Int32GetDatum(request->estimated_tokens);
+	values[Anum_pg_qx_task_qxtaskestimatedcost - 1] =
+		Int32GetDatum(request->estimated_cost);
 	values[Anum_pg_qx_task_qxtaskstate - 1] =
 		CharGetDatum(QX_TASK_STATE_QUEUED);
 	qx_set_text_datum(values, nulls, Anum_pg_qx_task_qxtaskname,
@@ -372,6 +450,9 @@ qx_runtime_insert_task(Relation taskrel, const QxRuntimeTaskRequest *request)
 						  request->input);
 	qx_set_text_datum(values, nulls, Anum_pg_qx_task_qxtaskpriority,
 					  request->priority);
+	qx_set_nodetree_datum(values, nulls,
+						  Anum_pg_qx_task_qxtaskauthorizedtools,
+						  request->authorized_tools);
 
 	tup = heap_form_tuple(RelationGetDescr(taskrel), values, nulls);
 	CatalogTupleInsert(taskrel, tup);
@@ -382,6 +463,10 @@ qx_runtime_insert_task(Relation taskrel, const QxRuntimeTaskRequest *request)
 	ObjectAddressSet(referenced, QxSessionRelationId, request->sessionoid);
 	recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
 	ObjectAddressSet(referenced, QxAgentRelationId, request->agentoid);
+	recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
+	ObjectAddressSet(referenced, QxNamespaceRelationId, request->namespace_policy_oid);
+	recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
+	ObjectAddressSet(referenced, QxIdentityRelationId, request->identityoid);
 	recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
 	recordDependencyOnCurrentExtension(&myself, false);
 	InvokeObjectPostCreateHook(QxTaskRelationId, taskoid, 0);
@@ -473,8 +558,14 @@ QxRuntimeSubmitTask(const QxRuntimeTaskRequest *request)
 	stepoid = qx_insert_step(steprel, request->sessionoid, taskoid, 1,
 							 "stage8.scheduler_admit",
 							 "Embedded scheduler admitted attempt 1 into runtime");
-	payload = psprintf("attempt_opened;state=%c",
-					   QX_TASK_STATE_RUNNING);
+	qx_charge_task_budget(taskrel, taskoid, 16, 17, "scheduler_admit");
+	payload = psprintf("attempt_opened;state=%c;identity=%s;namespace_policy=%s;tools=%d;budget_cost=%d;budget_tokens=%d",
+					   QX_TASK_STATE_RUNNING,
+					   request->identity_name != NULL ? request->identity_name : "<unknown>",
+					   request->namespace_policy_name != NULL ? request->namespace_policy_name : "<unknown>",
+					   list_length(request->authorized_tools),
+					   request->budget_cost,
+					   request->budget_tokens);
 	(void) qx_insert_event(eventrel, request->sessionoid, taskoid, stepoid,
 						   request->ownerid, "TASK_DISPATCHED", payload);
 	(void) qx_insert_trace(tracerel, request->sessionoid, taskoid, stepoid,
@@ -482,8 +573,30 @@ QxRuntimeSubmitTask(const QxRuntimeTaskRequest *request)
 	pfree(payload);
 
 	stepoid = qx_insert_step(steprel, request->sessionoid, taskoid, 2,
+							 "stage14.authorize_tools",
+							 "Attempt 1 validated the runtime tool allowlist against namespace policy");
+	qx_charge_task_budget(taskrel, taskoid,
+						  request->authorized_tool_tokens,
+						  request->authorized_tool_cost,
+						  "authorize_tools");
+	payload = psprintf("namespace_policy=%s;authorized_tools=%d;tool_tokens=%d;tool_cost=%d",
+					   request->namespace_policy_name != NULL ? request->namespace_policy_name : "<unknown>",
+					   list_length(request->authorized_tools),
+					   request->authorized_tool_tokens,
+					   request->authorized_tool_cost);
+	(void) qx_insert_event(eventrel, request->sessionoid, taskoid, stepoid,
+						   request->ownerid, "TASK_TOOLS_AUTHORIZED", payload);
+	(void) qx_insert_trace(tracerel, request->sessionoid, taskoid, stepoid,
+						   request->ownerid, "runtime.authorize_tools", payload);
+	pfree(payload);
+
+	stepoid = qx_insert_step(steprel, request->sessionoid, taskoid, 3,
 							 "stage8.capture_input",
 							 "Attempt 1 captured task goal and raw input");
+	qx_charge_task_budget(taskrel, taskoid,
+						  request->input != NULL ? 24 : 8,
+						  13,
+						  "capture_input");
 	payload = psprintf("input_present=%s;task_name=%s",
 					   request->input != NULL ? "true" : "false",
 					   request->task_name != NULL ? request->task_name : "<anonymous>");
@@ -493,9 +606,10 @@ QxRuntimeSubmitTask(const QxRuntimeTaskRequest *request)
 						   request->ownerid, "runtime.capture_input", payload);
 	pfree(payload);
 
-	stepoid = qx_insert_step(steprel, request->sessionoid, taskoid, 3,
+	stepoid = qx_insert_step(steprel, request->sessionoid, taskoid, 4,
 							 "stage8.checkpoint_barrier",
 							 "Attempt 1 reached a resumable checkpoint barrier");
+	qx_charge_task_budget(taskrel, taskoid, 4, 14, "checkpoint_barrier");
 	payload = psprintf("checkpoint=stage8.after_capture;task_state=%c",
 					   QX_TASK_STATE_CHECKPOINTED);
 	(void) qx_insert_event(eventrel, request->sessionoid, taskoid, stepoid,
@@ -504,7 +618,7 @@ QxRuntimeSubmitTask(const QxRuntimeTaskRequest *request)
 						   request->ownerid, "runtime.checkpoint", payload);
 
 	checkpoint_data = psprintf("task=%u;attempt=%u;session=%u;next_step=%d",
-							   taskoid, attemptoid, request->sessionoid, 4);
+							   taskoid, attemptoid, request->sessionoid, 5);
 	checkpointoid = qx_insert_checkpoint(checkpointrel,
 										 request->sessionoid,
 										 taskoid,
@@ -512,7 +626,7 @@ QxRuntimeSubmitTask(const QxRuntimeTaskRequest *request)
 										 stepoid,
 										 request->ownerid,
 										 QX_TASK_STATE_CHECKPOINTED,
-										 4,
+										 5,
 										 "stage8.after_capture",
 										 checkpoint_data);
 	pfree(checkpoint_data);
@@ -651,9 +765,10 @@ QxRuntimeResumeTask(Oid taskoid, const char *checkpoint_label, Oid ownerid)
 						   InvalidOid, ownerid, "runtime.resume", payload);
 	pfree(payload);
 
-	stepoid = qx_insert_step(steprel, taskform->qxtasksessionid, taskoid, 4,
+	stepoid = qx_insert_step(steprel, taskform->qxtasksessionid, taskoid, 5,
 							 "stage8.resume_dispatch",
 							 "Attempt 2 resumed execution from the last durable checkpoint");
+	qx_charge_task_budget(taskrel, taskoid, 8, 14, "resume_dispatch");
 	payload = psprintf("resume_from=%s;state=%c",
 					   stored_label != NULL ? stored_label : "<unnamed>",
 					   QX_TASK_STATE_RUNNING);
@@ -663,9 +778,10 @@ QxRuntimeResumeTask(Oid taskoid, const char *checkpoint_label, Oid ownerid)
 						   stepoid, ownerid, "runtime.resume_dispatch", payload);
 	pfree(payload);
 
-	stepoid = qx_insert_step(steprel, taskform->qxtasksessionid, taskoid, 5,
+	stepoid = qx_insert_step(steprel, taskform->qxtasksessionid, taskoid, 6,
 							 "stage8.complete",
 							 "Attempt 2 completed the task after resuming");
+	qx_charge_task_budget(taskrel, taskoid, 4, 11, "final_checkpoint");
 	payload = psprintf("checkpoint=stage8.final;task_state=%c",
 					   QX_TASK_STATE_COMPLETED);
 	(void) qx_insert_event(eventrel, taskform->qxtasksessionid, taskoid,

@@ -36,11 +36,15 @@ typedef struct QxAgentPlan
 	QxAgentPlanKind kind;
 	Oid			ownerid;
 	Oid			agentoid;
+	Oid			identityoid;
+	Oid			namespace_policy_oid;
 	Oid			sessionoid;
 	Oid			taskoid;
 	Oid			checkpointoid;
 	Node	   *input;
 	char	   *command_name;
+	char	   *identity_name;
+	char	   *namespace_policy_name;
 	char	   *task_name;
 	char	   *goal;
 	char	   *priority;
@@ -51,8 +55,14 @@ typedef struct QxAgentPlan
 	bool		checkpointable;
 	bool		resumable;
 	bool		returning_requested;
+	int32		budget_tokens;
+	int32		budget_cost;
+	int32		estimated_tokens;
 	int32		estimated_total_cost;
 	int32		estimated_tool_calls;
+	int32		authorized_tool_tokens;
+	int32		authorized_tool_cost;
+	List	   *authorized_tools;	/* list of String */
 	List	   *steps;			/* list of QxAgentPlanStep */
 } QxAgentPlan;
 

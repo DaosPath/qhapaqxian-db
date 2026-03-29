@@ -8,7 +8,7 @@ CREATE AGENT archivist
   MEMORY PROFILE episodic
   TOOLS (search, summarize)
   POLICY guarded
-  BUDGET (tokens 4096, cost 12);
+  BUDGET (tokens 4096, cost 128);
 
 START SESSION FOR AGENT archivist
   WITH CONTEXT jsonb_build_object('mission', 'index');

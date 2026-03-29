@@ -26,11 +26,22 @@ QxExecuteAgentPlan(const QxAgentPlan *plan)
 				memset(&request, 0, sizeof(request));
 				request.sessionoid = plan->sessionoid;
 				request.agentoid = plan->agentoid;
+				request.identityoid = plan->identityoid;
+				request.namespace_policy_oid = plan->namespace_policy_oid;
 				request.ownerid = plan->ownerid;
 				request.task_name = plan->task_name;
+				request.identity_name = plan->identity_name;
+				request.namespace_policy_name = plan->namespace_policy_name;
 				request.goal = plan->goal;
 				request.input = plan->input;
 				request.priority = plan->priority;
+				request.authorized_tools = plan->authorized_tools;
+				request.budget_tokens = plan->budget_tokens;
+				request.budget_cost = plan->budget_cost;
+				request.estimated_tokens = plan->estimated_tokens;
+				request.estimated_cost = plan->estimated_total_cost;
+				request.authorized_tool_tokens = plan->authorized_tool_tokens;
+				request.authorized_tool_cost = plan->authorized_tool_cost;
 
 				return QxRuntimeSubmitTask(&request);
 			}

@@ -18,11 +18,22 @@ typedef struct QxRuntimeTaskRequest
 {
 	Oid			sessionoid;
 	Oid			agentoid;
+	Oid			identityoid;
+	Oid			namespace_policy_oid;
 	Oid			ownerid;
 	const char *task_name;
+	const char *identity_name;
+	const char *namespace_policy_name;
 	const char *goal;
 	Node	   *input;
 	const char *priority;
+	List	   *authorized_tools;
+	int32		budget_tokens;
+	int32		budget_cost;
+	int32		estimated_tokens;
+	int32		estimated_cost;
+	int32		authorized_tool_tokens;
+	int32		authorized_tool_cost;
 } QxRuntimeTaskRequest;
 
 extern Oid QxRuntimeSubmitTask(const QxRuntimeTaskRequest *request);

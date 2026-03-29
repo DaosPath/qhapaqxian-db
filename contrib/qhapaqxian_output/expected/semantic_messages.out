@@ -11,7 +11,7 @@ CREATE AGENT archivist
   MEMORY PROFILE episodic
   TOOLS (search, summarize)
   POLICY guarded
-  BUDGET (tokens 4096, cost 12);
+  BUDGET (tokens 4096, cost 128);
 START SESSION FOR AGENT archivist
   WITH CONTEXT jsonb_build_object('mission', 'index');
 SELECT oid AS qx_session_oid
@@ -38,7 +38,7 @@ SELECT count(*) AS total_messages,
 FROM decoded;
  total_messages | schema_v1_messages 
 ----------------+--------------------
-             22 |                 22
+             24 |                 24
 (1 row)
 
 WITH decoded AS (
@@ -53,8 +53,8 @@ ORDER BY 1;
  record_kind | nrecords 
 -------------+----------
  checkpoint  |        2
- event       |       10
- trace       |       10
+ event       |       11
+ trace       |       11
 (3 rows)
 
 SELECT msg->>'kind' AS event_kind
@@ -76,7 +76,8 @@ ORDER BY event_kind;
  TASK_READY_FOR_RESUME
  TASK_RESUME_DISPATCHED
  TASK_RESUMED
-(10 rows)
+ TASK_TOOLS_AUTHORIZED
+(11 rows)
 
 WITH decoded AS (
   SELECT data::jsonb AS msg
@@ -86,7 +87,7 @@ SELECT count(*) AS drained_messages
 FROM decoded;
  drained_messages 
 ------------------
-               22
+               24
 (1 row)
 
 WITH decoded AS (

@@ -24,6 +24,8 @@ Current bootstrap status:
 - Stage 10 engine-owned memory storage and operator-facing `REMEMBER` / `FETCH MEMORY` / `SHOW TRACE` commands are in-tree
 - Stage 11 compatibility and operability surface is in-tree with `pg_stat_qx_*` system views and hardened regression coverage
 - Stage 12 security-isolation seed is in-tree with owner-filtered `pg_stat_qx_*` views and revoked raw catalog access for non-privileged roles
+- Stage 13 operational identities and planner-side budget snapshots are in-tree with native `pg_qx_identity`, session/task identity linkage, and budget admission checks
+- Stage 14 namespace policy, runtime tool authorization, and live budget metering are in-tree with native `pg_qx_namespace`, task-level authorization snapshots, and runtime consumption counters
 
 What this fork is:
 - a real fork target for an AgentDB
@@ -50,6 +52,8 @@ Immediate fork governance files:
 - `docs/stage-10/README.md`
 - `docs/stage-11/README.md`
 - `docs/stage-12/README.md`
+- `docs/stage-13/README.md`
+- `docs/stage-14/README.md`
 - `docs/bootstrap-plan.md`
 - `docs/rebase-strategy.md`
 - `docs/patch-ledger.md`

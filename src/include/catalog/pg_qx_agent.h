@@ -30,6 +30,8 @@ CATALOG(pg_qx_agent,9520,QxAgentRelationId)
 	Oid			oid;			/* oid */
 	NameData	qxagentname;	/* agent name */
 	Oid			qxagentnamespace BKI_LOOKUP(pg_namespace);	/* schema */
+	Oid			qxnamespacepolicyid BKI_LOOKUP(pg_qx_namespace);	/* namespace policy */
+	Oid			qxidentityid BKI_LOOKUP(pg_qx_identity);	/* operational identity */
 	Oid			qxagentowner BKI_LOOKUP(pg_authid);	/* owner */
 
 #ifdef CATALOG_VARLEN

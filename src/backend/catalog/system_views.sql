@@ -1384,6 +1384,7 @@ CREATE VIEW pg_stat_qx_agents WITH (security_barrier) AS
         a.qxagentname AS agent_name,
         pg_get_userbyid(a.qxagentowner) AS owner_name,
         a.qxidentity AS identity_name,
+        qxn.qxnamespacepolicy AS namespace_policy_name,
         a.qxmodeluri AS model_uri,
         a.qxmemoryprofile AS memory_profile,
         a.qxpolicy AS policy_name,
@@ -1410,6 +1411,7 @@ CREATE VIEW pg_stat_qx_agents WITH (security_barrier) AS
          WHERE m.qxmemoryagentid = a.oid) AS memory_count
     FROM pg_qx_agent a
          LEFT JOIN pg_namespace n ON (n.oid = a.qxagentnamespace)
+         LEFT JOIN pg_qx_namespace qxn ON (qxn.oid = a.qxnamespacepolicyid)
     WHERE pg_has_role(SESSION_USER, a.qxagentowner, 'USAGE')
        OR pg_has_role(SESSION_USER, 'pg_read_all_stats', 'MEMBER');
 
@@ -1419,6 +1421,8 @@ CREATE VIEW pg_stat_qx_sessions WITH (security_barrier) AS
         s.oid AS session_oid,
         a.qxagentname AS agent_name,
         pg_get_userbyid(s.qxsessionowner) AS owner_name,
+        qxi.qxidentityname AS identity_name,
+        qxn.qxnamespacepolicy AS namespace_policy_name,
         CASE s.qxsessionstatus
             WHEN 'a' THEN 'active'
             ELSE 'unknown'
@@ -1445,6 +1449,8 @@ CREATE VIEW pg_stat_qx_sessions WITH (security_barrier) AS
          WHERE m.qxmemorysessionid = s.oid) AS memory_count
     FROM pg_qx_session s
          JOIN pg_qx_agent a ON (a.oid = s.qxsessionagentid)
+         JOIN pg_qx_identity qxi ON (qxi.oid = s.qxsessionidentityid)
+         JOIN pg_qx_namespace qxn ON (qxn.oid = s.qxsessionnamespacepolicyid)
     WHERE pg_has_role(SESSION_USER, s.qxsessionowner, 'USAGE')
        OR pg_has_role(SESSION_USER, 'pg_read_all_stats', 'MEMBER');
 
@@ -1455,6 +1461,8 @@ CREATE VIEW pg_stat_qx_tasks WITH (security_barrier) AS
         t.qxtasksessionid AS session_oid,
         a.qxagentname AS agent_name,
         pg_get_userbyid(t.qxtaskowner) AS owner_name,
+        qxi.qxidentityname AS identity_name,
+        qxn.qxnamespacepolicy AS namespace_policy_name,
         t.qxtaskname AS task_name,
         t.qxtaskgoal AS goal,
         t.qxtaskpriority AS priority,
@@ -1466,6 +1474,12 @@ CREATE VIEW pg_stat_qx_tasks WITH (security_barrier) AS
             WHEN 'c' THEN 'completed'
             ELSE 'unknown'
         END AS task_state,
+        t.qxtaskbudgettokens AS budget_tokens,
+        t.qxtaskbudgetcost AS budget_cost,
+        t.qxtaskconsumedtokens AS consumed_tokens,
+        t.qxtaskconsumedcost AS consumed_cost,
+        GREATEST(t.qxtaskbudgettokens - t.qxtaskconsumedtokens, 0) AS remaining_tokens,
+        GREATEST(t.qxtaskbudgetcost - t.qxtaskconsumedcost, 0) AS remaining_cost,
         t.qxtasklastattemptid <> 0 AS has_attempt,
         t.qxtasklastcheckpointid <> 0 AS has_checkpoint,
         (SELECT count(*)::bigint
@@ -1488,6 +1502,8 @@ CREATE VIEW pg_stat_qx_tasks WITH (security_barrier) AS
          WHERE m.qxmemorytaskid = t.oid) AS memory_count
     FROM pg_qx_task t
          JOIN pg_qx_agent a ON (a.oid = t.qxtaskagentid)
+         JOIN pg_qx_identity qxi ON (qxi.oid = t.qxtaskidentityid)
+         JOIN pg_qx_namespace qxn ON (qxn.oid = t.qxtasknamespacepolicyid)
     WHERE pg_has_role(SESSION_USER, t.qxtaskowner, 'USAGE')
        OR pg_has_role(SESSION_USER, 'pg_read_all_stats', 'MEMBER');
 

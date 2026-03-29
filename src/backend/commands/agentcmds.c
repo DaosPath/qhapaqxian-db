@@ -20,11 +20,15 @@
 #include "catalog/objectaddress.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_qx_agent.h"
+#include "catalog/pg_qx_identity.h"
+#include "catalog/pg_qx_namespace.h"
+#include "commands/defrem.h"
 #include "commands/agentcmds.h"
 #include "miscadmin.h"
 #include "nodes/nodes.h"
 #include "nodes/pg_list.h"
 #include "nodes/value.h"
+#include "qx/qx_security.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -41,6 +45,7 @@ qx_set_text_datum(Datum *values, bool *nulls, AttrNumber attnum,
 		return;
 	}
 
+	nulls[attnum - 1] = false;
 	values[attnum - 1] = CStringGetTextDatum(value);
 }
 
@@ -56,6 +61,7 @@ qx_set_nodetree_datum(Datum *values, bool *nulls, AttrNumber attnum,
 		return;
 	}
 
+	nulls[attnum - 1] = false;
 	serialized = nodeToString(node);
 	values[attnum - 1] = CStringGetTextDatum(serialized);
 	pfree(serialized);
@@ -70,6 +76,8 @@ CreateAgentCommand(CreateAgentStmt *stmt)
 	Datum		values[Natts_pg_qx_agent];
 	bool		nulls[Natts_pg_qx_agent];
 	Oid			agentoid;
+	Oid			identityoid;
+	Oid			namespacepolicyoid;
 	Oid			namespaceoid;
 	Oid			ownerid;
 	AclResult	aclresult;
@@ -99,6 +107,17 @@ CreateAgentCommand(CreateAgentStmt *stmt)
 	memset(values, 0, sizeof(values));
 	memset(nulls, false, sizeof(nulls));
 
+	QxValidateToolList(stmt->tools);
+	namespacepolicyoid = QxEnsureNamespacePolicy(namespaceoid, ownerid,
+												 ownerid,
+												 stmt->policy_name,
+												 stmt->tools);
+	identityoid = QxEnsureOperationalIdentity(namespaceoid, ownerid,
+											  stmt->identity_name,
+											  ownerid,
+											  stmt->policy_name,
+											  stmt->budget_options);
+
 	agentoid = GetNewOidWithIndex(rel, QxAgentOidIndexId,
 								  Anum_pg_qx_agent_oid);
 	values[Anum_pg_qx_agent_oid - 1] = ObjectIdGetDatum(agentoid);
@@ -106,6 +125,10 @@ CreateAgentCommand(CreateAgentStmt *stmt)
 		DirectFunctionCall1(namein, CStringGetDatum(agentname));
 	values[Anum_pg_qx_agent_qxagentnamespace - 1] =
 		ObjectIdGetDatum(namespaceoid);
+	values[Anum_pg_qx_agent_qxnamespacepolicyid - 1] =
+		ObjectIdGetDatum(namespacepolicyoid);
+	values[Anum_pg_qx_agent_qxidentityid - 1] =
+		ObjectIdGetDatum(identityoid);
 	values[Anum_pg_qx_agent_qxagentowner - 1] = ObjectIdGetDatum(ownerid);
 
 	qx_set_text_datum(values, nulls, Anum_pg_qx_agent_qxidentity,
@@ -129,6 +152,10 @@ CreateAgentCommand(CreateAgentStmt *stmt)
 	ObjectAddressSet(myself, QxAgentRelationId, agentoid);
 	recordDependencyOnOwner(QxAgentRelationId, agentoid, ownerid);
 	ObjectAddressSet(referenced, NamespaceRelationId, namespaceoid);
+	recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
+	ObjectAddressSet(referenced, QxNamespaceRelationId, namespacepolicyoid);
+	recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
+	ObjectAddressSet(referenced, QxIdentityRelationId, identityoid);
 	recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
 	recordDependencyOnCurrentExtension(&myself, false);
 	InvokeObjectPostCreateHook(QxAgentRelationId, agentoid, 0);

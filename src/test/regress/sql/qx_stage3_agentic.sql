@@ -6,10 +6,12 @@ CREATE AGENT archivist
   MEMORY PROFILE episodic
   TOOLS (search, summarize)
   POLICY guarded
-  BUDGET (tokens 4096, cost 12);
+  BUDGET (tokens 4096, cost 128);
 
 SELECT qxagentname::text AS agent_name,
        qxagentnamespace = 'public'::regnamespace AS in_public_schema,
+       qxnamespacepolicyid <> 0 AS has_namespace_policy_oid,
+       qxidentityid <> 0 AS has_identity_oid,
        qxagentowner = (SELECT oid FROM pg_roles WHERE rolname = current_user) AS owned_by_current_user,
        qxidentity::text AS identity_name,
        qxmodeluri::text AS model_uri,
@@ -20,6 +22,32 @@ SELECT qxagentname::text AS agent_name,
 FROM pg_qx_agent
 WHERE qxagentname = 'archivist';
 
+SELECT qxnamespaceid = 'public'::regnamespace AS binds_public_schema,
+       qxnamespaceowner = (SELECT oid FROM pg_roles WHERE rolname = current_user) AS owned_by_current_user,
+       qxnamespaceauthrole = (SELECT oid FROM pg_roles WHERE rolname = current_user) AS auth_role_is_current_user,
+       qxrequireknowntools AS require_known_tools,
+       qxenforcebudgets AS enforce_budgets,
+       qxnamespacepolicy::text AS policy_name,
+       qxallowedtools IS NOT NULL AS has_allowed_tools
+FROM pg_qx_namespace
+WHERE qxnamespaceid = 'public'::regnamespace;
+
+SELECT qxidentityname::text AS identity_name,
+       qxidentitynamespace = 'public'::regnamespace AS in_public_schema,
+       qxidentityowner = (SELECT oid FROM pg_roles WHERE rolname = current_user) AS owned_by_current_user,
+       qxidentityauthrole = (SELECT oid FROM pg_roles WHERE rolname = current_user) AS auth_role_is_current_user,
+       qxidentitypolicy::text AS policy_name,
+       qxidentitybudget IS NOT NULL AS has_budget
+FROM pg_qx_identity
+WHERE qxidentityname = 'imperial';
+
+SELECT qxtoolname::text AS tool_name,
+       qxtoolenabled AS enabled,
+       qxtooltokencost AS token_cost,
+       qxtoolcostunits AS cost_units
+FROM pg_qx_tool
+ORDER BY qxtoolname;
+
 CREATE AGENT archivist
   IDENTITY imperial;
 
@@ -27,6 +55,8 @@ START SESSION FOR AGENT archivist
   WITH CONTEXT jsonb_build_object('mission', 'index');
 
 SELECT qxsessionagentid = (SELECT oid FROM pg_qx_agent WHERE qxagentname = 'archivist') AS linked_agent,
+       qxsessionnamespacepolicyid = (SELECT qxnamespacepolicyid FROM pg_qx_agent WHERE qxagentname = 'archivist') AS linked_policy,
+       qxsessionidentityid = (SELECT qxidentityid FROM pg_qx_agent WHERE qxagentname = 'archivist') AS linked_identity,
        qxsessiondbid = (SELECT oid FROM pg_database WHERE datname = current_database()) AS current_db,
        qxsessionowner = (SELECT oid FROM pg_roles WHERE rolname = current_user) AS owned_by_current_user,
        qxsessionstatus AS status,
@@ -76,7 +106,18 @@ SELECT qxtaskname::text AS task_name,
        qxtaskgoal::text AS goal,
        qxtaskpriority::text AS priority,
        qxtaskstate AS state,
+       qxtasknamespacepolicyid = (SELECT qxnamespacepolicyid FROM pg_qx_agent WHERE qxagentname = 'archivist') AS linked_policy,
+       qxtaskidentityid = (SELECT qxidentityid FROM pg_qx_agent WHERE qxagentname = 'archivist') AS linked_identity,
        qxtaskinput IS NOT NULL AS has_input,
+       qxtaskbudgettokens AS budget_tokens,
+       qxtaskbudgetcost AS budget_cost,
+       qxtaskauthorizedtooltokens AS authorized_tool_tokens,
+       qxtaskauthorizedtoolcost AS authorized_tool_cost,
+       qxtaskestimatedtokens AS estimated_tokens,
+       qxtaskestimatedcost AS estimated_cost,
+       qxtaskconsumedtokens AS consumed_tokens,
+       qxtaskconsumedcost AS consumed_cost,
+       qxtaskauthorizedtools IS NOT NULL AS has_authorized_tools,
        qxtasksessionid = :qx_session_oid AS linked_session,
        qxtasklastattemptid <> 0 AS has_attempt,
        qxtasklastcheckpointid <> 0 AS has_checkpoint
@@ -130,6 +171,8 @@ RESUME TASK :qx_task_oid FROM CHECKPOINT 'stage8.after_capture';
 
 SELECT qxtaskname::text AS task_name,
        qxtaskstate AS state,
+       qxtaskconsumedtokens AS consumed_tokens,
+       qxtaskconsumedcost AS consumed_cost,
        qxtasklastattemptid <> 0 AS has_attempt,
        qxtasklastcheckpointid <> 0 AS has_checkpoint
 FROM pg_qx_task
@@ -207,7 +250,28 @@ FETCH MEMORY FOR AGENT archivist
 
 SHOW TRACE FOR TASK :qx_task_oid LIMIT 20;
 
+CREATE AGENT tiny_budget
+  IDENTITY sentinel
+  MODEL 'openai:gpt-5.4-mini'
+  TOOLS (search)
+  POLICY strict
+  BUDGET (tokens 10, cost 5);
+
+START SESSION FOR AGENT tiny_budget;
+
+SELECT oid AS qx_tiny_session_oid
+FROM pg_qx_session
+WHERE qxsessionagentid = (SELECT oid FROM pg_qx_agent WHERE qxagentname = 'tiny_budget')
+ORDER BY oid DESC
+LIMIT 1
+\gset
+
+RUN TASK budget_probe IN SESSION :qx_tiny_session_oid
+  GOAL 'should exceed budget'
+  INPUT jsonb_build_object('topic', 'over budget');
+
 SELECT agent_name::text AS agent_name,
+       namespace_policy_name::text AS namespace_policy_name,
        active_session_count,
        task_count,
        completed_task_count,
@@ -217,6 +281,8 @@ ORDER BY agent_name;
 
 SELECT session_oid = :qx_session_oid AS session_match,
        agent_name::text AS agent_name,
+       identity_name::text AS identity_name,
+       namespace_policy_name::text AS namespace_policy_name,
        session_status,
        has_context,
        task_count,
@@ -228,8 +294,16 @@ ORDER BY session_oid;
 
 SELECT task_oid = :qx_task_oid AS task_match,
        agent_name::text AS agent_name,
+       identity_name::text AS identity_name,
+       namespace_policy_name::text AS namespace_policy_name,
        task_name::text AS task_name,
        task_state,
+       budget_tokens,
+       budget_cost,
+       consumed_tokens,
+       consumed_cost,
+       remaining_tokens,
+       remaining_cost,
        has_attempt,
        has_checkpoint,
        attempt_count,

@@ -1,13 +1,14 @@
 #-------------------------------------------------------------------------
 #
-# Makefile for backend/qx
+# Makefile for backend/qx/security
 #
 #-------------------------------------------------------------------------
 
-subdir = src/backend/qx
-top_builddir = ../../..
+subdir = src/backend/qx/security
+top_builddir = ../../../..
 include $(top_builddir)/src/Makefile.global
 
-SUBDIRS = planner executor replication runtime memory security
+OBJS = \
+	qx_security.o
 
 include $(top_srcdir)/src/backend/common.mk
