@@ -37,7 +37,7 @@ SUBDIRS = \
 	scripts
 
 ifeq ($(PORTNAME), win32)
-SUBDIRS += pgevent
+SUBDIRS += pgevent qhapaqxian_launcher
 else
 ALWAYS_SUBDIRS += pgevent
 endif

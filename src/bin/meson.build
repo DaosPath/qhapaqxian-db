@@ -21,4 +21,7 @@ subdir('pg_walsummary')
 subdir('pgbench')
 subdir('pgevent')
 subdir('psql')
+if host_system == 'windows'
+  subdir('qhapaqxian_launcher')
+endif
 subdir('scripts')

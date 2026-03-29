@@ -14,6 +14,7 @@ This document marks the repository as publishable on GitHub, not as production-r
 - the repository can be cloned and built with the documented bootstrap toolchain;
 - fork-specific engine work is documented;
 - native agentic syntax, catalogs, runtime slices, memory storage, semantic logging, and operator views are present;
+- a temporary Windows launcher `qhapaqxian-db.exe` can be produced next to the built `postgres.exe`;
 - maintenance boundaries against upstream are recorded.
 
 ## What it does not mean
