@@ -1377,7 +1377,7 @@ CREATE VIEW pg_wait_events AS
     SELECT * FROM pg_get_wait_events();
 
 
-CREATE VIEW pg_stat_qx_agents AS
+CREATE VIEW pg_stat_qx_agents WITH (security_barrier) AS
     SELECT
         a.oid AS agent_oid,
         n.nspname AS schemaname,
@@ -1409,10 +1409,12 @@ CREATE VIEW pg_stat_qx_agents AS
          FROM pg_qx_memory m
          WHERE m.qxmemoryagentid = a.oid) AS memory_count
     FROM pg_qx_agent a
-         LEFT JOIN pg_namespace n ON (n.oid = a.qxagentnamespace);
+         LEFT JOIN pg_namespace n ON (n.oid = a.qxagentnamespace)
+    WHERE pg_has_role(SESSION_USER, a.qxagentowner, 'USAGE')
+       OR pg_has_role(SESSION_USER, 'pg_read_all_stats', 'MEMBER');
 
 
-CREATE VIEW pg_stat_qx_sessions AS
+CREATE VIEW pg_stat_qx_sessions WITH (security_barrier) AS
     SELECT
         s.oid AS session_oid,
         a.qxagentname AS agent_name,
@@ -1442,10 +1444,12 @@ CREATE VIEW pg_stat_qx_sessions AS
          FROM pg_qx_memory m
          WHERE m.qxmemorysessionid = s.oid) AS memory_count
     FROM pg_qx_session s
-         JOIN pg_qx_agent a ON (a.oid = s.qxsessionagentid);
+         JOIN pg_qx_agent a ON (a.oid = s.qxsessionagentid)
+    WHERE pg_has_role(SESSION_USER, s.qxsessionowner, 'USAGE')
+       OR pg_has_role(SESSION_USER, 'pg_read_all_stats', 'MEMBER');
 
 
-CREATE VIEW pg_stat_qx_tasks AS
+CREATE VIEW pg_stat_qx_tasks WITH (security_barrier) AS
     SELECT
         t.oid AS task_oid,
         t.qxtasksessionid AS session_oid,
@@ -1483,4 +1487,20 @@ CREATE VIEW pg_stat_qx_tasks AS
          FROM pg_qx_memory m
          WHERE m.qxmemorytaskid = t.oid) AS memory_count
     FROM pg_qx_task t
-         JOIN pg_qx_agent a ON (a.oid = t.qxtaskagentid);
+         JOIN pg_qx_agent a ON (a.oid = t.qxtaskagentid)
+    WHERE pg_has_role(SESSION_USER, t.qxtaskowner, 'USAGE')
+       OR pg_has_role(SESSION_USER, 'pg_read_all_stats', 'MEMBER');
+
+GRANT SELECT ON pg_stat_qx_agents TO PUBLIC;
+GRANT SELECT ON pg_stat_qx_sessions TO PUBLIC;
+GRANT SELECT ON pg_stat_qx_tasks TO PUBLIC;
+
+REVOKE ALL ON pg_qx_agent FROM PUBLIC;
+REVOKE ALL ON pg_qx_session FROM PUBLIC;
+REVOKE ALL ON pg_qx_task FROM PUBLIC;
+REVOKE ALL ON pg_qx_attempt FROM PUBLIC;
+REVOKE ALL ON pg_qx_step FROM PUBLIC;
+REVOKE ALL ON pg_qx_event FROM PUBLIC;
+REVOKE ALL ON pg_qx_trace FROM PUBLIC;
+REVOKE ALL ON pg_qx_checkpoint FROM PUBLIC;
+REVOKE ALL ON pg_qx_memory FROM PUBLIC;

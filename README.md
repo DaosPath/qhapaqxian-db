@@ -23,6 +23,7 @@ Current bootstrap status:
 - Stage 9 semantic WAL/logical-message boundary is in-tree with persisted semantic `LSN`s and the `qhapaqxian_output` logical decoder
 - Stage 10 engine-owned memory storage and operator-facing `REMEMBER` / `FETCH MEMORY` / `SHOW TRACE` commands are in-tree
 - Stage 11 compatibility and operability surface is in-tree with `pg_stat_qx_*` system views and hardened regression coverage
+- Stage 12 security-isolation seed is in-tree with owner-filtered `pg_stat_qx_*` views and revoked raw catalog access for non-privileged roles
 
 What this fork is:
 - a real fork target for an AgentDB
@@ -48,6 +49,7 @@ Immediate fork governance files:
 - `docs/stage-9/README.md`
 - `docs/stage-10/README.md`
 - `docs/stage-11/README.md`
+- `docs/stage-12/README.md`
 - `docs/bootstrap-plan.md`
 - `docs/rebase-strategy.md`
 - `docs/patch-ledger.md`

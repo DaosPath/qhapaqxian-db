@@ -22,7 +22,8 @@ Current state:
 - Stage 9 semantic WAL/event replication boundary is implemented with logical messages and persisted semantic `LSN`s;
 - Stage 10 engine-owned memory storage and operator-facing retrieval/trace commands are implemented with `pg_qx_memory`, `REMEMBER`, `FETCH MEMORY`, and `SHOW TRACE`;
 - Stage 11 compatibility, hardening, and release discipline are implemented with `pg_stat_qx_*` operator views and aligned regression/deparser coverage;
-- the next execution step is post-bootstrap release engineering: packaging polish, tighter security isolation, and upgrade discipline unless deeper storage is justified by benchmarks.
+- Stage 12 security isolation has started with owner-filtered `pg_stat_qx_*` views, direct catalog revocation for non-privileged roles, and regression coverage for non-owner visibility;
+- the next execution step is deeper identity/security work: namespaces, tool authorization, budget enforcement, and role design beyond owner-based isolation, unless deeper storage is justified by benchmarks.
 
 Immediate non-goals:
 - renaming all PostgreSQL binaries

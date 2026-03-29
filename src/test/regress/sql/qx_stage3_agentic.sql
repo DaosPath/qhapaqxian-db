@@ -1,4 +1,4 @@
--- QhapaqXian DB Stage 11 operability and compatibility slice
+-- QhapaqXian DB Stage 12 security isolation slice
 
 CREATE AGENT archivist
   IDENTITY imperial
@@ -239,6 +239,29 @@ SELECT task_oid = :qx_task_oid AS task_match,
        checkpoint_count
 FROM pg_stat_qx_tasks
 ORDER BY task_oid;
+
+CREATE ROLE qx_observer LOGIN;
+
+SET SESSION AUTHORIZATION qx_observer;
+
+SELECT current_user, session_user;
+
+SELECT count(*) AS visible_agents
+FROM pg_stat_qx_agents;
+
+SELECT count(*) AS visible_sessions
+FROM pg_stat_qx_sessions;
+
+SELECT count(*) AS visible_tasks
+FROM pg_stat_qx_tasks;
+
+SELECT has_table_privilege(current_user, 'pg_qx_memory', 'SELECT') AS can_select_memory;
+
+SELECT count(*) FROM pg_qx_memory;
+
+RESET SESSION AUTHORIZATION;
+
+DROP ROLE qx_observer;
 
 START SESSION FOR AGENT archivist
   RETURNING SESSION;

@@ -1,4 +1,4 @@
--- QhapaqXian DB Stage 11 operability and compatibility slice
+-- QhapaqXian DB Stage 12 security isolation slice
 CREATE AGENT archivist
   IDENTITY imperial
   MODEL 'openai:gpt-5.4'
@@ -419,6 +419,45 @@ ORDER BY task_oid;
  t          | archivist  | summarize_docs | completed  | t           | t              |             2 |          5 |           9 |           9 |                2
 (1 row)
 
+CREATE ROLE qx_observer LOGIN;
+SET SESSION AUTHORIZATION qx_observer;
+SELECT current_user, session_user;
+ current_user | session_user 
+--------------+--------------
+ qx_observer  | qx_observer
+(1 row)
+
+SELECT count(*) AS visible_agents
+FROM pg_stat_qx_agents;
+ visible_agents 
+----------------
+              0
+(1 row)
+
+SELECT count(*) AS visible_sessions
+FROM pg_stat_qx_sessions;
+ visible_sessions 
+------------------
+                0
+(1 row)
+
+SELECT count(*) AS visible_tasks
+FROM pg_stat_qx_tasks;
+ visible_tasks 
+---------------
+             0
+(1 row)
+
+SELECT has_table_privilege(current_user, 'pg_qx_memory', 'SELECT') AS can_select_memory;
+ can_select_memory 
+-------------------
+ f
+(1 row)
+
+SELECT count(*) FROM pg_qx_memory;
+ERROR:  permission denied for table pg_qx_memory
+RESET SESSION AUTHORIZATION;
+DROP ROLE qx_observer;
 START SESSION FOR AGENT archivist
   RETURNING SESSION;
 ERROR:  START SESSION ... RETURNING SESSION is not executable yet
