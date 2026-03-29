@@ -13,6 +13,7 @@ top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
 
 OBJS = \
+	agentcmds.o \
 	aggregatecmds.o \
 	alter.o \
 	amcmds.o \
@@ -40,6 +41,7 @@ OBJS = \
 	indexcmds.o \
 	lockcmds.o \
 	matview.o \
+	memorycmds.o \
 	opclasscmds.o \
 	operatorcmds.o \
 	policy.o \
@@ -50,10 +52,13 @@ OBJS = \
 	schemacmds.o \
 	seclabel.o \
 	sequence.o \
+	sessioncmds.o \
 	statscmds.o \
 	subscriptioncmds.o \
 	tablecmds.o \
+	taskcmds.o \
 	tablespace.o \
+	tracecmds.o \
 	trigger.o \
 	tsearchcmds.o \
 	typecmds.o \

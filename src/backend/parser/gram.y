@@ -216,6 +216,8 @@ static PartitionStrategy parsePartitionStrategy(char *strategy);
 static void preprocess_pubobj_list(List *pubobjspec_list,
 								   core_yyscan_t yyscanner);
 static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
+static int qx_parse_memory_scope(char *scope, int location,
+								 core_yyscan_t yyscanner);
 
 %}
 
@@ -313,6 +315,8 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 		UnlistenStmt UpdateStmt VacuumStmt
 		VariableResetStmt VariableSetStmt VariableShowStmt
 		ViewStmt CheckPointStmt CreateConversionStmt
+		CreateAgentStmt StartSessionStmt RunTaskStmt ResumeTaskStmt ExplainAgentStmt
+		RememberStmt FetchMemoryStmt ShowTraceStmt
 		DeallocateStmt PrepareStmt ExecuteStmt
 		DropOwnedStmt ReassignOwnedStmt
 		AlterTSConfigurationStmt AlterTSDictionaryStmt
@@ -352,6 +356,17 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <defelt>	utility_option_elem
 %type <list>	utility_option_list
 %type <node>	utility_option_arg
+%type <node>	qx_explainable_stmt
+%type <str>		qx_opt_agent_identity qx_opt_agent_model
+				qx_opt_agent_memory_profile qx_opt_agent_policy
+				qx_opt_task_name qx_opt_task_priority
+				qx_opt_resume_checkpoint qx_opt_memory_match
+%type <list>	qx_opt_agent_tools qx_opt_agent_budget
+				qx_opt_memory_scopes qx_memory_scope_list
+				qx_opt_memory_tags qx_memory_tag_list
+%type <node>	qx_opt_session_context qx_opt_task_input
+%type <boolean>	qx_opt_returning_session qx_opt_returning_task
+%type <ival>	qx_memory_scope qx_opt_fetch_limit qx_opt_show_trace_limit
 %type <defelt>	drop_option
 %type <boolean>	opt_or_replace opt_no
 				opt_grant_grant_option
@@ -703,17 +718,17 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 
 /* ordinary key words in alphabetical order */
 %token <keyword> ABORT_P ABSENT ABSOLUTE_P ACCESS ACTION ADD_P ADMIN AFTER
-	AGGREGATE ALL ALSO ALTER ALWAYS ANALYSE ANALYZE AND ANY ARRAY AS ASC
+	AGENT AGGREGATE ALL ALSO ALTER ALWAYS ANALYSE ANALYZE AND ANY ARRAY AS ASC
 	ASENSITIVE ASSERTION ASSIGNMENT ASYMMETRIC ATOMIC AT ATTACH ATTRIBUTE AUTHORIZATION
 
 	BACKWARD BEFORE BEGIN_P BETWEEN BIGINT BINARY BIT
 	BOOLEAN_P BOTH BREADTH BY
 
-	CACHE CALL CALLED CASCADE CASCADED CASE CAST CATALOG_P CHAIN CHAR_P
+	BUDGET CACHE CALL CALLED CASCADE CASCADED CASE CAST CATALOG_P CHAIN CHAR_P
 	CHARACTER CHARACTERISTICS CHECK CHECKPOINT CLASS CLOSE
 	CLUSTER COALESCE COLLATE COLLATION COLUMN COLUMNS COMMENT COMMENTS COMMIT
 	COMMITTED COMPRESSION CONCURRENTLY CONDITIONAL CONFIGURATION CONFLICT
-	CONNECTION CONSTRAINT CONSTRAINTS CONTENT_P CONTINUE_P CONVERSION_P COPY
+	CONNECTION CONSTRAINT CONSTRAINTS CONTENT_P CONTEXT_P CONTINUE_P CONVERSION_P COPY
 	COST CREATE CROSS CSV CUBE CURRENT_P
 	CURRENT_CATALOG CURRENT_DATE CURRENT_ROLE CURRENT_SCHEMA
 	CURRENT_TIME CURRENT_TIMESTAMP CURRENT_USER CURSOR CYCLE
@@ -730,7 +745,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	FALSE_P FAMILY FETCH FILTER FINALIZE FIRST_P FLOAT_P FOLLOWING FOR
 	FORCE FOREIGN FORMAT FORWARD FREEZE FROM FULL FUNCTION FUNCTIONS
 
-	GENERATED GLOBAL GRANT GRANTED GREATEST GROUP_P GROUPING GROUPS
+	GENERATED GLOBAL GOAL GRANT GRANTED GREATEST GROUP_P GROUPING GROUPS
 
 	HANDLER HAVING HEADER_P HOLD HOUR_P
 
@@ -748,8 +763,8 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	LEADING LEAKPROOF LEAST LEFT LEVEL LIKE LIMIT LISTEN LOAD LOCAL
 	LOCALTIME LOCALTIMESTAMP LOCATION LOCK_P LOCKED LOGGED
 
-	MAPPING MATCH MATCHED MATERIALIZED MAXVALUE MERGE MERGE_ACTION METHOD
-	MINUTE_P MINVALUE MODE MONTH_P MOVE
+	MAPPING MATCH MATCHED MATERIALIZED MAXVALUE MEMORY MERGE MERGE_ACTION METHOD
+	MINUTE_P MINVALUE MODE MODEL MONTH_P MOVE
 
 	NAME_P NAMES NATIONAL NATURAL NCHAR NESTED NEW NEXT NFC NFD NFKC NFKD NO
 	NONE NORMALIZE NORMALIZED
@@ -761,7 +776,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	OVER OVERLAPS OVERLAY OVERRIDING OWNED OWNER
 
 	PARALLEL PARAMETER PARSER PARTIAL PARTITION PASSING PASSWORD PATH
-	PLACING PLAN PLANS POLICY
+	PLACING PLAN PLANS POLICY PRIORITY PROFILE
 	POSITION PRECEDING PRECISION PRESERVE PREPARE PREPARED PRIMARY
 	PRIOR PRIVILEGES PROCEDURAL PROCEDURE PROCEDURES PROGRAM PUBLICATION
 
@@ -769,18 +784,18 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 
 	RANGE READ REAL REASSIGN RECHECK RECURSIVE REF_P REFERENCES REFERENCING
 	REFRESH REINDEX RELATIVE_P RELEASE RENAME REPEATABLE REPLACE REPLICA
-	RESET RESTART RESTRICT RETURN RETURNING RETURNS REVOKE RIGHT ROLE ROLLBACK ROLLUP
-	ROUTINE ROUTINES ROW ROWS RULE
+	RESET RESTART RESTRICT REMEMBER RESUME RETURN RETURNING RETURNS REVOKE RIGHT ROLE ROLLBACK ROLLUP
+	ROUTINE ROUTINES ROW ROWS RULE RUN
 
-	SAVEPOINT SCALAR SCHEMA SCHEMAS SCROLL SEARCH SECOND_P SECURITY SELECT
+	SAVEPOINT SCALAR SCHEMA SCHEMAS SCOPE SCROLL SEARCH SECOND_P SECURITY SELECT
 	SEQUENCE SEQUENCES
 	SERIALIZABLE SERVER SESSION SESSION_USER SET SETS SETOF SHARE SHOW
 	SIMILAR SIMPLE SKIP SMALLINT SNAPSHOT SOME SOURCE SQL_P STABLE STANDALONE_P
 	START STATEMENT STATISTICS STDIN STDOUT STORAGE STORED STRICT_P STRING_P STRIP_P
 	SUBSCRIPTION SUBSTRING SUPPORT SYMMETRIC SYSID SYSTEM_P SYSTEM_USER
 
-	TABLE TABLES TABLESAMPLE TABLESPACE TARGET TEMP TEMPLATE TEMPORARY TEXT_P THEN
-	TIES TIME TIMESTAMP TO TRAILING TRANSACTION TRANSFORM
+	TABLE TABLES TABLESAMPLE TABLESPACE TAGS TARGET TASK TEMP TEMPLATE TEMPORARY TEXT_P THEN
+	TIES TIME TIMESTAMP TO TOOLS TRACE TRAILING TRANSACTION TRANSFORM
 	TREAT TRIGGER TRIM TRUE_P
 	TRUNCATE TRUSTED TYPE_P TYPES_P
 
@@ -1041,6 +1056,7 @@ stmt:
 			| CreateAmStmt
 			| CreateAsStmt
 			| CreateAssertionStmt
+			| CreateAgentStmt
 			| CreateCastStmt
 			| CreateConversionStmt
 			| CreateDomainStmt
@@ -1089,6 +1105,8 @@ stmt:
 			| DropdbStmt
 			| ExecuteStmt
 			| ExplainStmt
+			| ExplainAgentStmt
+			| FetchMemoryStmt
 			| FetchStmt
 			| GrantStmt
 			| GrantRoleStmt
@@ -1104,12 +1122,15 @@ stmt:
 			| PrepareStmt
 			| ReassignOwnedStmt
 			| ReindexStmt
+			| RememberStmt
+			| ResumeTaskStmt
 			| RemoveAggrStmt
 			| RemoveFuncStmt
 			| RemoveOperStmt
 			| RenameStmt
 			| RevokeStmt
 			| RevokeRoleStmt
+			| RunTaskStmt
 			| RuleStmt
 			| SecLabelStmt
 			| SelectStmt
@@ -1120,6 +1141,8 @@ stmt:
 			| VacuumStmt
 			| VariableResetStmt
 			| VariableSetStmt
+			| StartSessionStmt
+			| ShowTraceStmt
 			| VariableShowStmt
 			| ViewStmt
 			| /*EMPTY*/
@@ -1947,6 +1970,246 @@ SetResetClause:
 FunctionSetResetClause:
 			SET set_rest_more				{ $$ = $2; }
 			| VariableResetStmt				{ $$ = (VariableSetStmt *) $1; }
+		;
+
+/*
+ * QhapaqXian DB agentic commands.
+ *
+ * Clause order is intentionally fixed in this first parser pass to keep the
+ * fork diff small and predictable against upstream PostgreSQL.
+ */
+CreateAgentStmt:
+			CREATE AGENT name
+			qx_opt_agent_identity
+			qx_opt_agent_model
+			qx_opt_agent_memory_profile
+			qx_opt_agent_tools
+			qx_opt_agent_policy
+			qx_opt_agent_budget
+				{
+					CreateAgentStmt *n = makeNode(CreateAgentStmt);
+
+					n->agent_name = $3;
+					n->if_not_exists = false;
+					n->identity_name = $4;
+					n->model_uri = $5;
+					n->memory_profile = $6;
+					n->tools = $7;
+					n->policy_name = $8;
+					n->budget_options = $9;
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+		;
+
+qx_opt_agent_identity:
+			IDENTITY_P name							{ $$ = $2; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
+qx_opt_agent_model:
+			MODEL Sconst							{ $$ = $2; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
+qx_opt_agent_memory_profile:
+			MEMORY PROFILE name					{ $$ = $3; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
+qx_opt_agent_tools:
+			TOOLS '(' name_list ')'				{ $$ = $3; }
+			| /* EMPTY */							{ $$ = NIL; }
+		;
+
+qx_opt_agent_policy:
+			POLICY name							{ $$ = $2; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
+qx_opt_agent_budget:
+			BUDGET '(' utility_option_list ')'	{ $$ = $3; }
+			| /* EMPTY */							{ $$ = NIL; }
+		;
+
+StartSessionStmt:
+			START SESSION FOR AGENT name
+			qx_opt_session_context
+			qx_opt_returning_session
+				{
+					StartSessionStmt *n = makeNode(StartSessionStmt);
+
+					n->agent_name = $5;
+					n->context = $6;
+					n->returning = $7;
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+		;
+
+qx_opt_session_context:
+			WITH CONTEXT_P a_expr				{ $$ = $3; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
+qx_opt_returning_session:
+			RETURNING SESSION					{ $$ = true; }
+			| /* EMPTY */							{ $$ = false; }
+		;
+
+RunTaskStmt:
+			RUN TASK qx_opt_task_name IN_P SESSION a_expr GOAL Sconst
+			qx_opt_task_input
+			qx_opt_task_priority
+			qx_opt_returning_task
+				{
+					RunTaskStmt *n = makeNode(RunTaskStmt);
+
+					n->task_name = $3;
+					n->session_id = $6;
+					n->goal = $8;
+					n->input = $9;
+					n->priority = $10;
+					n->returning = $11;
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+		;
+
+ResumeTaskStmt:
+			RESUME TASK a_expr qx_opt_resume_checkpoint
+				{
+					ResumeTaskStmt *n = makeNode(ResumeTaskStmt);
+
+					n->task_id = $3;
+					n->checkpoint_label = $4;
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+		;
+
+ExplainAgentStmt:
+			EXPLAIN AGENT qx_explainable_stmt
+				{
+					ExplainAgentStmt *n = makeNode(ExplainAgentStmt);
+
+					n->statement = $3;
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+		;
+
+qx_explainable_stmt:
+			RunTaskStmt
+			| ResumeTaskStmt
+		;
+
+RememberStmt:
+			REMEMBER IN_P SESSION a_expr SCOPE name KEY Sconst VALUE_P a_expr
+			qx_opt_memory_tags
+				{
+					RememberStmt *n = makeNode(RememberStmt);
+
+					n->session_id = $4;
+					n->scope = qx_parse_memory_scope($6, @6, yyscanner);
+					n->memory_key = $8;
+					n->memory_value = $10;
+					n->tags = $11;
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+		;
+
+FetchMemoryStmt:
+			FETCH MEMORY FOR AGENT name qx_opt_memory_scopes qx_opt_memory_match
+			qx_opt_fetch_limit
+				{
+					FetchMemoryStmt *n = makeNode(FetchMemoryStmt);
+
+					n->agent_name = $5;
+					n->scopes = $6;
+					n->match_text = $7;
+					n->limit_count = $8;
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+		;
+
+ShowTraceStmt:
+			SHOW TRACE FOR TASK a_expr qx_opt_show_trace_limit
+				{
+					ShowTraceStmt *n = makeNode(ShowTraceStmt);
+
+					n->task_id = $5;
+					n->limit_count = $6;
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+		;
+
+qx_opt_task_name:
+			name								{ $$ = $1; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
+qx_opt_task_input:
+			INPUT_P a_expr						{ $$ = $2; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
+qx_opt_task_priority:
+			PRIORITY name						{ $$ = $2; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
+qx_opt_returning_task:
+			RETURNING TASK						{ $$ = true; }
+			| /* EMPTY */							{ $$ = false; }
+		;
+
+qx_opt_resume_checkpoint:
+			FROM CHECKPOINT Sconst				{ $$ = $3; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
+qx_memory_scope:
+			name								{ $$ = qx_parse_memory_scope($1, @1, yyscanner); }
+		;
+
+qx_opt_memory_scopes:
+			SCOPE qx_memory_scope_list			{ $$ = $2; }
+			| /* EMPTY */							{ $$ = NIL; }
+		;
+
+qx_memory_scope_list:
+			qx_memory_scope						{ $$ = list_make1(makeInteger($1)); }
+			| qx_memory_scope_list ',' qx_memory_scope
+												{ $$ = lappend($1, makeInteger($3)); }
+		;
+
+qx_opt_memory_match:
+			MATCH Sconst							{ $$ = $2; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
+qx_opt_fetch_limit:
+			LIMIT Iconst							{ $$ = $2; }
+			| /* EMPTY */							{ $$ = 10; }
+		;
+
+qx_opt_show_trace_limit:
+			LIMIT Iconst							{ $$ = $2; }
+			| /* EMPTY */							{ $$ = 50; }
+		;
+
+qx_opt_memory_tags:
+			TAGS '(' qx_memory_tag_list ')'		{ $$ = $3; }
+			| /* EMPTY */							{ $$ = NIL; }
+		;
+
+qx_memory_tag_list:
+			Sconst								{ $$ = list_make1(makeString($1)); }
+			| qx_memory_tag_list ',' Sconst		{ $$ = lappend($1, makeString($3)); }
 		;
 
 
@@ -17534,6 +17797,7 @@ unreserved_keyword:
 			| ADD_P
 			| ADMIN
 			| AFTER
+			| AGENT
 			| AGGREGATE
 			| ALSO
 			| ALTER
@@ -17550,6 +17814,7 @@ unreserved_keyword:
 			| BEGIN_P
 			| BREADTH
 			| BY
+			| BUDGET
 			| CACHE
 			| CALL
 			| CALLED
@@ -17574,6 +17839,7 @@ unreserved_keyword:
 			| CONNECTION
 			| CONSTRAINTS
 			| CONTENT_P
+			| CONTEXT_P
 			| CONTINUE_P
 			| CONVERSION_P
 			| COPY
@@ -17633,6 +17899,7 @@ unreserved_keyword:
 			| FUNCTIONS
 			| GENERATED
 			| GLOBAL
+			| GOAL
 			| GRANTED
 			| GROUPS
 			| HANDLER
@@ -17681,11 +17948,13 @@ unreserved_keyword:
 			| MATCHED
 			| MATERIALIZED
 			| MAXVALUE
+			| MEMORY
 			| MERGE
 			| METHOD
 			| MINUTE_P
 			| MINVALUE
 			| MODE
+			| MODEL
 			| MONTH_P
 			| MOVE
 			| NAME_P
@@ -17734,10 +18003,12 @@ unreserved_keyword:
 			| PREPARED
 			| PRESERVE
 			| PRIOR
+			| PRIORITY
 			| PRIVILEGES
 			| PROCEDURAL
 			| PROCEDURE
 			| PROCEDURES
+			| PROFILE
 			| PROGRAM
 			| PUBLICATION
 			| QUOTE
@@ -17753,6 +18024,7 @@ unreserved_keyword:
 			| REINDEX
 			| RELATIVE_P
 			| RELEASE
+			| REMEMBER
 			| RENAME
 			| REPEATABLE
 			| REPLACE
@@ -17760,6 +18032,7 @@ unreserved_keyword:
 			| RESET
 			| RESTART
 			| RESTRICT
+			| RESUME
 			| RETURN
 			| RETURNS
 			| REVOKE
@@ -17770,10 +18043,12 @@ unreserved_keyword:
 			| ROUTINES
 			| ROWS
 			| RULE
+			| RUN
 			| SAVEPOINT
 			| SCALAR
 			| SCHEMA
 			| SCHEMAS
+			| SCOPE
 			| SCROLL
 			| SEARCH
 			| SECOND_P
@@ -17810,12 +18085,16 @@ unreserved_keyword:
 			| SYSTEM_P
 			| TABLES
 			| TABLESPACE
+			| TAGS
 			| TARGET
+			| TASK
 			| TEMP
 			| TEMPLATE
 			| TEMPORARY
 			| TEXT_P
 			| TIES
+			| TOOLS
+			| TRACE
 			| TRANSACTION
 			| TRANSFORM
 			| TRIGGER
@@ -18382,6 +18661,7 @@ bare_label_keyword:
 			| REINDEX
 			| RELATIVE_P
 			| RELEASE
+			| REMEMBER
 			| RENAME
 			| REPEATABLE
 			| REPLACE
@@ -18389,6 +18669,7 @@ bare_label_keyword:
 			| RESET
 			| RESTART
 			| RESTRICT
+			| RESUME
 			| RETURN
 			| RETURNS
 			| REVOKE
@@ -18405,6 +18686,7 @@ bare_label_keyword:
 			| SCALAR
 			| SCHEMA
 			| SCHEMAS
+			| SCOPE
 			| SCROLL
 			| SEARCH
 			| SECURITY
@@ -18451,6 +18733,7 @@ bare_label_keyword:
 			| TABLES
 			| TABLESAMPLE
 			| TABLESPACE
+			| TAGS
 			| TARGET
 			| TEMP
 			| TEMPLATE
@@ -18460,6 +18743,7 @@ bare_label_keyword:
 			| TIES
 			| TIME
 			| TIMESTAMP
+			| TRACE
 			| TRAILING
 			| TRANSACTION
 			| TRANSFORM
@@ -19508,6 +19792,26 @@ makeRecursiveViewSelect(char *relname, List *aliases, Node *query)
 	s->fromClause = list_make1(makeRangeVar(NULL, relname, -1));
 
 	return (Node *) s;
+}
+
+static int
+qx_parse_memory_scope(char *scope, int location, core_yyscan_t yyscanner)
+{
+	if (pg_strcasecmp(scope, "working") == 0 ||
+		pg_strcasecmp(scope, "work") == 0)
+		return 'w';
+	if (pg_strcasecmp(scope, "episodic") == 0)
+		return 'e';
+	if (pg_strcasecmp(scope, "semantic") == 0)
+		return 's';
+
+	ereport(ERROR,
+			(errcode(ERRCODE_SYNTAX_ERROR),
+			 errmsg("unrecognized QhapaqXian memory scope \"%s\"", scope),
+			 errdetail("Valid scopes are WORKING, EPISODIC, and SEMANTIC."),
+			 parser_errposition(location)));
+
+	return 'w';
 }
 
 /* parser_init()

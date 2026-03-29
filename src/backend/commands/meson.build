@@ -1,6 +1,7 @@
 # Copyright (c) 2022-2024, PostgreSQL Global Development Group
 
 backend_sources += files(
+  'agentcmds.c',
   'aggregatecmds.c',
   'alter.c',
   'amcmds.c',
@@ -28,6 +29,7 @@ backend_sources += files(
   'indexcmds.c',
   'lockcmds.c',
   'matview.c',
+  'memorycmds.c',
   'opclasscmds.c',
   'operatorcmds.c',
   'policy.c',
@@ -38,10 +40,13 @@ backend_sources += files(
   'schemacmds.c',
   'seclabel.c',
   'sequence.c',
+  'sessioncmds.c',
   'statscmds.c',
   'subscriptioncmds.c',
   'tablecmds.c',
+  'taskcmds.c',
   'tablespace.c',
+  'tracecmds.c',
   'trigger.c',
   'tsearchcmds.c',
   'typecmds.c',

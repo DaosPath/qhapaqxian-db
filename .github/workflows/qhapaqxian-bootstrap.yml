@@ -1,0 +1,33 @@
+name: qhapaqxian-bootstrap
+
+on:
+  push:
+    branches:
+      - codex/**
+      - qx/**
+  pull_request:
+
+jobs:
+  build-bootstrap:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bison \
+            flex \
+            libreadline-dev \
+            zlib1g-dev \
+            libxml2-dev \
+            libxslt1-dev \
+            libssl-dev \
+            perl \
+            pkg-config
+      - name: Configure
+        run: ./configure --without-icu --without-ldap --without-pam --with-extra-version='+qhx-bootstrap'
+      - name: Build
+        run: make -j"$(nproc)"
+      - name: Smoke version
+        run: ./src/backend/postgres --version

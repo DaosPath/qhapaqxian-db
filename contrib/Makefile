@@ -40,6 +40,7 @@ SUBDIRS = \
 		pgstattuple	\
 		pg_visibility	\
 		pg_walinspect	\
+		qhapaqxian_output \
 		postgres_fdw	\
 		seg		\
 		spi		\

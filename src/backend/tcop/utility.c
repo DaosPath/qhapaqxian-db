@@ -24,6 +24,7 @@
 #include "catalog/pg_authid.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/toasting.h"
+#include "commands/agentcmds.h"
 #include "commands/alter.h"
 #include "commands/async.h"
 #include "commands/cluster.h"
@@ -40,6 +41,7 @@
 #include "commands/extension.h"
 #include "commands/lockcmds.h"
 #include "commands/matview.h"
+#include "commands/memorycmds.h"
 #include "commands/policy.h"
 #include "commands/portalcmds.h"
 #include "commands/prepare.h"
@@ -48,13 +50,17 @@
 #include "commands/schemacmds.h"
 #include "commands/seclabel.h"
 #include "commands/sequence.h"
+#include "commands/sessioncmds.h"
 #include "commands/subscriptioncmds.h"
 #include "commands/tablecmds.h"
+#include "commands/taskcmds.h"
 #include "commands/tablespace.h"
+#include "commands/tracecmds.h"
 #include "commands/trigger.h"
 #include "commands/typecmds.h"
 #include "commands/user.h"
 #include "commands/vacuum.h"
+#include "qx/qx_agent_planner.h"
 #include "commands/view.h"
 #include "miscadmin.h"
 #include "parser/parse_utilcmd.h"
@@ -163,6 +169,7 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 		case T_AlterUserMappingStmt:
 		case T_CommentStmt:
 		case T_CompositeTypeStmt:
+		case T_CreateAgentStmt:
 		case T_CreateAmStmt:
 		case T_CreateCastStmt:
 		case T_CreateConversionStmt:
@@ -206,9 +213,13 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 		case T_IndexStmt:
 		case T_ReassignOwnedStmt:
 		case T_RefreshMatViewStmt:
+		case T_RememberStmt:
+		case T_ResumeTaskStmt:
 		case T_RenameStmt:
+		case T_RunTaskStmt:
 		case T_RuleStmt:
 		case T_SecLabelStmt:
+		case T_StartSessionStmt:
 		case T_TruncateStmt:
 		case T_ViewStmt:
 			{
@@ -313,6 +324,9 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 			}
 
 		case T_ExplainStmt:
+		case T_ExplainAgentStmt:
+		case T_FetchMemoryStmt:
+		case T_ShowTraceStmt:
 		case T_VariableShowStmt:
 			{
 				/*
@@ -707,6 +721,34 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 			ExecuteDoStmt(pstate, (DoStmt *) parsetree, isAtomicContext);
 			break;
 
+		case T_CreateAgentStmt:
+			CreateAgentCommand((CreateAgentStmt *) parsetree);
+			break;
+
+		case T_StartSessionStmt:
+			StartSessionCommand((StartSessionStmt *) parsetree);
+			break;
+
+		case T_RunTaskStmt:
+			RunTaskCommand((RunTaskStmt *) parsetree);
+			break;
+
+		case T_ResumeTaskStmt:
+			ResumeTaskCommand((ResumeTaskStmt *) parsetree);
+			break;
+
+		case T_RememberStmt:
+			RememberMemoryCommand((RememberStmt *) parsetree);
+			break;
+
+		case T_FetchMemoryStmt:
+			FetchMemoryCommand((FetchMemoryStmt *) parsetree, dest);
+			break;
+
+		case T_ShowTraceStmt:
+			ShowTraceCommand((ShowTraceStmt *) parsetree, dest);
+			break;
+
 		case T_CreateTableSpaceStmt:
 			/* no event triggers for global objects */
 			PreventInTransactionBlock(isTopLevel, "CREATE TABLESPACE");
@@ -857,6 +899,10 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 
 		case T_VacuumStmt:
 			ExecVacuum(pstate, (VacuumStmt *) parsetree, isTopLevel);
+			break;
+
+		case T_ExplainAgentStmt:
+			QxExplainAgentCommand((ExplainAgentStmt *) parsetree, dest);
 			break;
 
 		case T_ExplainStmt:
@@ -2061,6 +2107,15 @@ UtilityReturnsTuples(Node *parsetree)
 		case T_ExplainStmt:
 			return true;
 
+		case T_ExplainAgentStmt:
+			return true;
+
+		case T_FetchMemoryStmt:
+			return true;
+
+		case T_ShowTraceStmt:
+			return true;
+
 		case T_VariableShowStmt:
 			return true;
 
@@ -2111,6 +2166,15 @@ UtilityTupleDescriptor(Node *parsetree)
 
 		case T_ExplainStmt:
 			return ExplainResultDesc((ExplainStmt *) parsetree);
+
+		case T_ExplainAgentStmt:
+			return QxExplainAgentResultDesc();
+
+		case T_FetchMemoryStmt:
+			return FetchMemoryResultDesc();
+
+		case T_ShowTraceStmt:
+			return ShowTraceResultDesc();
 
 		case T_VariableShowStmt:
 			{
@@ -2393,6 +2457,26 @@ CreateCommandTag(Node *parsetree)
 			break;
 
 			/* utility statements --- same whether raw or cooked */
+		case T_CreateAgentStmt:
+			tag = CMDTAG_CREATE_AGENT;
+			break;
+
+		case T_StartSessionStmt:
+			tag = CMDTAG_START_SESSION;
+			break;
+
+		case T_RunTaskStmt:
+			tag = CMDTAG_RUN_TASK;
+			break;
+
+		case T_ResumeTaskStmt:
+			tag = CMDTAG_RESUME_TASK;
+			break;
+
+		case T_RememberStmt:
+			tag = CMDTAG_REMEMBER;
+			break;
+
 		case T_TransactionStmt:
 			{
 				TransactionStmt *stmt = (TransactionStmt *) parsetree;
@@ -2870,6 +2954,14 @@ CreateCommandTag(Node *parsetree)
 			tag = CMDTAG_EXPLAIN;
 			break;
 
+		case T_ExplainAgentStmt:
+			tag = CMDTAG_EXPLAIN_AGENT;
+			break;
+
+		case T_FetchMemoryStmt:
+			tag = CMDTAG_FETCH_MEMORY;
+			break;
+
 		case T_CreateTableAsStmt:
 			switch (((CreateTableAsStmt *) parsetree)->objtype)
 			{
@@ -2915,6 +3007,10 @@ CreateCommandTag(Node *parsetree)
 
 		case T_VariableShowStmt:
 			tag = CMDTAG_SHOW;
+			break;
+
+		case T_ShowTraceStmt:
+			tag = CMDTAG_SHOW_TRACE;
 			break;
 
 		case T_DiscardStmt:
@@ -3287,6 +3383,20 @@ GetCommandLogLevel(Node *parsetree)
 			break;
 
 		case T_FetchStmt:
+			lev = LOGSTMT_ALL;
+			break;
+
+		case T_CreateAgentStmt:
+			lev = LOGSTMT_DDL;
+			break;
+
+		case T_StartSessionStmt:
+		case T_ExplainAgentStmt:
+		case T_FetchMemoryStmt:
+		case T_RememberStmt:
+		case T_ResumeTaskStmt:
+		case T_RunTaskStmt:
+		case T_ShowTraceStmt:
 			lev = LOGSTMT_ALL;
 			break;
 

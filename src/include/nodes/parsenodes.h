@@ -2635,6 +2635,89 @@ typedef struct VariableShowStmt
 } VariableShowStmt;
 
 /* ----------------------
+ * Agentic Statements (QhapaqXian DB)
+ * ----------------------
+ */
+typedef struct CreateAgentStmt
+{
+	NodeTag		type;
+	char	   *agent_name;
+	bool		if_not_exists;
+	char	   *identity_name;
+	char	   *model_uri;
+	char	   *memory_profile;
+	List	   *tools;			/* list of String */
+	char	   *policy_name;
+	List	   *budget_options; /* list of DefElem */
+	ParseLoc	location;
+} CreateAgentStmt;
+
+typedef struct StartSessionStmt
+{
+	NodeTag		type;
+	char	   *agent_name;
+	Node	   *context;
+	bool		returning;
+	ParseLoc	location;
+} StartSessionStmt;
+
+typedef struct RunTaskStmt
+{
+	NodeTag		type;
+	char	   *task_name;
+	Node	   *session_id;
+	char	   *goal;
+	Node	   *input;
+	char	   *priority;
+	bool		returning;
+	ParseLoc	location;
+} RunTaskStmt;
+
+typedef struct ResumeTaskStmt
+{
+	NodeTag		type;
+	Node	   *task_id;
+	char	   *checkpoint_label;
+	ParseLoc	location;
+} ResumeTaskStmt;
+
+typedef struct ExplainAgentStmt
+{
+	NodeTag		type;
+	Node	   *statement;
+	ParseLoc	location;
+} ExplainAgentStmt;
+
+typedef struct RememberStmt
+{
+	NodeTag		type;
+	Node	   *session_id;
+	char		scope;
+	char	   *memory_key;
+	Node	   *memory_value;
+	List	   *tags;			/* list of String */
+	ParseLoc	location;
+} RememberStmt;
+
+typedef struct FetchMemoryStmt
+{
+	NodeTag		type;
+	char	   *agent_name;
+	List	   *scopes;			/* list of Integer */
+	char	   *match_text;
+	int			limit_count;
+	ParseLoc	location;
+} FetchMemoryStmt;
+
+typedef struct ShowTraceStmt
+{
+	NodeTag		type;
+	Node	   *task_id;
+	int			limit_count;
+	ParseLoc	location;
+} ShowTraceStmt;
+
+/* ----------------------
  *		Create Table Statement
  *
  * NOTE: in the raw gram.y output, ColumnDef and Constraint nodes are

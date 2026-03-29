@@ -69,6 +69,15 @@ catalog_headers = [
   'pg_publication_rel.h',
   'pg_subscription.h',
   'pg_subscription_rel.h',
+  'pg_qx_agent.h',
+  'pg_qx_session.h',
+  'pg_qx_attempt.h',
+  'pg_qx_task.h',
+  'pg_qx_step.h',
+  'pg_qx_event.h',
+  'pg_qx_trace.h',
+  'pg_qx_checkpoint.h',
+  'pg_qx_memory.h',
 ]
 
 # The .dat files we need can just be listed alphabetically.

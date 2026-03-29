@@ -1,0 +1,463 @@
+-- QhapaqXian DB Stage 11 operability and compatibility slice
+CREATE AGENT archivist
+  IDENTITY imperial
+  MODEL 'openai:gpt-5.4'
+  MEMORY PROFILE episodic
+  TOOLS (search, summarize)
+  POLICY guarded
+  BUDGET (tokens 4096, cost 12);
+SELECT qxagentname::text AS agent_name,
+       qxagentnamespace = 'public'::regnamespace AS in_public_schema,
+       qxagentowner = (SELECT oid FROM pg_roles WHERE rolname = current_user) AS owned_by_current_user,
+       qxidentity::text AS identity_name,
+       qxmodeluri::text AS model_uri,
+       qxmemoryprofile::text AS memory_profile,
+       qxpolicy::text AS policy_name,
+       qxtools IS NOT NULL AS has_tools,
+       qxbudget IS NOT NULL AS has_budget
+FROM pg_qx_agent
+WHERE qxagentname = 'archivist';
+ agent_name | in_public_schema | owned_by_current_user | identity_name |   model_uri    | memory_profile | policy_name | has_tools | has_budget 
+------------+------------------+-----------------------+---------------+----------------+----------------+-------------+-----------+------------
+ archivist  | t                | t                     | imperial      | openai:gpt-5.4 | episodic       | guarded     | t         | t
+(1 row)
+
+CREATE AGENT archivist
+  IDENTITY imperial;
+ERROR:  agent "archivist" already exists in schema "public"
+START SESSION FOR AGENT archivist
+  WITH CONTEXT jsonb_build_object('mission', 'index');
+SELECT qxsessionagentid = (SELECT oid FROM pg_qx_agent WHERE qxagentname = 'archivist') AS linked_agent,
+       qxsessiondbid = (SELECT oid FROM pg_database WHERE datname = current_database()) AS current_db,
+       qxsessionowner = (SELECT oid FROM pg_roles WHERE rolname = current_user) AS owned_by_current_user,
+       qxsessionstatus AS status,
+       qxcontext IS NOT NULL AS has_context
+FROM pg_qx_session
+ORDER BY oid;
+ linked_agent | current_db | owned_by_current_user | status | has_context 
+--------------+------------+-----------------------+--------+-------------
+ t            | t          | t                     | a      | t
+(1 row)
+
+SELECT qxeventkind::text AS event_kind,
+       qxeventlsn <> '0/0'::pg_lsn AS has_semantic_lsn,
+       COALESCE(qxeventlsn > lag(qxeventlsn) OVER (ORDER BY oid), true) AS lsn_monotonic,
+       qxeventtaskid = 0 AS session_scoped,
+       qxeventstepid = 0 AS without_step
+FROM pg_qx_event
+ORDER BY oid;
+   event_kind    | has_semantic_lsn | lsn_monotonic | session_scoped | without_step 
+-----------------+------------------+---------------+----------------+--------------
+ SESSION_STARTED | t                | t             | t              | t
+(1 row)
+
+SELECT qxtracename::text AS trace_name,
+       qxtracestate AS trace_state,
+       qxtracelsn <> '0/0'::pg_lsn AS has_semantic_lsn,
+       COALESCE(qxtracelsn > lag(qxtracelsn) OVER (ORDER BY oid), true) AS lsn_monotonic,
+       qxtracetaskid = 0 AS session_scoped
+FROM pg_qx_trace
+ORDER BY oid;
+  trace_name  | trace_state | has_semantic_lsn | lsn_monotonic | session_scoped 
+--------------+-------------+------------------+---------------+----------------
+ session.root | o           | t                | t             | t
+(1 row)
+
+SELECT oid AS qx_session_oid
+FROM pg_qx_session
+ORDER BY oid DESC
+LIMIT 1
+\gset
+EXPLAIN AGENT RUN TASK summarize_docs IN SESSION :qx_session_oid
+  GOAL 'summarize docs'
+  INPUT jsonb_build_object('topic', 'parser')
+  PRIORITY high;
+                                   AGENT PLAN                                    
+---------------------------------------------------------------------------------
+ AgentPlan v1
+   Command: RUN TASK
+   Goal: summarize docs
+   Task Name: summarize_docs
+   Priority: high
+   Checkpoint Label: stage8.after_capture
+   Input Present: true
+   Target State: checkpointed
+   Result Mode: catalog inspection via pg_qx_*
+   Checkpointable: true
+   Resumable: false
+   Estimated Cost: 63
+   Estimated Tool Calls: 0
+   Steps:
+     1. validate_session [cost=8, checkpoint=false, retry=false]
+        check session existence, ownership, database, and active state
+     2. snapshot_identity_policy [cost=11, checkpoint=false, retry=false]
+        freeze agent identity and policy/budget context for the attempt
+     3. enqueue_attempt [cost=17, checkpoint=false, retry=true]
+        persist the task shell and open attempt 1 in the embedded runtime
+     4. capture_input [cost=13, checkpoint=false, retry=false]
+        record task goal, priority, and raw input for deterministic resume
+     5. durable_checkpoint [cost=14, checkpoint=true, retry=true]
+        stop at a resumable checkpoint boundary before asynchronous continuation
+(24 rows)
+
+RUN TASK summarize_docs IN SESSION :qx_session_oid
+  GOAL 'summarize docs'
+  INPUT jsonb_build_object('topic', 'parser')
+  PRIORITY high;
+SELECT oid AS qx_task_oid
+FROM pg_qx_task
+ORDER BY oid DESC
+LIMIT 1
+\gset
+SELECT qxtaskname::text AS task_name,
+       qxtaskgoal::text AS goal,
+       qxtaskpriority::text AS priority,
+       qxtaskstate AS state,
+       qxtaskinput IS NOT NULL AS has_input,
+       qxtasksessionid = :qx_session_oid AS linked_session,
+       qxtasklastattemptid <> 0 AS has_attempt,
+       qxtasklastcheckpointid <> 0 AS has_checkpoint
+FROM pg_qx_task
+ORDER BY oid;
+   task_name    |      goal      | priority | state | has_input | linked_session | has_attempt | has_checkpoint 
+----------------+----------------+----------+-------+-----------+----------------+-------------+----------------
+ summarize_docs | summarize docs | high     | k     | t         | t              | t           | t
+(1 row)
+
+SELECT qxattemptseqno AS seqno,
+       qxattemptstate AS state,
+       qxattemptresumecheckpointid = 0 AS starts_fresh,
+       qxattemptstrategy::text AS strategy
+FROM pg_qx_attempt
+ORDER BY qxattemptseqno;
+ seqno | state | starts_fresh | strategy 
+-------+-------+--------------+----------
+     1 | k     | t            | initial
+(1 row)
+
+SELECT qxstepseqno AS seqno,
+       qxstepname::text AS step_name,
+       qxstepstate AS state
+FROM pg_qx_step
+ORDER BY qxstepseqno;
+ seqno |         step_name         | state 
+-------+---------------------------+-------
+     1 | stage8.scheduler_admit    | c
+     2 | stage8.capture_input      | c
+     3 | stage8.checkpoint_barrier | c
+(3 rows)
+
+SELECT qxeventkind::text AS event_kind,
+       qxeventlsn <> '0/0'::pg_lsn AS has_semantic_lsn,
+       COALESCE(qxeventlsn > lag(qxeventlsn) OVER (ORDER BY oid), true) AS lsn_monotonic,
+       qxeventtaskid = (SELECT oid FROM pg_qx_task ORDER BY oid DESC LIMIT 1) AS linked_task,
+       qxeventstepid <> 0 AS has_step
+FROM pg_qx_event
+ORDER BY oid;
+      event_kind       | has_semantic_lsn | lsn_monotonic | linked_task | has_step 
+-----------------------+------------------+---------------+-------------+----------
+ SESSION_STARTED       | t                | t             | f           | f
+ TASK_QUEUED           | t                | t             | t           | f
+ TASK_DISPATCHED       | t                | t             | t           | t
+ TASK_INPUT_CAPTURED   | t                | t             | t           | t
+ TASK_CHECKPOINTED     | t                | t             | t           | t
+ TASK_READY_FOR_RESUME | t                | t             | t           | f
+(6 rows)
+
+SELECT qxtracename::text AS trace_name,
+       qxtracestate AS trace_state,
+       qxtracelsn <> '0/0'::pg_lsn AS has_semantic_lsn,
+       COALESCE(qxtracelsn > lag(qxtracelsn) OVER (ORDER BY oid), true) AS lsn_monotonic,
+       qxtracetaskid = (SELECT oid FROM pg_qx_task ORDER BY oid DESC LIMIT 1) AS linked_task
+FROM pg_qx_trace
+ORDER BY oid;
+      trace_name       | trace_state | has_semantic_lsn | lsn_monotonic | linked_task 
+-----------------------+-------------+------------------+---------------+-------------
+ session.root          | o           | t                | t             | f
+ runtime.queue         | c           | t                | t             | t
+ runtime.dispatch      | c           | t                | t             | t
+ runtime.capture_input | c           | t                | t             | t
+ runtime.checkpoint    | c           | t                | t             | t
+ runtime.pause         | c           | t                | t             | t
+(6 rows)
+
+SELECT qxcheckpointlabel::text AS checkpoint_label,
+       qxcheckpointstate AS checkpoint_state,
+       qxcheckpointtaskstate AS task_state,
+       qxcheckpointlsn <> '0/0'::pg_lsn AS has_semantic_lsn,
+       COALESCE(qxcheckpointlsn > lag(qxcheckpointlsn) OVER (ORDER BY oid), true) AS lsn_monotonic,
+       qxcheckpointnextstepseqno AS next_step,
+       qxcheckpointattemptid <> 0 AS linked_attempt,
+       qxcheckpointtaskid = (SELECT oid FROM pg_qx_task ORDER BY oid DESC LIMIT 1) AS linked_task,
+       qxcheckpointdata::text LIKE 'task=%' AS has_data
+FROM pg_qx_checkpoint
+ORDER BY oid;
+   checkpoint_label   | checkpoint_state | task_state | has_semantic_lsn | lsn_monotonic | next_step | linked_attempt | linked_task | has_data 
+----------------------+------------------+------------+------------------+---------------+-----------+----------------+-------------+----------
+ stage8.after_capture | d                | k          | t                | t             |         4 | t              | t           | t
+(1 row)
+
+EXPLAIN AGENT RESUME TASK :qx_task_oid FROM CHECKPOINT 'stage8.after_capture';
+                                   AGENT PLAN                                    
+---------------------------------------------------------------------------------
+ AgentPlan v1
+   Command: RESUME TASK
+   Checkpoint Label: stage8.after_capture
+   Input Present: false
+   Target State: completed
+   Result Mode: state transition via pg_qx_task
+   Checkpointable: true
+   Resumable: true
+   Estimated Cost: 54
+   Estimated Tool Calls: 0
+   Steps:
+     1. validate_task [cost=7, checkpoint=false, retry=false]
+        check task visibility, ownership, and checkpointed state
+     2. load_checkpoint [cost=10, checkpoint=true, retry=false]
+        load the latest durable checkpoint and verify the requested label
+     3. open_resume_attempt [cost=12, checkpoint=false, retry=true]
+        create a new runtime attempt linked to the resumable checkpoint
+     4. resume_dispatch [cost=14, checkpoint=false, retry=true]
+        dispatch the resumed attempt from the stored next-step boundary
+     5. final_checkpoint [cost=11, checkpoint=true, retry=false]
+        seal completion with a final durable checkpoint and completed task state
+(21 rows)
+
+RESUME TASK :qx_task_oid FROM CHECKPOINT 'stage8.after_capture';
+SELECT qxtaskname::text AS task_name,
+       qxtaskstate AS state,
+       qxtasklastattemptid <> 0 AS has_attempt,
+       qxtasklastcheckpointid <> 0 AS has_checkpoint
+FROM pg_qx_task
+ORDER BY oid;
+   task_name    | state | has_attempt | has_checkpoint 
+----------------+-------+-------------+----------------
+ summarize_docs | c     | t           | t
+(1 row)
+
+SELECT qxattemptseqno AS seqno,
+       qxattemptstate AS state,
+       qxattemptresumecheckpointid <> 0 AS resumes_from_checkpoint,
+       qxattemptstrategy::text AS strategy
+FROM pg_qx_attempt
+ORDER BY qxattemptseqno;
+ seqno | state | resumes_from_checkpoint | strategy 
+-------+-------+-------------------------+----------
+     1 | k     | f                       | initial
+     2 | c     | t                       | resume
+(2 rows)
+
+SELECT qxstepseqno AS seqno,
+       qxstepname::text AS step_name,
+       qxstepstate AS state
+FROM pg_qx_step
+ORDER BY qxstepseqno;
+ seqno |         step_name         | state 
+-------+---------------------------+-------
+     1 | stage8.scheduler_admit    | c
+     2 | stage8.capture_input      | c
+     3 | stage8.checkpoint_barrier | c
+     4 | stage8.resume_dispatch    | c
+     5 | stage8.complete           | c
+(5 rows)
+
+SELECT qxeventkind::text AS event_kind,
+       qxeventlsn <> '0/0'::pg_lsn AS has_semantic_lsn,
+       COALESCE(qxeventlsn > lag(qxeventlsn) OVER (ORDER BY oid), true) AS lsn_monotonic,
+       qxeventtaskid = (SELECT oid FROM pg_qx_task ORDER BY oid DESC LIMIT 1) AS linked_task,
+       qxeventstepid <> 0 AS has_step
+FROM pg_qx_event
+ORDER BY oid;
+       event_kind       | has_semantic_lsn | lsn_monotonic | linked_task | has_step 
+------------------------+------------------+---------------+-------------+----------
+ SESSION_STARTED        | t                | t             | f           | f
+ TASK_QUEUED            | t                | t             | t           | f
+ TASK_DISPATCHED        | t                | t             | t           | t
+ TASK_INPUT_CAPTURED    | t                | t             | t           | t
+ TASK_CHECKPOINTED      | t                | t             | t           | t
+ TASK_READY_FOR_RESUME  | t                | t             | t           | f
+ TASK_RESUMED           | t                | t             | t           | f
+ TASK_RESUME_DISPATCHED | t                | t             | t           | t
+ TASK_CHECKPOINTED      | t                | t             | t           | t
+ TASK_COMPLETED         | t                | t             | t           | f
+(10 rows)
+
+SELECT qxtracename::text AS trace_name,
+       qxtracestate AS trace_state,
+       qxtracelsn <> '0/0'::pg_lsn AS has_semantic_lsn,
+       COALESCE(qxtracelsn > lag(qxtracelsn) OVER (ORDER BY oid), true) AS lsn_monotonic,
+       qxtracetaskid = (SELECT oid FROM pg_qx_task ORDER BY oid DESC LIMIT 1) AS linked_task
+FROM pg_qx_trace
+ORDER BY oid;
+        trace_name        | trace_state | has_semantic_lsn | lsn_monotonic | linked_task 
+--------------------------+-------------+------------------+---------------+-------------
+ session.root             | o           | t                | t             | f
+ runtime.queue            | c           | t                | t             | t
+ runtime.dispatch         | c           | t                | t             | t
+ runtime.capture_input    | c           | t                | t             | t
+ runtime.checkpoint       | c           | t                | t             | t
+ runtime.pause            | c           | t                | t             | t
+ runtime.resume           | c           | t                | t             | t
+ runtime.resume_dispatch  | c           | t                | t             | t
+ runtime.final_checkpoint | c           | t                | t             | t
+ runtime.complete         | c           | t                | t             | t
+(10 rows)
+
+SELECT qxcheckpointlabel::text AS checkpoint_label,
+       qxcheckpointstate AS checkpoint_state,
+       qxcheckpointtaskstate AS task_state,
+       qxcheckpointlsn <> '0/0'::pg_lsn AS has_semantic_lsn,
+       COALESCE(qxcheckpointlsn > lag(qxcheckpointlsn) OVER (ORDER BY oid), true) AS lsn_monotonic,
+       qxcheckpointnextstepseqno AS next_step,
+       qxcheckpointattemptid <> 0 AS linked_attempt
+FROM pg_qx_checkpoint
+ORDER BY oid;
+   checkpoint_label   | checkpoint_state | task_state | has_semantic_lsn | lsn_monotonic | next_step | linked_attempt 
+----------------------+------------------+------------+------------------+---------------+-----------+----------------
+ stage8.after_capture | d                | k          | t                | t             |         4 | t
+ stage8.final         | d                | c          | t                | t             |         0 | t
+(2 rows)
+
+REMEMBER IN SESSION :qx_session_oid
+  SCOPE semantic
+  KEY 'parser.notes'
+  VALUE 'stable grammar'
+  TAGS ('docs', 'stage10');
+REMEMBER IN SESSION :qx_session_oid
+  SCOPE episodic
+  KEY 'resume.status'
+  VALUE 'completed'
+  TAGS ('resume', 'success');
+SELECT qxmemorysessionid = :qx_session_oid AS linked_session,
+       qxmemoryscope AS scope,
+       qxmemorykey::text AS memory_key,
+       qxmemoryvalue::text AS memory_value,
+       qxmemorytags::text AS tags,
+       qxmemoryowner = (SELECT oid FROM pg_roles WHERE rolname = current_user) AS owned_by_current_user
+FROM pg_qx_memory
+ORDER BY oid;
+ linked_session | scope |  memory_key   |  memory_value  |      tags      | owned_by_current_user 
+----------------+-------+---------------+----------------+----------------+-----------------------
+ t              | s     | parser.notes  | stable grammar | docs,stage10   | t
+ t              | e     | resume.status | completed      | resume,success | t
+(2 rows)
+
+FETCH MEMORY FOR AGENT archivist
+  SCOPE semantic
+  MATCH 'parser'
+  LIMIT 5;
+  scope   |  memory_key  |  memory_value  | memory_tags  
+----------+--------------+----------------+--------------
+ semantic | parser.notes | stable grammar | docs,stage10
+(1 row)
+
+FETCH MEMORY FOR AGENT archivist
+  SCOPE episodic
+  MATCH 'completed'
+  LIMIT 5;
+  scope   |  memory_key   | memory_value |  memory_tags   
+----------+---------------+--------------+----------------
+ episodic | resume.status | completed    | resume,success
+(1 row)
+
+SHOW TRACE FOR TASK :qx_task_oid LIMIT 20;
+ trace_state |        trace_name        |                         trace_detail                         | has_step | has_semantic_lsn 
+-------------+--------------------------+--------------------------------------------------------------+----------+------------------
+ closed      | runtime.queue            | goal=summarize docs;priority=high                            | f        | t
+ closed      | runtime.dispatch         | attempt_opened;state=r                                       | t        | t
+ closed      | runtime.capture_input    | input_present=true;task_name=summarize_docs                  | t        | t
+ closed      | runtime.checkpoint       | checkpoint=stage8.after_capture;task_state=k                 | t        | t
+ closed      | runtime.pause            | Task paused at durable checkpoint and awaits RESUME TASK     | f        | t
+ closed      | runtime.resume           | checkpoint=stage8.after_capture;resume_requested;next_step=4 | f        | t
+ closed      | runtime.resume_dispatch  | resume_from=stage8.after_capture;state=r                     | t        | t
+ closed      | runtime.final_checkpoint | checkpoint=stage8.final;task_state=c                         | t        | t
+ closed      | runtime.complete         | Task completed after resumable attempt handoff               | f        | t
+(9 rows)
+
+SELECT agent_name::text AS agent_name,
+       active_session_count,
+       task_count,
+       completed_task_count,
+       memory_count
+FROM pg_stat_qx_agents
+ORDER BY agent_name;
+ agent_name | active_session_count | task_count | completed_task_count | memory_count 
+------------+----------------------+------------+----------------------+--------------
+ archivist  |                    1 |          1 |                    1 |            2
+(1 row)
+
+SELECT session_oid = :qx_session_oid AS session_match,
+       agent_name::text AS agent_name,
+       session_status,
+       has_context,
+       task_count,
+       completed_task_count,
+       memory_count,
+       trace_count
+FROM pg_stat_qx_sessions
+ORDER BY session_oid;
+ session_match | agent_name | session_status | has_context | task_count | completed_task_count | memory_count | trace_count 
+---------------+------------+----------------+-------------+------------+----------------------+--------------+-------------
+ t             | archivist  | active         | t           |          1 |                    1 |            2 |          10
+(1 row)
+
+SELECT task_oid = :qx_task_oid AS task_match,
+       agent_name::text AS agent_name,
+       task_name::text AS task_name,
+       task_state,
+       has_attempt,
+       has_checkpoint,
+       attempt_count,
+       step_count,
+       event_count,
+       trace_count,
+       checkpoint_count
+FROM pg_stat_qx_tasks
+ORDER BY task_oid;
+ task_match | agent_name |   task_name    | task_state | has_attempt | has_checkpoint | attempt_count | step_count | event_count | trace_count | checkpoint_count 
+------------+------------+----------------+------------+-------------+----------------+---------------+------------+-------------+-------------+------------------
+ t          | archivist  | summarize_docs | completed  | t           | t              |             2 |          5 |           9 |           9 |                2
+(1 row)
+
+START SESSION FOR AGENT archivist
+  RETURNING SESSION;
+ERROR:  START SESSION ... RETURNING SESSION is not executable yet
+DETAIL:  Etapa 4 persists session rows in pg_qx_session, but tuple-returning utility execution is still deferred.
+HINT:  Proceed with Etapa 5 to expose executable session creation results.
+START SESSION FOR AGENT missing_agent;
+ERROR:  agent "missing_agent" does not exist
+RUN TASK IN SESSION 42
+  GOAL 'index docs';
+ERROR:  session 42 does not exist
+RUN TASK summarize_docs IN SESSION current_setting('server_version_num')
+  GOAL 'reject dynamic session expr';
+ERROR:  RUN TASK currently requires a literal identifier
+DETAIL:  Etapa 8 routes RUN TASK through AgentPlan planning, but IN SESSION still does not evaluate arbitrary expressions.
+HINT:  Pass a numeric session OID literal, or resolve the session OID in the client before invoking RUN TASK.
+RESUME TASK 42;
+ERROR:  task 42 does not exist
+RESUME TASK current_setting('server_version_num');
+ERROR:  RESUME TASK currently requires a literal identifier
+DETAIL:  Etapa 8 keeps RESUME TASK on the utility/planner path and does not yet evaluate arbitrary expressions in TASK identifiers.
+HINT:  Pass a numeric task OID literal, or resolve the task OID in the client before invoking RESUME TASK.
+REMEMBER IN SESSION current_setting('server_version_num')
+  SCOPE semantic
+  KEY 'reject.dynamic'
+  VALUE 'nope';
+ERROR:  REMEMBER currently requires a literal identifier
+DETAIL:  Stage 10 persists agent memory in engine-owned storage, but session identifiers still require literal OID input on the utility path.
+HINT:  Pass a numeric session OID literal, or resolve the session OID in the client before invoking REMEMBER.
+FETCH MEMORY FOR AGENT missing_agent;
+ERROR:  agent "missing_agent" does not exist
+SHOW TRACE FOR TASK current_setting('server_version_num');
+ERROR:  SHOW TRACE currently requires a literal identifier
+DETAIL:  Stage 10 exposes engine-owned trace rows directly, but task identifiers still require literal OID input on the utility path.
+HINT:  Pass a numeric task OID literal, or resolve the task OID in the client before invoking SHOW TRACE.
+RUN TASK summarize_docs IN SESSION :qx_session_oid
+  GOAL 'summarize docs'
+  INPUT jsonb_build_object('topic', 'parser')
+  PRIORITY high
+  RETURNING TASK;
+ERROR:  RUN TASK ... RETURNING TASK is not executable yet
+DETAIL:  Etapa 8 routes task execution through AgentPlan, but tuple-returning utility execution is still deferred.
+HINT:  Inspect pg_qx_task and related pg_qx_* catalogs after RUN TASK, or proceed to later stages for tuple-returning execution.

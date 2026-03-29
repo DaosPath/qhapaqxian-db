@@ -1375,3 +1375,112 @@ CREATE VIEW pg_stat_subscription_stats AS
 
 CREATE VIEW pg_wait_events AS
     SELECT * FROM pg_get_wait_events();
+
+
+CREATE VIEW pg_stat_qx_agents AS
+    SELECT
+        a.oid AS agent_oid,
+        n.nspname AS schemaname,
+        a.qxagentname AS agent_name,
+        pg_get_userbyid(a.qxagentowner) AS owner_name,
+        a.qxidentity AS identity_name,
+        a.qxmodeluri AS model_uri,
+        a.qxmemoryprofile AS memory_profile,
+        a.qxpolicy AS policy_name,
+        (SELECT count(*)::bigint
+         FROM pg_qx_session s
+         WHERE s.qxsessionagentid = a.oid) AS session_count,
+        (SELECT count(*)::bigint
+         FROM pg_qx_session s
+         WHERE s.qxsessionagentid = a.oid
+           AND s.qxsessionstatus = 'a') AS active_session_count,
+        (SELECT count(*)::bigint
+         FROM pg_qx_task t
+         WHERE t.qxtaskagentid = a.oid) AS task_count,
+        (SELECT count(*)::bigint
+         FROM pg_qx_task t
+         WHERE t.qxtaskagentid = a.oid
+           AND t.qxtaskstate = 'k') AS checkpointed_task_count,
+        (SELECT count(*)::bigint
+         FROM pg_qx_task t
+         WHERE t.qxtaskagentid = a.oid
+           AND t.qxtaskstate = 'c') AS completed_task_count,
+        (SELECT count(*)::bigint
+         FROM pg_qx_memory m
+         WHERE m.qxmemoryagentid = a.oid) AS memory_count
+    FROM pg_qx_agent a
+         LEFT JOIN pg_namespace n ON (n.oid = a.qxagentnamespace);
+
+
+CREATE VIEW pg_stat_qx_sessions AS
+    SELECT
+        s.oid AS session_oid,
+        a.qxagentname AS agent_name,
+        pg_get_userbyid(s.qxsessionowner) AS owner_name,
+        CASE s.qxsessionstatus
+            WHEN 'a' THEN 'active'
+            ELSE 'unknown'
+        END AS session_status,
+        s.qxcontext IS NOT NULL AS has_context,
+        (SELECT count(*)::bigint
+         FROM pg_qx_task t
+         WHERE t.qxtasksessionid = s.oid) AS task_count,
+        (SELECT count(*)::bigint
+         FROM pg_qx_task t
+         WHERE t.qxtasksessionid = s.oid
+           AND t.qxtaskstate = 'c') AS completed_task_count,
+        (SELECT count(*)::bigint
+         FROM pg_qx_event e
+         WHERE e.qxeventsessionid = s.oid) AS event_count,
+        (SELECT count(*)::bigint
+         FROM pg_qx_trace tr
+         WHERE tr.qxtracesessionid = s.oid) AS trace_count,
+        (SELECT count(*)::bigint
+         FROM pg_qx_checkpoint c
+         WHERE c.qxcheckpointsessionid = s.oid) AS checkpoint_count,
+        (SELECT count(*)::bigint
+         FROM pg_qx_memory m
+         WHERE m.qxmemorysessionid = s.oid) AS memory_count
+    FROM pg_qx_session s
+         JOIN pg_qx_agent a ON (a.oid = s.qxsessionagentid);
+
+
+CREATE VIEW pg_stat_qx_tasks AS
+    SELECT
+        t.oid AS task_oid,
+        t.qxtasksessionid AS session_oid,
+        a.qxagentname AS agent_name,
+        pg_get_userbyid(t.qxtaskowner) AS owner_name,
+        t.qxtaskname AS task_name,
+        t.qxtaskgoal AS goal,
+        t.qxtaskpriority AS priority,
+        CASE t.qxtaskstate
+            WHEN 'p' THEN 'pending'
+            WHEN 'q' THEN 'queued'
+            WHEN 'r' THEN 'running'
+            WHEN 'k' THEN 'checkpointed'
+            WHEN 'c' THEN 'completed'
+            ELSE 'unknown'
+        END AS task_state,
+        t.qxtasklastattemptid <> 0 AS has_attempt,
+        t.qxtasklastcheckpointid <> 0 AS has_checkpoint,
+        (SELECT count(*)::bigint
+         FROM pg_qx_attempt a2
+         WHERE a2.qxattempttaskid = t.oid) AS attempt_count,
+        (SELECT count(*)::bigint
+         FROM pg_qx_step st
+         WHERE st.qxsteptaskid = t.oid) AS step_count,
+        (SELECT count(*)::bigint
+         FROM pg_qx_event e
+         WHERE e.qxeventtaskid = t.oid) AS event_count,
+        (SELECT count(*)::bigint
+         FROM pg_qx_trace tr
+         WHERE tr.qxtracetaskid = t.oid) AS trace_count,
+        (SELECT count(*)::bigint
+         FROM pg_qx_checkpoint c
+         WHERE c.qxcheckpointtaskid = t.oid) AS checkpoint_count,
+        (SELECT count(*)::bigint
+         FROM pg_qx_memory m
+         WHERE m.qxmemorytaskid = t.oid) AS memory_count
+    FROM pg_qx_task t
+         JOIN pg_qx_agent a ON (a.oid = t.qxtaskagentid);
