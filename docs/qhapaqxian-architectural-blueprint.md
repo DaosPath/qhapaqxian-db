@@ -2,6 +2,10 @@
 
 Status: initial architecture seed for an empty repository on 2026-03-26.
 
+Current-state note:
+- this blueprint is the architecture seed and target-design document;
+- the canonical repository implementation status now lives in `STATUS.md`.
+
 Explicit inferences:
 - This repository is currently empty, so this document defines the first engineering baseline rather than describing existing code.
 - The first fork should start from a clean upstream PostgreSQL 17.x stable import. This is a deliberate compatibility choice, not a claim that 17.x is the latest release.

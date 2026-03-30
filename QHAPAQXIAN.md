@@ -2,6 +2,10 @@
 
 This file defines the first practical fork boundary for QhapaqXian DB.
 
+Implementation status note:
+- the canonical current-state ledger now lives in `STATUS.md`
+- this file should describe fork boundary and governance, not duplicate the full stage ledger
+
 Product naming:
 - brand: QhapaqXian
 - product: QhapaqXian DB
@@ -9,7 +13,7 @@ Product naming:
 
 Bootstrap decisions:
 - upstream base: PostgreSQL 17.x stable
-- branch model starts with `codex/bootstrap`
+- branch model starts with `bootstrap`
 - global binary renames are deferred
 - parser/catalog/runtime changes are staged after upstream import and CI stabilization
 

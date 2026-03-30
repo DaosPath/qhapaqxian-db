@@ -3,6 +3,9 @@ QhapaqXian DB
 
 This repository is the bootstrap fork for QhapaqXian DB.
 
+Canonical current-state tracker:
+- `STATUS.md`
+
 Naming boundary:
 - brand: QhapaqXian
 - product: QhapaqXian DB
