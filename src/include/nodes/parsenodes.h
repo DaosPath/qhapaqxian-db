@@ -2692,6 +2692,8 @@ typedef struct CreateProviderStmt
 	RangeVar   *provider_name;
 	char	   *provider_kind;
 	char	   *endpoint_name;
+	char	   *receipt_alg;
+	char	   *receipt_key;
 	bool		attestation_required;
 	ParseLoc	location;
 } CreateProviderStmt;
@@ -2706,6 +2708,10 @@ typedef struct AlterProviderStmt
 	bool		set_kind;
 	char	   *endpoint_name;
 	bool		set_endpoint;
+	char	   *receipt_alg;
+	bool		set_receipt_alg;
+	char	   *receipt_key;
+	bool		set_receipt_key;
 	bool		attestation_required;
 	bool		set_attestation_required;
 	bool		enabled;
@@ -2722,6 +2728,8 @@ typedef struct CreatePrincipalStmt
 	RangeVar   *provider_name;
 	char	   *program_name;
 	char	   *sandbox_name;
+	char	   *runtime_class;
+	char	   *receipt_signer;
 	bool		enabled;
 	ParseLoc	location;
 } CreatePrincipalStmt;
@@ -2738,6 +2746,10 @@ typedef struct AlterPrincipalStmt
 	bool		set_program;
 	char	   *sandbox_name;
 	bool		set_sandbox;
+	char	   *runtime_class;
+	bool		set_runtime;
+	char	   *receipt_signer;
+	bool		set_receipt_signer;
 	bool		enabled;
 	bool		set_enabled;
 	ParseLoc	location;

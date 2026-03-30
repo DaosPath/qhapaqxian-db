@@ -8,6 +8,7 @@
 #include "postgres.h"
 
 #include "access/table.h"
+#include "access/tableam.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
@@ -44,8 +45,40 @@ static void qx_validate_principal_program(const char *program_name,
 										  const char *command_name);
 static void qx_validate_provider_kind(const char *provider_kind,
 									  const char *command_name);
-static void qx_validate_provider_endpoint(const char *endpoint_name,
+static void qx_validate_provider_receipt_alg(const char *receipt_alg,
+											 const char *command_name);
+static void qx_validate_provider_isolation_contract(const char *provider_kind,
+													const char *receipt_alg,
+													bool attestation_required,
+													const char *command_name);
+static void qx_validate_provider_endpoint(const char *provider_kind,
+										  const char *endpoint_name,
 										  const char *command_name);
+static void qx_validate_provider_receipt_key(const char *receipt_alg,
+											 const char *receipt_key,
+											 const char *command_name);
+static char *qx_provider_receipt_alg_by_oid(Oid provideroid);
+static char *qx_provider_kind_by_oid(Oid provideroid);
+static void qx_validate_principal_receipt_signer(const char *receipt_signer,
+												 const char *command_name);
+static const char *qx_default_runtime_for_provider_kind(const char *provider_kind);
+static void qx_validate_principal_runtime_class(const char *runtime_class,
+												const char *command_name);
+static void qx_validate_principal_runtime_binding_values(const char *provider_kind,
+														 const char *receipt_alg,
+														 const char *runtime_class,
+														 const char *sandbox_name,
+														 const char *receipt_signer,
+														 const char *command_name);
+static void qx_validate_principal_runtime_binding(Oid provideroid,
+												  const char *runtime_class,
+												  const char *sandbox_name,
+												  const char *receipt_signer,
+												  const char *command_name);
+static void qx_validate_provider_bound_principals(Oid provideroid,
+												  const char *provider_kind,
+												  const char *receipt_alg,
+												  const char *command_name);
 static void qx_validate_tool_sandbox(const char *sandbox_name);
 static int	qx_sandbox_rank(const char *sandbox_name);
 static HeapTuple qx_lookup_tool_tuple(RangeVar *tool_name, Oid *namespaceoid);
@@ -173,15 +206,83 @@ qx_validate_provider_kind(const char *provider_kind, const char *command_name)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("%s kind must not be empty", command_name)));
 
-	if (strcmp(provider_kind, "loopback") != 0)
+	if (strcmp(provider_kind, "loopback") != 0 &&
+		strcmp(provider_kind, "remote") != 0 &&
+		strcmp(provider_kind, "container") != 0 &&
+		strcmp(provider_kind, "microvm") != 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("unsupported provider kind \"%s\"", provider_kind),
-				 errdetail("QhapaqXian providers currently support only the loopback execution driver.")));
+				 errdetail("QhapaqXian providers currently support loopback, remote, container, and microvm execution drivers.")));
 }
 
 static void
-qx_validate_provider_endpoint(const char *endpoint_name,
+qx_validate_provider_isolation_contract(const char *provider_kind,
+										 const char *receipt_alg,
+										 bool attestation_required,
+										 const char *command_name)
+{
+	const char *effective_kind;
+	const char *effective_alg;
+
+	effective_kind = (provider_kind != NULL && provider_kind[0] != '\0') ?
+		provider_kind : "loopback";
+	effective_alg = (receipt_alg != NULL && receipt_alg[0] != '\0') ?
+		receipt_alg : "hmac-sha256";
+
+	if (strcmp(effective_kind, "container") != 0 &&
+		strcmp(effective_kind, "microvm") != 0)
+		return;
+
+	if (strcmp(effective_alg, "ed25519") != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("%s kind \"%s\" requires ed25519 receipts",
+						command_name, effective_kind),
+				 errdetail("Container and microVM providers must use asymmetric receipts so the runtime can verify brokered isolation evidence.")));
+
+	if (!attestation_required)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("%s kind \"%s\" requires attestation",
+						command_name, effective_kind),
+				 errdetail("Container and microVM providers must declare ATTESTATION ENABLE so the runtime rejects unsigned broker responses.")));
+}
+
+static void
+qx_validate_provider_receipt_alg(const char *receipt_alg,
+								 const char *command_name)
+{
+	const char *effective_alg;
+
+	effective_alg = (receipt_alg != NULL && receipt_alg[0] != '\0') ?
+		receipt_alg : "hmac-sha256";
+
+	if (strcmp(effective_alg, "hmac-sha256") == 0)
+		return;
+
+	if (strcmp(effective_alg, "ed25519") == 0)
+	{
+#ifndef USE_OPENSSL
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("%s receipt algorithm \"%s\" requires OpenSSL support",
+						command_name, effective_alg),
+				 errdetail("Build QhapaqXian DB with OpenSSL to enable asymmetric receipt verification.")));
+#endif
+		return;
+	}
+
+	ereport(ERROR,
+			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+			 errmsg("unsupported provider receipt algorithm \"%s\"",
+					effective_alg),
+			 errdetail("QhapaqXian providers currently support only hmac-sha256 and ed25519 receipts.")));
+}
+
+static void
+qx_validate_provider_endpoint(const char *provider_kind,
+							  const char *endpoint_name,
 							  const char *command_name)
 {
 	if (endpoint_name == NULL || endpoint_name[0] == '\0')
@@ -197,12 +298,335 @@ qx_validate_provider_endpoint(const char *endpoint_name,
 				 errmsg("%s endpoint contains unsupported characters",
 						command_name)));
 
+	if (provider_kind != NULL &&
+		strcmp(provider_kind, "remote") == 0)
+	{
+		if (strncmp(endpoint_name, "remote://", 9) != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("%s endpoint must start with \"remote://\" for remote providers",
+							command_name),
+					 errdetail("The brokered remote provider subsystem accepts only remote:// endpoints.")));
+		return;
+	}
+
+	if (provider_kind != NULL &&
+		strcmp(provider_kind, "container") == 0)
+	{
+		if (strncmp(endpoint_name, "container://", 12) != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("%s endpoint must start with \"container://\" for container providers",
+							command_name),
+					 errdetail("Container providers accept only container:// broker endpoints.")));
+		return;
+	}
+
+	if (provider_kind != NULL &&
+		strcmp(provider_kind, "microvm") == 0)
+	{
+		if (strncmp(endpoint_name, "microvm://", 10) != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("%s endpoint must start with \"microvm://\" for microvm providers",
+							command_name),
+					 errdetail("MicroVM providers accept only microvm:// broker endpoints.")));
+		return;
+	}
+
 	if (strncmp(endpoint_name, "local://", 8) != 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("%s endpoint must start with \"local://\"",
 						command_name),
-				 errdetail("The bootstrap provider subsystem only supports loopback local endpoints for now.")));
+				 errdetail("Loopback providers accept only local:// endpoints.")));
+}
+
+static void
+qx_validate_provider_receipt_key(const char *receipt_alg,
+								 const char *receipt_key,
+								 const char *command_name)
+{
+	const char *effective_alg;
+
+	effective_alg = (receipt_alg != NULL && receipt_alg[0] != '\0') ?
+		receipt_alg : "hmac-sha256";
+
+	if (receipt_key == NULL || receipt_key[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("%s receipt key must not be empty", command_name),
+				 errdetail("Providers need verification material for runtime receipts.")));
+
+	if (strcmp(effective_alg, "ed25519") == 0)
+	{
+		if (strstr(receipt_key, "-----BEGIN PUBLIC KEY-----") == NULL ||
+			strstr(receipt_key, "-----END PUBLIC KEY-----") == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("%s receipt key is not a PEM public key",
+							command_name),
+					 errdetail("Ed25519 providers require a PEM-encoded public key in RECEIPT KEY.")));
+		return;
+	}
+
+	if (strlen(receipt_key) < 8)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("%s receipt key is too short", command_name),
+				 errdetail("Use at least 8 characters for the bootstrap HMAC receipt key.")));
+
+	if (strchr(receipt_key, '\n') != NULL ||
+		strchr(receipt_key, '\r') != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("%s receipt key contains unsupported characters",
+						command_name)));
+}
+
+static char *
+qx_provider_receipt_alg_by_oid(Oid provideroid)
+{
+	HeapTuple	providertup;
+	char	   *receipt_alg;
+
+	providertup = SearchSysCache1(QXPROVIDEROID, ObjectIdGetDatum(provideroid));
+	if (!HeapTupleIsValid(providertup))
+		elog(ERROR, "cache lookup failed for QhapaqXian provider %u", provideroid);
+
+	receipt_alg = qxpolicy_text_attr(providertup,
+									 Anum_pg_qx_provider_qxproviderreceiptalg,
+									 QXPROVIDEROID);
+	ReleaseSysCache(providertup);
+
+	if (receipt_alg == NULL || receipt_alg[0] == '\0')
+		return pstrdup("hmac-sha256");
+
+	return receipt_alg;
+}
+
+static void
+qx_validate_principal_runtime_class(const char *runtime_class,
+									 const char *command_name)
+{
+	if (runtime_class == NULL || runtime_class[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("%s runtime class must not be empty", command_name)));
+
+	if (strcmp(runtime_class, "host") != 0 &&
+		strcmp(runtime_class, "container") != 0 &&
+		strcmp(runtime_class, "microvm") != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("unsupported principal runtime class \"%s\"", runtime_class),
+				 errdetail("QhapaqXian principals currently support host, container, or microvm runtime classes.")));
+}
+
+static char *
+qx_provider_kind_by_oid(Oid provideroid)
+{
+	HeapTuple	providertup;
+	char	   *provider_kind;
+
+	providertup = SearchSysCache1(QXPROVIDEROID, ObjectIdGetDatum(provideroid));
+	if (!HeapTupleIsValid(providertup))
+		elog(ERROR, "cache lookup failed for QhapaqXian provider %u", provideroid);
+
+	provider_kind = qxpolicy_text_attr(providertup,
+									   Anum_pg_qx_provider_qxproviderkind,
+									   QXPROVIDEROID);
+	ReleaseSysCache(providertup);
+
+	if (provider_kind == NULL || provider_kind[0] == '\0')
+		return pstrdup("loopback");
+
+	return provider_kind;
+}
+
+static const char *
+qx_default_runtime_for_provider_kind(const char *provider_kind)
+{
+	if (provider_kind != NULL && strcmp(provider_kind, "container") == 0)
+		return "container";
+	if (provider_kind != NULL && strcmp(provider_kind, "microvm") == 0)
+		return "microvm";
+
+	return "host";
+}
+
+static void
+qx_validate_principal_receipt_signer(const char *receipt_signer,
+									 const char *command_name)
+{
+	if (receipt_signer == NULL || receipt_signer[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("%s signer must not be empty", command_name),
+				 errdetail("Asymmetric receipt principals need a signer file reference.")));
+
+	if (strchr(receipt_signer, '\n') != NULL ||
+		strchr(receipt_signer, '\r') != NULL ||
+		strchr(receipt_signer, ';') != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("%s signer contains unsupported characters",
+						command_name),
+				 errdetail("Signer references must be bare filenames or absolute paths.")));
+
+	if (!is_absolute_path(receipt_signer) &&
+		(first_dir_separator(receipt_signer) != NULL ||
+		 path_contains_parent_reference(receipt_signer)))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("%s signer must be a bare filename or an absolute path",
+						command_name),
+				 errdetail("Relative paths and parent-directory references are rejected for receipt signers.")));
+
+	if (path_contains_parent_reference(receipt_signer))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("%s signer must not contain parent-directory references",
+						command_name)));
+}
+
+static void
+qx_validate_principal_runtime_binding_values(const char *provider_kind,
+											  const char *receipt_alg,
+											  const char *runtime_class,
+											  const char *sandbox_name,
+											  const char *receipt_signer,
+											  const char *command_name)
+{
+	const char *effective_runtime;
+
+	qx_validate_provider_kind(provider_kind, command_name);
+	qx_validate_provider_receipt_alg(receipt_alg, command_name);
+	effective_runtime = (runtime_class != NULL && runtime_class[0] != '\0') ?
+		runtime_class : qx_default_runtime_for_provider_kind(provider_kind);
+	qx_validate_principal_runtime_class(effective_runtime, command_name);
+
+	if (receipt_signer != NULL)
+		qx_validate_principal_receipt_signer(receipt_signer, command_name);
+
+	if ((strcmp(provider_kind, "loopback") == 0 ||
+		 strcmp(provider_kind, "remote") == 0) &&
+		strcmp(effective_runtime, "host") != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("%s runtime class \"%s\" is incompatible with provider kind \"%s\"",
+						command_name, effective_runtime, provider_kind),
+				 errdetail("Loopback and remote providers currently back only host principals. Use KIND 'container' or KIND 'microvm' for isolated principals.")));
+
+	if (strcmp(provider_kind, "container") == 0 &&
+		strcmp(effective_runtime, "container") != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("%s runtime class \"%s\" is incompatible with provider kind \"%s\"",
+						command_name, effective_runtime, provider_kind),
+				 errdetail("Container providers require principals declared with RUNTIME 'container'.")));
+
+	if (strcmp(provider_kind, "microvm") == 0 &&
+		strcmp(effective_runtime, "microvm") != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("%s runtime class \"%s\" is incompatible with provider kind \"%s\"",
+						command_name, effective_runtime, provider_kind),
+				 errdetail("MicroVM providers require principals declared with RUNTIME 'microvm'.")));
+
+	if (strcmp(effective_runtime, "host") != 0 &&
+		(sandbox_name == NULL || strcmp(sandbox_name, "isolated") != 0))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("%s runtime class \"%s\" requires sandbox \"isolated\"",
+						command_name, effective_runtime),
+				 errdetail("Containerized and microVM-backed principals must run at the strongest local sandbox ceiling before broker handoff.")));
+
+	if (strcmp(receipt_alg, "ed25519") == 0 &&
+		(receipt_signer == NULL || receipt_signer[0] == '\0'))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("%s requires SIGNER for principals bound to ed25519 providers",
+						command_name),
+				 errdetail("The provider verifies receipts with a public key, so the principal must reference a private signer file.")));
+}
+
+static void
+qx_validate_principal_runtime_binding(Oid provideroid,
+									  const char *runtime_class,
+									  const char *sandbox_name,
+									  const char *receipt_signer,
+									  const char *command_name)
+{
+	char	   *provider_kind;
+	char	   *receipt_alg;
+
+	provider_kind = qx_provider_kind_by_oid(provideroid);
+	receipt_alg = qx_provider_receipt_alg_by_oid(provideroid);
+	qx_validate_principal_runtime_binding_values(provider_kind,
+												 receipt_alg,
+												 runtime_class,
+												 sandbox_name,
+												 receipt_signer,
+												 command_name);
+
+	pfree(provider_kind);
+	pfree(receipt_alg);
+}
+
+static void
+qx_validate_provider_bound_principals(Oid provideroid,
+									  const char *provider_kind,
+									  const char *receipt_alg,
+									  const char *command_name)
+{
+	Relation	rel;
+	TableScanDesc scan;
+	HeapTuple	tup;
+
+	rel = table_open(QxPrincipalRelationId, AccessShareLock);
+	scan = table_beginscan_catalog(rel, 0, NULL);
+
+	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	{
+		Form_pg_qx_principal principalform = (Form_pg_qx_principal) GETSTRUCT(tup);
+		char	   *sandbox_name;
+		char	   *runtime_class;
+		char	   *receipt_signer;
+		char	   *scope;
+
+		if (principalform->qxprincipalproviderid != provideroid)
+			continue;
+
+		sandbox_name = qxpolicy_text_attr(tup,
+										  Anum_pg_qx_principal_qxprincipalsandbox,
+										  QXPRINCIPALOID);
+		runtime_class = qxpolicy_text_attr(tup,
+										   Anum_pg_qx_principal_qxprincipalruntimeclass,
+										   QXPRINCIPALOID);
+		receipt_signer = qxpolicy_text_attr(tup,
+											Anum_pg_qx_principal_qxprincipalreceiptsigner,
+											QXPRINCIPALOID);
+		scope = psprintf("%s principal \"%s\"",
+						 command_name,
+						 NameStr(principalform->qxprincipalname));
+		qx_validate_principal_runtime_binding_values(provider_kind,
+													 receipt_alg,
+													 runtime_class,
+													 sandbox_name,
+													 receipt_signer,
+													 scope);
+		pfree(scope);
+		if (sandbox_name != NULL)
+			pfree(sandbox_name);
+		if (runtime_class != NULL)
+			pfree(runtime_class);
+		if (receipt_signer != NULL)
+			pfree(receipt_signer);
+	}
+
+	table_endscan(scan);
+	table_close(rel, AccessShareLock);
 }
 
 static void
@@ -739,16 +1163,27 @@ CreateProviderCommand(CreateProviderStmt *stmt)
 	Oid			provideroid;
 	AclResult	aclresult;
 	ObjectAddress myself;
+	const char *receipt_alg;
 
 	namespaceoid = RangeVarGetCreationNamespace(stmt->provider_name);
 	ownerid = GetUserId();
+	receipt_alg = (stmt->receipt_alg != NULL && stmt->receipt_alg[0] != '\0') ?
+		stmt->receipt_alg : "hmac-sha256";
 
 	aclresult = object_aclcheck(NamespaceRelationId, namespaceoid, ownerid, ACL_CREATE);
 	if (aclresult != ACLCHECK_OK)
 		aclcheck_error(aclresult, OBJECT_SCHEMA, get_namespace_name(namespaceoid));
 
 	qx_validate_provider_kind(stmt->provider_kind, "CREATE PROVIDER");
-	qx_validate_provider_endpoint(stmt->endpoint_name, "CREATE PROVIDER");
+	qx_validate_provider_endpoint(stmt->provider_kind, stmt->endpoint_name,
+								  "CREATE PROVIDER");
+	qx_validate_provider_receipt_alg(receipt_alg, "CREATE PROVIDER");
+	qx_validate_provider_receipt_key(receipt_alg, stmt->receipt_key,
+									 "CREATE PROVIDER");
+	qx_validate_provider_isolation_contract(stmt->provider_kind,
+											 receipt_alg,
+											 stmt->attestation_required,
+											 "CREATE PROVIDER");
 
 	if (SearchSysCacheExists2(QXPROVIDERNAMENSP,
 							  CStringGetDatum(stmt->provider_name->relname),
@@ -783,6 +1218,12 @@ CreateProviderCommand(CreateProviderStmt *stmt)
 	qxpolicy_set_text(values, nulls,
 					  Anum_pg_qx_provider_qxproviderendpoint,
 					  stmt->endpoint_name);
+	qxpolicy_set_text(values, nulls,
+					  Anum_pg_qx_provider_qxproviderreceiptalg,
+					  receipt_alg);
+	qxpolicy_set_text(values, nulls,
+					  Anum_pg_qx_provider_qxproviderreceiptkey,
+					  stmt->receipt_key);
 
 	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
 	CatalogTupleInsert(rel, tup);
@@ -807,9 +1248,16 @@ AlterProviderCommand(AlterProviderStmt *stmt)
 	bool		replaces[Natts_pg_qx_provider];
 	Oid			namespaceoid = InvalidOid;
 	Oid			ownerid;
+	char	   *effective_kind = NULL;
+	char	   *effective_endpoint = NULL;
+	char	   *effective_receipt_alg = NULL;
+	char	   *effective_receipt_key = NULL;
+	bool		effective_attestation_required;
 
 	if (!stmt->set_kind &&
 		!stmt->set_endpoint &&
+		!stmt->set_receipt_alg &&
+		!stmt->set_receipt_key &&
 		!stmt->set_attestation_required &&
 		!stmt->set_enabled)
 		ereport(ERROR,
@@ -837,8 +1285,49 @@ AlterProviderCommand(AlterProviderStmt *stmt)
 
 	if (stmt->set_kind)
 		qx_validate_provider_kind(stmt->provider_kind, "ALTER PROVIDER");
-	if (stmt->set_endpoint)
-		qx_validate_provider_endpoint(stmt->endpoint_name, "ALTER PROVIDER");
+	if (stmt->set_receipt_alg)
+		qx_validate_provider_receipt_alg(stmt->receipt_alg, "ALTER PROVIDER");
+	effective_kind = stmt->set_kind ? pstrdup(stmt->provider_kind) :
+		qxpolicy_text_attr(oldtup,
+						   Anum_pg_qx_provider_qxproviderkind,
+						   QXPROVIDEROID);
+	effective_endpoint = stmt->set_endpoint ? pstrdup(stmt->endpoint_name) :
+		qxpolicy_text_attr(oldtup,
+						   Anum_pg_qx_provider_qxproviderendpoint,
+						   QXPROVIDEROID);
+	if (stmt->set_kind || stmt->set_endpoint)
+		qx_validate_provider_endpoint(effective_kind,
+									  effective_endpoint,
+									  "ALTER PROVIDER");
+	effective_receipt_alg = stmt->set_receipt_alg ? pstrdup(stmt->receipt_alg) :
+		qxpolicy_text_attr(oldtup,
+						   Anum_pg_qx_provider_qxproviderreceiptalg,
+						   QXPROVIDEROID);
+	if (effective_receipt_alg == NULL || effective_receipt_alg[0] == '\0')
+	{
+		if (effective_receipt_alg != NULL)
+			pfree(effective_receipt_alg);
+		effective_receipt_alg = pstrdup("hmac-sha256");
+	}
+	effective_receipt_key = stmt->set_receipt_key ? pstrdup(stmt->receipt_key) :
+		qxpolicy_text_attr(oldtup,
+						   Anum_pg_qx_provider_qxproviderreceiptkey,
+						   QXPROVIDEROID);
+	if (stmt->set_receipt_alg || stmt->set_receipt_key)
+		qx_validate_provider_receipt_key(effective_receipt_alg,
+										 effective_receipt_key,
+										 "ALTER PROVIDER");
+	effective_attestation_required = stmt->set_attestation_required ?
+		stmt->attestation_required :
+		oldform->qxproviderattestationrequired;
+	qx_validate_provider_isolation_contract(effective_kind,
+											 effective_receipt_alg,
+											 effective_attestation_required,
+											 "ALTER PROVIDER");
+	qx_validate_provider_bound_principals(oldform->oid,
+										  effective_kind,
+										  effective_receipt_alg,
+										  "ALTER PROVIDER");
 
 	rel = table_open(QxProviderRelationId, RowExclusiveLock);
 	memset(values, 0, sizeof(values));
@@ -859,6 +1348,20 @@ AlterProviderCommand(AlterProviderStmt *stmt)
 						  stmt->endpoint_name);
 		replaces[Anum_pg_qx_provider_qxproviderendpoint - 1] = true;
 	}
+	if (stmt->set_receipt_alg)
+	{
+		qxpolicy_set_text(values, nulls,
+						  Anum_pg_qx_provider_qxproviderreceiptalg,
+						  stmt->receipt_alg);
+		replaces[Anum_pg_qx_provider_qxproviderreceiptalg - 1] = true;
+	}
+	if (stmt->set_receipt_key)
+	{
+		qxpolicy_set_text(values, nulls,
+						  Anum_pg_qx_provider_qxproviderreceiptkey,
+						  stmt->receipt_key);
+		replaces[Anum_pg_qx_provider_qxproviderreceiptkey - 1] = true;
+	}
 	if (stmt->set_attestation_required)
 	{
 		values[Anum_pg_qx_provider_qxproviderattestationrequired - 1] =
@@ -877,6 +1380,14 @@ AlterProviderCommand(AlterProviderStmt *stmt)
 	CatalogTupleUpdate(rel, &oldtup->t_self, newtup);
 	heap_freetuple(newtup);
 	table_close(rel, RowExclusiveLock);
+	if (effective_kind != NULL)
+		pfree(effective_kind);
+	if (effective_endpoint != NULL)
+		pfree(effective_endpoint);
+	if (effective_receipt_alg != NULL)
+		pfree(effective_receipt_alg);
+	if (effective_receipt_key != NULL)
+		pfree(effective_receipt_key);
 
 	InvokeObjectPostAlterHook(QxProviderRelationId, oldform->oid, 0);
 	ReleaseSysCache(oldtup);
@@ -895,6 +1406,7 @@ CreatePrincipalCommand(CreatePrincipalStmt *stmt)
 	Oid			principaloid;
 	AclResult	aclresult;
 	ObjectAddress myself;
+	char	   *effective_runtime_class;
 
 	namespaceoid = RangeVarGetCreationNamespace(stmt->principal_name);
 	ownerid = GetUserId();
@@ -907,6 +1419,22 @@ CreatePrincipalCommand(CreatePrincipalStmt *stmt)
 	qx_validate_principal_program(stmt->program_name, "CREATE PRINCIPAL");
 	provideroid = qx_validate_principal_provider_binding(namespaceoid, ownerid,
 														 stmt->provider_name);
+	if (stmt->runtime_class != NULL && stmt->runtime_class[0] != '\0')
+		effective_runtime_class = pstrdup(stmt->runtime_class);
+	else
+	{
+		char	   *provider_kind;
+
+		provider_kind = qx_provider_kind_by_oid(provideroid);
+		effective_runtime_class =
+			pstrdup(qx_default_runtime_for_provider_kind(provider_kind));
+		pfree(provider_kind);
+	}
+	qx_validate_principal_runtime_binding(provideroid,
+										  effective_runtime_class,
+										  stmt->sandbox_name,
+										  stmt->receipt_signer,
+										  "CREATE PRINCIPAL");
 
 	if (SearchSysCacheExists2(QXPRINCIPALNAMENSP,
 							  CStringGetDatum(stmt->principal_name->relname),
@@ -944,6 +1472,12 @@ CreatePrincipalCommand(CreatePrincipalStmt *stmt)
 	qxpolicy_set_text(values, nulls,
 					  Anum_pg_qx_principal_qxprincipalprovider,
 					  stmt->provider_name->relname);
+	qxpolicy_set_text(values, nulls,
+					  Anum_pg_qx_principal_qxprincipalruntimeclass,
+					  effective_runtime_class);
+	qxpolicy_set_text(values, nulls,
+					  Anum_pg_qx_principal_qxprincipalreceiptsigner,
+					  stmt->receipt_signer);
 
 	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
 	CatalogTupleInsert(rel, tup);
@@ -952,6 +1486,7 @@ CreatePrincipalCommand(CreatePrincipalStmt *stmt)
 
 	qx_record_principal_dependencies(principaloid, ownerid, namespaceoid,
 									 provideroid);
+	pfree(effective_runtime_class);
 	ObjectAddressSet(myself, QxPrincipalRelationId, principaloid);
 	recordDependencyOnCurrentExtension(&myself, false);
 	InvokeObjectPostCreateHook(QxPrincipalRelationId, principaloid, 0);
@@ -970,10 +1505,16 @@ AlterPrincipalCommand(AlterPrincipalStmt *stmt)
 	Oid			namespaceoid = InvalidOid;
 	Oid			ownerid;
 	Oid			provideroid = InvalidOid;
+	Oid			effective_provideroid = InvalidOid;
+	char	   *effective_runtime_class = NULL;
+	char	   *effective_sandbox_name = NULL;
+	char	   *effective_receipt_signer = NULL;
 
 	if (!stmt->set_provider &&
 		!stmt->set_program &&
 		!stmt->set_sandbox &&
+		!stmt->set_runtime &&
+		!stmt->set_receipt_signer &&
 		!stmt->set_enabled)
 		ereport(ERROR,
 				(errcode(ERRCODE_SYNTAX_ERROR),
@@ -1005,6 +1546,38 @@ AlterPrincipalCommand(AlterPrincipalStmt *stmt)
 		qx_validate_principal_program(stmt->program_name, "ALTER PRINCIPAL");
 	if (stmt->set_sandbox)
 		qx_validate_tool_sandbox(stmt->sandbox_name);
+	effective_provideroid = stmt->set_provider ? provideroid :
+		oldform->qxprincipalproviderid;
+	if (stmt->set_runtime)
+		effective_runtime_class = pstrdup(stmt->runtime_class);
+	else
+		effective_runtime_class = qxpolicy_text_attr(oldtup,
+													 Anum_pg_qx_principal_qxprincipalruntimeclass,
+													 QXPRINCIPALOID);
+	if (effective_runtime_class == NULL || effective_runtime_class[0] == '\0')
+	{
+		char	   *provider_kind;
+
+		if (effective_runtime_class != NULL)
+			pfree(effective_runtime_class);
+		provider_kind = qx_provider_kind_by_oid(effective_provideroid);
+		effective_runtime_class =
+			pstrdup(qx_default_runtime_for_provider_kind(provider_kind));
+		pfree(provider_kind);
+	}
+	effective_sandbox_name = stmt->set_sandbox ? pstrdup(stmt->sandbox_name) :
+		qxpolicy_text_attr(oldtup,
+						   Anum_pg_qx_principal_qxprincipalsandbox,
+						   QXPRINCIPALOID);
+	effective_receipt_signer = stmt->set_receipt_signer ? stmt->receipt_signer :
+		qxpolicy_text_attr(oldtup,
+						   Anum_pg_qx_principal_qxprincipalreceiptsigner,
+						   QXPRINCIPALOID);
+	qx_validate_principal_runtime_binding(effective_provideroid,
+										  effective_runtime_class,
+										  effective_sandbox_name,
+										  effective_receipt_signer,
+										  "ALTER PRINCIPAL");
 
 	rel = table_open(QxPrincipalRelationId, RowExclusiveLock);
 
@@ -1038,6 +1611,20 @@ AlterPrincipalCommand(AlterPrincipalStmt *stmt)
 						  stmt->sandbox_name);
 		replaces[Anum_pg_qx_principal_qxprincipalsandbox - 1] = true;
 	}
+	if (stmt->set_runtime)
+	{
+		qxpolicy_set_text(values, nulls,
+						  Anum_pg_qx_principal_qxprincipalruntimeclass,
+						  stmt->runtime_class);
+		replaces[Anum_pg_qx_principal_qxprincipalruntimeclass - 1] = true;
+	}
+	if (stmt->set_receipt_signer)
+	{
+		qxpolicy_set_text(values, nulls,
+						  Anum_pg_qx_principal_qxprincipalreceiptsigner,
+						  stmt->receipt_signer);
+		replaces[Anum_pg_qx_principal_qxprincipalreceiptsigner - 1] = true;
+	}
 
 	if (stmt->set_enabled)
 	{
@@ -1051,6 +1638,12 @@ AlterPrincipalCommand(AlterPrincipalStmt *stmt)
 	CatalogTupleUpdate(rel, &oldtup->t_self, newtup);
 	heap_freetuple(newtup);
 	table_close(rel, RowExclusiveLock);
+	if (effective_runtime_class != NULL)
+		pfree(effective_runtime_class);
+	if (effective_sandbox_name != NULL)
+		pfree(effective_sandbox_name);
+	if (!stmt->set_receipt_signer && effective_receipt_signer != NULL)
+		pfree(effective_receipt_signer);
 
 	deleteDependencyRecordsForClass(QxPrincipalRelationId, oldform->oid,
 									QxProviderRelationId, DEPENDENCY_NORMAL);

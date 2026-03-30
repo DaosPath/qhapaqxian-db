@@ -40,6 +40,14 @@ static char *qx_security_text_attr(HeapTuple tup, AttrNumber attnum,
 								   int cacheid);
 static bool qx_tool_name_in_list(List *tools, const char *tool_name);
 static int	qx_sandbox_rank(const char *sandbox_name);
+static const char *qx_default_runtime_for_provider_kind(const char *provider_kind);
+static void qx_validate_principal_runtime_binding(const char *principal_name,
+												  const char *provider_kind,
+												  const char *runtime_class,
+												  const char *sandbox_name,
+												  const char *receipt_signer,
+												  const char *receipt_alg,
+												  const char *context_name);
 static char *qx_tool_contract_for_tuples(HeapTuple tooltup,
 										 HeapTuple principaltup,
 										 HeapTuple providertup);
@@ -122,6 +130,91 @@ qx_sandbox_rank(const char *sandbox_name)
 	return -1;
 }
 
+static const char *
+qx_default_runtime_for_provider_kind(const char *provider_kind)
+{
+	if (provider_kind != NULL && strcmp(provider_kind, "container") == 0)
+		return "container";
+	if (provider_kind != NULL && strcmp(provider_kind, "microvm") == 0)
+		return "microvm";
+
+	return "host";
+}
+
+static void
+qx_validate_principal_runtime_binding(const char *principal_name,
+										 const char *provider_kind,
+										 const char *runtime_class,
+										 const char *sandbox_name,
+										 const char *receipt_signer,
+										 const char *receipt_alg,
+										 const char *context_name)
+{
+	const char *effective_kind;
+	const char *effective_runtime;
+	const char *effective_alg;
+
+	effective_kind = (provider_kind != NULL && provider_kind[0] != '\0') ?
+		provider_kind : "loopback";
+	effective_runtime = (runtime_class != NULL && runtime_class[0] != '\0') ?
+		runtime_class : qx_default_runtime_for_provider_kind(effective_kind);
+	effective_alg = (receipt_alg != NULL && receipt_alg[0] != '\0') ?
+		receipt_alg : "hmac-sha256";
+
+	if (strcmp(effective_runtime, "host") != 0 &&
+		strcmp(effective_runtime, "container") != 0 &&
+		strcmp(effective_runtime, "microvm") != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("%s saw unsupported runtime class \"%s\" on principal \"%s\"",
+						context_name, effective_runtime,
+						principal_name != NULL ? principal_name : "<unknown>")));
+
+	if ((strcmp(effective_kind, "loopback") == 0 ||
+		 strcmp(effective_kind, "remote") == 0) &&
+		strcmp(effective_runtime, "host") != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("principal \"%s\" runtime class \"%s\" is incompatible with provider kind \"%s\"",
+						principal_name != NULL ? principal_name : "<unknown>",
+						effective_runtime, effective_kind),
+				 errdetail("Loopback and remote providers currently back only host principals.")));
+
+	if (strcmp(effective_kind, "container") == 0 &&
+		strcmp(effective_runtime, "container") != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("principal \"%s\" runtime class \"%s\" is incompatible with provider kind \"%s\"",
+						principal_name != NULL ? principal_name : "<unknown>",
+						effective_runtime, effective_kind),
+				 errdetail("Container providers require principals declared with runtime class \"container\".")));
+
+	if (strcmp(effective_kind, "microvm") == 0 &&
+		strcmp(effective_runtime, "microvm") != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("principal \"%s\" runtime class \"%s\" is incompatible with provider kind \"%s\"",
+						principal_name != NULL ? principal_name : "<unknown>",
+						effective_runtime, effective_kind),
+				 errdetail("MicroVM providers require principals declared with runtime class \"microvm\".")));
+
+	if (strcmp(effective_runtime, "host") != 0 &&
+		(sandbox_name == NULL || strcmp(sandbox_name, "isolated") != 0))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("principal \"%s\" runtime class \"%s\" requires sandbox \"isolated\"",
+						principal_name != NULL ? principal_name : "<unknown>",
+						effective_runtime)));
+
+	if (strcmp(effective_alg, "ed25519") == 0 &&
+		(receipt_signer == NULL || receipt_signer[0] == '\0'))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("principal \"%s\" has no signer for ed25519 receipts",
+						principal_name != NULL ? principal_name : "<unknown>"),
+				 errdetail("Bind SIGNER on the principal before authorizing tools under an ed25519 provider.")));
+}
+
 static char *
 qx_tool_contract_for_tuples(HeapTuple tooltup, HeapTuple principaltup,
 							HeapTuple providertup)
@@ -132,9 +225,13 @@ qx_tool_contract_for_tuples(HeapTuple tooltup, HeapTuple principaltup,
 	char	   *handler_name;
 	char	   *tool_sandbox;
 	char	   *principal_sandbox;
+	char	   *principal_runtime;
 	char	   *principal_program;
+	char	   *principal_receipt_signer;
+	char	   *provider_oid;
 	char	   *provider_kind;
 	char	   *provider_endpoint;
+	char	   *provider_receipt_alg;
 	char	   *contract;
 
 	handler_name = qx_security_text_attr(tooltup,
@@ -146,27 +243,48 @@ qx_tool_contract_for_tuples(HeapTuple tooltup, HeapTuple principaltup,
 	principal_sandbox = qx_security_text_attr(principaltup,
 											  Anum_pg_qx_principal_qxprincipalsandbox,
 											  QXPRINCIPALOID);
+	principal_runtime = qx_security_text_attr(principaltup,
+											  Anum_pg_qx_principal_qxprincipalruntimeclass,
+											  QXPRINCIPALOID);
 	principal_program = qx_security_text_attr(principaltup,
 											  Anum_pg_qx_principal_qxprincipalprogram,
 											  QXPRINCIPALOID);
+	principal_receipt_signer = qx_security_text_attr(principaltup,
+													 Anum_pg_qx_principal_qxprincipalreceiptsigner,
+													 QXPRINCIPALOID);
+	provider_oid = psprintf("%u", providerform->oid);
 	provider_kind = qx_security_text_attr(providertup,
 										  Anum_pg_qx_provider_qxproviderkind,
 										  QXPROVIDEROID);
 	provider_endpoint = qx_security_text_attr(providertup,
 											  Anum_pg_qx_provider_qxproviderendpoint,
 											  QXPROVIDEROID);
+	provider_receipt_alg = qx_security_text_attr(providertup,
+												 Anum_pg_qx_provider_qxproviderreceiptalg,
+												 QXPROVIDEROID);
+	if (principal_runtime == NULL || principal_runtime[0] == '\0')
+	{
+		if (principal_runtime != NULL)
+			pfree(principal_runtime);
+		principal_runtime =
+			pstrdup(qx_default_runtime_for_provider_kind(provider_kind));
+	}
 
-	contract = psprintf("tool=%s;handler=%s;tool_sandbox=%s;principal=%s;principal_sandbox=%s;program=%s;provider=%s;provider_kind=%s;provider_endpoint=%s;provider_attestation=%s;receipt_schema=qx.receipt.v1",
+	contract = psprintf("tool=%s;handler=%s;tool_sandbox=%s;principal=%s;principal_sandbox=%s;principal_runtime=%s;program=%s;receipt_signer=%s;provider=%s;provider_oid=%s;provider_kind=%s;provider_endpoint=%s;provider_attestation=%s;receipt_schema=qx.receipt.v1;receipt_alg=%s",
 						NameStr(toolform->qxtoolname),
 						handler_name != NULL ? handler_name : "<none>",
 						tool_sandbox != NULL ? tool_sandbox : "builtin",
 						NameStr(principalform->qxprincipalname),
 						principal_sandbox != NULL ? principal_sandbox : "builtin",
+						principal_runtime != NULL ? principal_runtime : "host",
 						principal_program != NULL ? principal_program : "",
+						principal_receipt_signer != NULL ? principal_receipt_signer : "",
 						NameStr(providerform->qxprovidername),
+						provider_oid,
 						provider_kind != NULL ? provider_kind : "loopback",
 						provider_endpoint != NULL ? provider_endpoint : "local://qhapaqxian-tool-runner",
-						providerform->qxproviderattestationrequired ? "required" : "optional");
+						providerform->qxproviderattestationrequired ? "required" : "optional",
+						provider_receipt_alg != NULL ? provider_receipt_alg : "hmac-sha256");
 
 	if (handler_name != NULL)
 		pfree(handler_name);
@@ -174,12 +292,20 @@ qx_tool_contract_for_tuples(HeapTuple tooltup, HeapTuple principaltup,
 		pfree(tool_sandbox);
 	if (principal_sandbox != NULL)
 		pfree(principal_sandbox);
+	if (principal_runtime != NULL)
+		pfree(principal_runtime);
 	if (principal_program != NULL)
 		pfree(principal_program);
+	if (principal_receipt_signer != NULL)
+		pfree(principal_receipt_signer);
+	if (provider_oid != NULL)
+		pfree(provider_oid);
 	if (provider_kind != NULL)
 		pfree(provider_kind);
 	if (provider_endpoint != NULL)
 		pfree(provider_endpoint);
+	if (provider_receipt_alg != NULL)
+		pfree(provider_receipt_alg);
 
 	return contract;
 }
@@ -487,6 +613,10 @@ QxValidateRegisteredTools(Oid namespaceoid, List *tools, bool require_enabled)
 			HeapTuple	providertup;
 			char	   *tool_sandbox;
 			char	   *principal_sandbox;
+			char	   *principal_runtime;
+			char	   *principal_receipt_signer;
+			char	   *provider_kind;
+			char	   *provider_receipt_alg;
 			Form_pg_qx_principal principalform;
 			Form_pg_qx_provider providerform;
 
@@ -567,12 +697,33 @@ QxValidateRegisteredTools(Oid namespaceoid, List *tools, bool require_enabled)
 			principal_sandbox = qx_security_text_attr(principaltup,
 													  Anum_pg_qx_principal_qxprincipalsandbox,
 													  QXPRINCIPALOID);
+			principal_runtime = qx_security_text_attr(principaltup,
+													 Anum_pg_qx_principal_qxprincipalruntimeclass,
+													 QXPRINCIPALOID);
+			principal_receipt_signer = qx_security_text_attr(principaltup,
+															 Anum_pg_qx_principal_qxprincipalreceiptsigner,
+															 QXPRINCIPALOID);
+			provider_kind = qx_security_text_attr(providertup,
+												 Anum_pg_qx_provider_qxproviderkind,
+												 QXPROVIDEROID);
+			provider_receipt_alg = qx_security_text_attr(providertup,
+														 Anum_pg_qx_provider_qxproviderreceiptalg,
+														 QXPROVIDEROID);
 			if (qx_sandbox_rank(tool_sandbox) > qx_sandbox_rank(principal_sandbox))
 			{
 				if (tool_sandbox != NULL)
 					pfree(tool_sandbox);
 				if (principal_sandbox != NULL)
 					pfree(principal_sandbox);
+				if (principal_runtime != NULL)
+					pfree(principal_runtime);
+				if (principal_receipt_signer != NULL)
+					pfree(principal_receipt_signer);
+				if (provider_kind != NULL)
+					pfree(provider_kind);
+				if (provider_receipt_alg != NULL)
+					pfree(provider_receipt_alg);
+				ReleaseSysCache(providertup);
 				ReleaseSysCache(principaltup);
 				ReleaseSysCache(tooltup);
 				ereport(ERROR,
@@ -580,11 +731,26 @@ QxValidateRegisteredTools(Oid namespaceoid, List *tools, bool require_enabled)
 						 errmsg("tool \"%s\" exceeds its principal sandbox ceiling",
 								tool_name)));
 			}
+			qx_validate_principal_runtime_binding(NameStr(principalform->qxprincipalname),
+												 provider_kind,
+												 principal_runtime,
+												 principal_sandbox,
+												 principal_receipt_signer,
+												 provider_receipt_alg,
+												 "tool registration validation");
 
 			if (tool_sandbox != NULL)
 				pfree(tool_sandbox);
 			if (principal_sandbox != NULL)
 				pfree(principal_sandbox);
+			if (principal_runtime != NULL)
+				pfree(principal_runtime);
+			if (principal_receipt_signer != NULL)
+				pfree(principal_receipt_signer);
+			if (provider_kind != NULL)
+				pfree(provider_kind);
+			if (provider_receipt_alg != NULL)
+				pfree(provider_receipt_alg);
 			ReleaseSysCache(providertup);
 			ReleaseSysCache(principaltup);
 		}
@@ -681,6 +847,10 @@ QxAuthorizeToolsForNamespace(Oid namespacepolicyoid, Oid namespaceoid,
 		Form_pg_qx_provider providerform;
 		char	   *tool_sandbox;
 		char	   *principal_sandbox;
+		char	   *principal_runtime;
+		char	   *principal_receipt_signer;
+		char	   *provider_kind;
+		char	   *provider_receipt_alg;
 		char	   *contract;
 
 		if (policyform->qxrequireknowntools &&
@@ -790,22 +960,60 @@ QxAuthorizeToolsForNamespace(Oid namespacepolicyoid, Oid namespaceoid,
 		principal_sandbox = qx_security_text_attr(principaltup,
 													  Anum_pg_qx_principal_qxprincipalsandbox,
 													  QXPRINCIPALOID);
+		principal_runtime = qx_security_text_attr(principaltup,
+												 Anum_pg_qx_principal_qxprincipalruntimeclass,
+												 QXPRINCIPALOID);
+		principal_receipt_signer = qx_security_text_attr(principaltup,
+														 Anum_pg_qx_principal_qxprincipalreceiptsigner,
+														 QXPRINCIPALOID);
+		provider_kind = qx_security_text_attr(providertup,
+											 Anum_pg_qx_provider_qxproviderkind,
+											 QXPROVIDEROID);
+		provider_receipt_alg = qx_security_text_attr(providertup,
+													 Anum_pg_qx_provider_qxproviderreceiptalg,
+													 QXPROVIDEROID);
 		if (qx_sandbox_rank(tool_sandbox) > qx_sandbox_rank(principal_sandbox))
 		{
 			if (tool_sandbox != NULL)
 				pfree(tool_sandbox);
 			if (principal_sandbox != NULL)
 				pfree(principal_sandbox);
+			if (principal_runtime != NULL)
+				pfree(principal_runtime);
+			if (principal_receipt_signer != NULL)
+				pfree(principal_receipt_signer);
+			if (provider_kind != NULL)
+				pfree(provider_kind);
+			if (provider_receipt_alg != NULL)
+				pfree(provider_receipt_alg);
+			ReleaseSysCache(providertup);
+			ReleaseSysCache(principaltup);
+			ReleaseSysCache(tooltup);
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("tool \"%s\" exceeds the sandbox ceiling of principal \"%s\"",
 							tool_name, NameStr(principalform->qxprincipalname))));
 		}
+		qx_validate_principal_runtime_binding(NameStr(principalform->qxprincipalname),
+											 provider_kind,
+											 principal_runtime,
+											 principal_sandbox,
+											 principal_receipt_signer,
+											 provider_receipt_alg,
+											 "namespace tool authorization");
 
 		if (tool_sandbox != NULL)
 			pfree(tool_sandbox);
 		if (principal_sandbox != NULL)
 			pfree(principal_sandbox);
+		if (principal_runtime != NULL)
+			pfree(principal_runtime);
+		if (principal_receipt_signer != NULL)
+			pfree(principal_receipt_signer);
+		if (provider_kind != NULL)
+			pfree(provider_kind);
+		if (provider_receipt_alg != NULL)
+			pfree(provider_receipt_alg);
 
 		contract = qx_tool_contract_for_tuples(tooltup, principaltup, providertup);
 		authz->tool_count += 1;

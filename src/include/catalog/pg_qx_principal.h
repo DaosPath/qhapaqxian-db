@@ -24,6 +24,8 @@ CATALOG(pg_qx_principal,9590,QxPrincipalRelationId)
 	text		qxprincipalsandbox BKI_FORCE_NULL;
 	text		qxprincipalprogram BKI_FORCE_NULL;
 	text		qxprincipalprovider BKI_FORCE_NULL;
+	text		qxprincipalruntimeclass BKI_FORCE_NULL;
+	text		qxprincipalreceiptsigner BKI_FORCE_NULL;
 #endif
 } FormData_pg_qx_principal;
 

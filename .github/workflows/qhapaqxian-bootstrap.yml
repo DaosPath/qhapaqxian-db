@@ -26,7 +26,7 @@ jobs:
             perl \
             pkg-config
       - name: Configure
-        run: ./configure --without-icu --without-ldap --without-pam --with-extra-version='+qhx-bootstrap'
+        run: ./configure --without-icu --without-ldap --without-pam --with-openssl --with-extra-version='+qhx-bootstrap'
       - name: Build
         run: make -j"$(nproc)"
       - name: Smoke version

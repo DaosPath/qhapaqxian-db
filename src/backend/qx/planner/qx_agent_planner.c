@@ -45,6 +45,7 @@ static void qx_append_plan_text(StringInfo buf, const QxAgentPlan *plan);
 static char *qx_text_attr_from_syscache(HeapTuple tup, AttrNumber attnum,
 										int cacheid);
 static int32 qx_estimate_token_usage(bool input_present, int32 tool_token_cost);
+static char *qx_plan_display_contract(const char *contract);
 
 static Oid
 qx_extract_oid_literal(Node *expr, const char *subject, const char *detail,
@@ -106,6 +107,51 @@ qx_agent_plan_add_step(QxAgentPlan *plan, int16 seqno, const char *name,
 
 	plan->steps = lappend(plan->steps, step);
 	plan->estimated_total_cost += estimated_cost;
+}
+
+static char *
+qx_plan_display_contract(const char *contract)
+{
+	char	   *display;
+	const char *needle;
+
+	if (contract == NULL)
+		return pstrdup("<null>");
+
+	display = pstrdup(contract);
+
+	for (;;)
+	{
+		const char *keys[] = {"provider_oid=", "receipt_signer="};
+		int			i;
+		bool		removed = false;
+
+		for (i = 0; i < lengthof(keys); i++)
+		{
+			char	   *start;
+			char	   *end;
+
+			needle = strstr(display, keys[i]);
+			if (needle == NULL)
+				continue;
+
+			start = unconstify(char *, needle);
+			if (start > display && *(start - 1) == ';')
+				start--;
+			end = strchr(needle, ';');
+			if (end == NULL)
+				*start = '\0';
+			else
+				memmove(start, end, strlen(end) + 1);
+			removed = true;
+			break;
+		}
+
+		if (!removed)
+			break;
+	}
+
+	return display;
 }
 
 static QxAgentPlan *
@@ -542,9 +588,13 @@ qx_append_plan_text(StringInfo buf, const QxAgentPlan *plan)
 		appendStringInfoString(buf, "  Authorized Tools: ");
 		foreach(tool_lc, plan->authorized_tools)
 		{
+			char	   *display_contract;
+
 			if (!first)
 				appendStringInfoString(buf, ", ");
-			appendStringInfoString(buf, strVal(lfirst(tool_lc)));
+			display_contract = qx_plan_display_contract(strVal(lfirst(tool_lc)));
+			appendStringInfoString(buf, display_contract);
+			pfree(display_contract);
 			first = false;
 		}
 		appendStringInfoChar(buf, '\n');

@@ -23,6 +23,8 @@ CATALOG(pg_qx_provider,9595,QxProviderRelationId)
 #ifdef CATALOG_VARLEN
 	text		qxproviderkind BKI_FORCE_NULL;
 	text		qxproviderendpoint BKI_FORCE_NULL;
+	text		qxproviderreceiptalg BKI_FORCE_NULL;
+	text		qxproviderreceiptkey BKI_FORCE_NULL;
 #endif
 } FormData_pg_qx_provider;
 

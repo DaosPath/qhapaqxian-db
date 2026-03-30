@@ -30,7 +30,10 @@ Current state:
 - Stage 17 stronger runtime isolation is implemented with OS-level sandbox profiles, minimal-environment execution, sealed runtime workdirs, and launcher-enforced timeout/process ceilings for principal programs;
 - Stage 18 restricted-identity execution is implemented with restricted-token launch for non-`builtin` principals on Windows and parent-observed launch receipts in runtime traces;
 - Stage 19 provider-backed runtime receipts are implemented with native `CREATE/ALTER PROVIDER`, `pg_qx_provider`, principal-to-provider binding, and runtime verification of provider identity, receipt schema, receipt nonce, and attestation mode before budget charging;
-- the next execution step is no longer local provider debt but broader external-runtime scope: remote providers, signed/remote attestation, or container/microVM execution when the product chooses to leave the single-host fork boundary.
+- Stage 20 brokered remote providers and HMAC-signed receipts are implemented with `remote://` providers, provider-scoped receipt keys, runtime-side HMAC verification, and trace-visible receipt algorithm/signature evidence across submit and resume;
+- Stage 21 asymmetric remote receipts are implemented with `ed25519` provider verification, principal signer metadata, OpenSSL-backed runtime signature checks, and Windows runner packaging that stages `libcrypto`, `libssl`, and `zlib` runtime DLLs into `bindir` so minimal-environment execution remains viable;
+- Stage 22 brokered container and microVM principal classes are implemented with `container://` / `microvm://` providers, explicit principal runtime classes, provider/runtime compatibility checks, and receipt/tracing payloads that bind submit/resume evidence to the expected principal runtime;
+- the next execution step is deeper external-runtime scope: real container or microVM launch backends behind those provider classes, or certificate-chain-backed provider attestation when the product chooses to leave the brokered single-host boundary.
 
 Immediate non-goals:
 - renaming all PostgreSQL binaries

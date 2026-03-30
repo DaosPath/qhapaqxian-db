@@ -367,12 +367,18 @@ static int qx_parse_memory_scope(char *scope, int location,
 				qx_opt_task_name qx_opt_task_priority
 				qx_opt_resume_checkpoint qx_opt_memory_match
 				qx_opt_provider_kind qx_opt_provider_endpoint
+				qx_opt_provider_receipt_alg
+				qx_opt_provider_receipt_key
+				qx_opt_principal_runtime qx_opt_principal_signer
 				qx_opt_alter_principal_program
-				qx_opt_alter_principal_sandbox
+				qx_opt_alter_principal_sandbox qx_opt_alter_principal_runtime
+				qx_opt_alter_principal_signer
 				qx_opt_tool_policy qx_opt_alter_tool_handler
 				qx_opt_alter_tool_sandbox qx_opt_alter_tool_principal
 				qx_opt_alter_tool_policy
 				qx_opt_alter_provider_kind qx_opt_alter_provider_endpoint
+				qx_opt_alter_provider_receipt_alg
+				qx_opt_alter_provider_receipt_key
 %type <list>	qx_opt_agent_tools qx_opt_agent_budget
 				qx_opt_memory_scopes qx_memory_scope_list
 				qx_opt_memory_tags qx_memory_tag_list
@@ -805,11 +811,11 @@ static int qx_parse_memory_scope(char *scope, int location,
 	RANGE READ REAL REASSIGN RECHECK RECEIPT RECURSIVE REF_P REFERENCES REFERENCING
 	REFRESH REINDEX RELATIVE_P RELEASE RENAME REPEATABLE REPLACE REPLICA
 	RESET RESTART RESTRICT REMEMBER RESUME RETURN RETURNING RETURNS REVOKE RIGHT ROLE ROLLBACK ROLLUP
-	ROUTINE ROUTINES ROW ROWS RULE RUN
+	ROUTINE ROUTINES ROW ROWS RULE RUNTIME RUN
 
 	SANDBOX SAVEPOINT SCALAR SCHEMA SCHEMAS SCOPE SCROLL SEARCH SECOND_P SECURITY SELECT
 	SEQUENCE SEQUENCES
-	SERIALIZABLE SERVER SESSION SESSION_USER SET SETS SETOF SHARE SHOW
+	SERIALIZABLE SERVER SESSION SESSION_USER SET SETS SETOF SHARE SHOW SIGNER
 	SIMILAR SIMPLE SKIP SMALLINT SNAPSHOT SOME SOURCE SQL_P STABLE STANDALONE_P
 	START STATEMENT STATISTICS STDIN STDOUT STORAGE STORED STRICT_P STRING_P STRIP_P
 	SUBSCRIPTION SUBSTRING SUPPORT SYMMETRIC SYSID SYSTEM_P SYSTEM_USER
@@ -2076,6 +2082,7 @@ AlterNamespacePolicyStmt:
 
 CreateProviderStmt:
 			CREATE PROVIDER qualified_name KIND Sconst ENDPOINT Sconst
+			qx_opt_provider_receipt_alg qx_opt_provider_receipt_key
 			qx_opt_provider_attestation
 				{
 					CreateProviderStmt *n = makeNode(CreateProviderStmt);
@@ -2083,7 +2090,9 @@ CreateProviderStmt:
 					n->provider_name = $3;
 					n->provider_kind = $5;
 					n->endpoint_name = $7;
-					n->attestation_required = ($8 != 0);
+					n->receipt_alg = $8;
+					n->receipt_key = $9;
+					n->attestation_required = ($10 != 0);
 					n->location = @1;
 					$$ = (Node *) n;
 				}
@@ -2093,6 +2102,8 @@ AlterProviderStmt:
 			ALTER PROVIDER qualified_name
 			qx_opt_alter_provider_kind
 			qx_opt_alter_provider_endpoint
+			qx_opt_alter_provider_receipt_alg
+			qx_opt_alter_provider_receipt_key
 			qx_opt_alter_provider_attestation
 			qx_opt_alter_provider_enabled
 				{
@@ -2103,10 +2114,14 @@ AlterProviderStmt:
 					n->set_kind = ($4 != NULL);
 					n->endpoint_name = $5;
 					n->set_endpoint = ($5 != NULL);
-					n->attestation_required = ($6 > 0);
-					n->set_attestation_required = ($6 >= 0);
-					n->enabled = ($7 > 0);
-					n->set_enabled = ($7 >= 0);
+					n->receipt_alg = $6;
+					n->set_receipt_alg = ($6 != NULL);
+					n->receipt_key = $7;
+					n->set_receipt_key = ($7 != NULL);
+					n->attestation_required = ($8 > 0);
+					n->set_attestation_required = ($8 >= 0);
+					n->enabled = ($9 > 0);
+					n->set_enabled = ($9 >= 0);
 					n->location = @1;
 					$$ = (Node *) n;
 				}
@@ -2114,14 +2129,16 @@ AlterProviderStmt:
 
 CreatePrincipalStmt:
 			CREATE PRINCIPAL qualified_name PROGRAM Sconst SANDBOX Sconst
-			qx_principal_provider
+			qx_opt_principal_runtime qx_principal_provider qx_opt_principal_signer
 				{
 					CreatePrincipalStmt *n = makeNode(CreatePrincipalStmt);
 
 					n->principal_name = $3;
 					n->program_name = $5;
 					n->sandbox_name = $7;
-					n->provider_name = $8;
+					n->runtime_class = $8;
+					n->provider_name = $9;
+					n->receipt_signer = $10;
 					n->enabled = true;
 					n->location = @1;
 					$$ = (Node *) n;
@@ -2133,6 +2150,8 @@ AlterPrincipalStmt:
 			qx_opt_alter_principal_provider
 			qx_opt_alter_principal_program
 			qx_opt_alter_principal_sandbox
+			qx_opt_alter_principal_runtime
+			qx_opt_alter_principal_signer
 			qx_opt_alter_principal_enabled
 				{
 					AlterPrincipalStmt *n = makeNode(AlterPrincipalStmt);
@@ -2144,8 +2163,12 @@ AlterPrincipalStmt:
 					n->set_program = ($5 != NULL);
 					n->sandbox_name = $6;
 					n->set_sandbox = ($6 != NULL);
-					n->enabled = ($7 > 0);
-					n->set_enabled = ($7 >= 0);
+					n->runtime_class = $7;
+					n->set_runtime = ($7 != NULL);
+					n->receipt_signer = $8;
+					n->set_receipt_signer = ($8 != NULL);
+					n->enabled = ($9 > 0);
+					n->set_enabled = ($9 >= 0);
 					n->location = @1;
 					$$ = (Node *) n;
 				}
@@ -2261,10 +2284,25 @@ qx_opt_provider_endpoint:
 			| /* EMPTY */							{ $$ = NULL; }
 		;
 
+qx_opt_provider_receipt_alg:
+			USING Sconst						{ $$ = $2; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
 qx_opt_provider_attestation:
 			ATTESTATION ENABLE_P				{ $$ = 1; }
 			| ATTESTATION DISABLE_P				{ $$ = 0; }
 			| /* EMPTY */							{ $$ = 0; }
+		;
+
+qx_opt_provider_receipt_key:
+			RECEIPT KEY Sconst					{ $$ = $3; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
+qx_opt_alter_provider_receipt_alg:
+			USING Sconst						{ $$ = $2; }
+			| /* EMPTY */							{ $$ = NULL; }
 		;
 
 qx_opt_alter_provider_kind:
@@ -2283,10 +2321,35 @@ qx_opt_alter_provider_attestation:
 			| /* EMPTY */							{ $$ = -1; }
 		;
 
+qx_opt_alter_provider_receipt_key:
+			RECEIPT KEY Sconst					{ $$ = $3; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
 qx_opt_alter_provider_enabled:
 			ENABLE_P								{ $$ = 1; }
 			| DISABLE_P							{ $$ = 0; }
 			| /* EMPTY */							{ $$ = -1; }
+		;
+
+qx_opt_principal_signer:
+			SIGNER Sconst						{ $$ = $2; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
+qx_opt_principal_runtime:
+			RUNTIME Sconst						{ $$ = $2; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
+qx_opt_alter_principal_signer:
+			SIGNER Sconst						{ $$ = $2; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
+qx_opt_alter_principal_runtime:
+			RUNTIME Sconst						{ $$ = $2; }
+			| /* EMPTY */							{ $$ = NULL; }
 		;
 
 qx_opt_agent_model:

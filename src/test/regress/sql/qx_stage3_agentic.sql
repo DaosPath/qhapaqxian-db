@@ -1,29 +1,67 @@
--- QhapaqXian DB Stage 19 provider receipt slice
+-- QhapaqXian DB Stage 22 brokered container/microvm principal slice
 
 CREATE PROVIDER public.loopback_provider
   KIND 'loopback'
   ENDPOINT 'local://qhapaqxian-tool-runner'
+  RECEIPT KEY 'loopback-stage20-key'
+  ATTESTATION ENABLE;
+
+CREATE PROVIDER public.container_provider
+  KIND 'container'
+  ENDPOINT 'container://broker/pool'
+  USING 'ed25519'
+  RECEIPT KEY $$-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEATQR0xvmOgsHyUp6bWkQ7xlKHg40piOubNdB+Ew80TOs=
+-----END PUBLIC KEY-----$$
+  ATTESTATION ENABLE;
+
+CREATE PROVIDER public.microvm_provider
+  KIND 'microvm'
+  ENDPOINT 'microvm://broker/primary'
+  USING 'ed25519'
+  RECEIPT KEY $$-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEATQR0xvmOgsHyUp6bWkQ7xlKHg40piOubNdB+Ew80TOs=
+-----END PUBLIC KEY-----$$
   ATTESTATION ENABLE;
 
 ALTER PROVIDER public.loopback_provider
   ENDPOINT 'local://qhapaqxian-tool-runner'
+  RECEIPT KEY 'loopback-stage20-key'
   ATTESTATION ENABLE
   ENABLE;
 
 CREATE PRINCIPAL public.search_runner
   PROGRAM 'qhapaqxian-tool-runner'
   SANDBOX 'restricted'
+  RUNTIME 'host'
   PROVIDER public.loopback_provider;
+
+CREATE PRINCIPAL public.extract_runner
+  PROGRAM 'qhapaqxian-tool-runner'
+  SANDBOX 'isolated'
+  RUNTIME 'container'
+  PROVIDER public.container_provider
+  SIGNER 'qx_remote_ed25519_private.pem';
 
 CREATE PRINCIPAL public.summarize_runner
   PROGRAM 'qhapaqxian-tool-runner'
   SANDBOX 'isolated'
-  PROVIDER public.loopback_provider;
+  RUNTIME 'microvm'
+  PROVIDER public.microvm_provider
+  SIGNER 'qx_remote_ed25519_private.pem';
 
 ALTER PRINCIPAL public.search_runner
   PROVIDER public.loopback_provider
   PROGRAM 'qhapaqxian-tool-runner'
-  SANDBOX 'restricted';
+  SANDBOX 'restricted'
+  RUNTIME 'host';
+
+CREATE TOOL public.extract
+  HANDLER 'builtin.extract'
+  SANDBOX 'isolated'
+  PRINCIPAL 'extract_runner'
+  TOKEN COST 15
+  COST 10;
 
 CREATE TOOL public.search
   HANDLER 'builtin.search'
@@ -45,7 +83,7 @@ CREATE NAMESPACE POLICY guarded FOR SCHEMA public
   BUDGET ENABLE;
 
 ALTER NAMESPACE POLICY guarded FOR SCHEMA public
-  SET TOOLS (search, summarize)
+  SET TOOLS (extract, search, summarize)
   KNOWN TOOLS ENABLE
   BUDGET ENABLE;
 
@@ -110,7 +148,9 @@ SELECT qxprovidername::text AS provider_name,
        qxproviderenabled AS enabled,
        qxproviderattestationrequired AS attestation_required,
        qxproviderkind::text AS provider_kind,
-       qxproviderendpoint::text AS provider_endpoint
+       qxproviderendpoint::text AS provider_endpoint,
+       qxproviderreceiptalg::text AS receipt_alg,
+       qxproviderreceiptkey IS NOT NULL AS has_receipt_key
 FROM pg_qx_provider
 ORDER BY qxprovidername;
 
@@ -118,7 +158,9 @@ SELECT qxprincipalname::text AS principal_name,
        qxprincipalnamespace = 'public'::regnamespace AS in_public_schema,
        qxprincipalenabled AS enabled,
        qxprincipalsandbox::text AS sandbox_name,
+       qxprincipalruntimeclass::text AS runtime_class,
        qxprincipalprogram::text AS program_name,
+       qxprincipalreceiptsigner IS NOT NULL AS has_receipt_signer,
        qxprincipalproviderid <> 0 AS has_provider_oid,
        qxprincipalprovider::text AS provider_name
 FROM pg_qx_principal
@@ -343,19 +385,43 @@ SELECT qxtracename::text AS trace_name,
          WHEN qxtracename = 'runtime.external_resume' THEN qxtracedetail LIKE '%effective_sandbox=isolated%'
          ELSE false
        END AS expected_sandbox,
-       qxtracedetail LIKE '%provider=loopback_provider%' AS has_provider,
-       qxtracedetail LIKE '%profile=%' AS has_profile,
+       CASE
+        WHEN qxtracename = 'runtime.external_submit' THEN qxtracedetail LIKE '%provider=loopback_provider%'
+        WHEN qxtracename = 'runtime.external_resume' THEN qxtracedetail LIKE '%provider=microvm_provider%'
+        ELSE false
+      END AS expected_provider,
+      CASE
+        WHEN qxtracename = 'runtime.external_submit' THEN qxtracedetail LIKE '%provider_kind=loopback%'
+        WHEN qxtracename = 'runtime.external_resume' THEN qxtracedetail LIKE '%provider_kind=microvm%'
+        ELSE false
+      END AS expected_provider_kind,
+      CASE
+        WHEN qxtracename = 'runtime.external_submit' THEN qxtracedetail LIKE '%principal_runtime=host%'
+        WHEN qxtracename = 'runtime.external_resume' THEN qxtracedetail LIKE '%principal_runtime=microvm%'
+        ELSE false
+      END AS expected_principal_runtime,
+      qxtracedetail LIKE '%profile=%' AS has_profile,
        qxtracedetail LIKE '%env=minimal%' AS minimal_env,
        qxtracedetail LIKE '%cwd=pg_qx_runtime%' AS runtime_workdir,
        qxtracedetail LIKE '%process_limit=1%' AS single_process_cap,
        qxtracedetail LIKE '%timeout_ms=%' AS has_timeout,
        qxtracedetail LIKE '%receipt_schema=qx.receipt.v1%' AS has_receipt_schema,
        CASE
+         WHEN qxtracename = 'runtime.external_submit' THEN qxtracedetail LIKE '%receipt_alg=hmac-sha256%'
+         WHEN qxtracename = 'runtime.external_resume' THEN qxtracedetail LIKE '%receipt_alg=ed25519%'
+         ELSE false
+       END AS has_receipt_alg,
+       CASE
          WHEN qxtracename = 'runtime.external_submit' THEN qxtracedetail LIKE '%receipt_nonce=submit:search:search_runner%'
          WHEN qxtracename = 'runtime.external_resume' THEN qxtracedetail LIKE '%receipt_nonce=resume:summarize:summarize_runner%'
          ELSE false
        END AS expected_receipt_nonce,
-       qxtracedetail LIKE '%attestation=loopback_verified%' AS has_attestation,
+       qxtracedetail LIKE '%receipt_sig=verified%' AS has_receipt_sig,
+      CASE
+        WHEN qxtracename = 'runtime.external_submit' THEN qxtracedetail LIKE '%attestation=loopback_verified%'
+        WHEN qxtracename = 'runtime.external_resume' THEN qxtracedetail LIKE '%attestation=microvm_receipt_verified%'
+        ELSE false
+      END AS expected_attestation,
        qxtracedetail LIKE '%launch_mode=profiled_process%' AS has_launch_mode,
        qxtracedetail LIKE '%restricted_identity=%' AS has_restricted_identity,
        qxtracedetail LIKE '%wall_ms=%' AS has_wall_time

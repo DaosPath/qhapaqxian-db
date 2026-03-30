@@ -25,10 +25,14 @@
 #include "catalog/pg_qx_event.h"
 #include "catalog/pg_qx_identity.h"
 #include "catalog/pg_qx_namespace.h"
+#include "catalog/pg_qx_provider.h"
 #include "catalog/pg_qx_session.h"
 #include "catalog/pg_qx_step.h"
 #include "catalog/pg_qx_task.h"
 #include "catalog/pg_qx_trace.h"
+#include "common/hmac.h"
+#include "common/openssl.h"
+#include "common/sha2.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "nodes/readfuncs.h"
@@ -43,6 +47,15 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
+
+#ifdef USE_OPENSSL
+#include <openssl/bio.h>
+#include <openssl/err.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#endif
+
+#include <sys/stat.h>
 
 #ifndef WIN32
 #include <signal.h>
@@ -64,13 +77,17 @@ typedef struct QxExternalToolResult
 	char	   *detail;
 	char	   *tool_name;
 	char	   *principal_name;
+	char	   *principal_runtime;
 	char	   *provider_name;
+	char	   *provider_kind;
 	char	   *sandbox_name;
 	char	   *profile_name;
 	char	   *environment_mode;
 	char	   *workdir_name;
 	char	   *receipt_schema;
+	char	   *receipt_alg;
 	char	   *receipt_nonce;
+	char	   *receipt_signature;
 	char	   *attestation_mode;
 } QxExternalToolResult;
 
@@ -92,10 +109,47 @@ typedef struct QxSandboxObservation
 } QxSandboxObservation;
 
 static uint32 qx_runtime_temp_seq = 0;
+#define QX_RECEIPT_SIG_HEX_LEN	((PG_SHA256_DIGEST_LENGTH * 2) + 1)
+#define QX_ED25519_SIG_BYTES	64
+#define QX_ED25519_SIG_HEX_LEN	((QX_ED25519_SIG_BYTES * 2) + 1)
 
 static char *qx_text_attr_from_syscache(HeapTuple tup, AttrNumber attnum,
 										int cacheid);
 static char *qx_contract_value(const char *contract, const char *key);
+static char *qx_provider_receipt_key(Oid provideroid);
+static const char *qx_default_runtime_for_provider_kind(const char *provider_kind);
+static char *qx_expected_attestation_mode(const char *provider_kind,
+										  bool require_attestation);
+static char *qx_receipt_hmac_signature_hex(const char *receipt_key,
+										   const char *payload);
+#ifdef USE_OPENSSL
+static char *qx_openssl_error_string(void);
+static bool qx_verify_ed25519_receipt_signature(const char *public_key_pem,
+												 const char *payload,
+												 const char *signature_hex);
+#endif
+static char *qx_receipt_payload(const char *phase,
+								Oid taskoid,
+								const char *tool_name,
+								const char *principal_name,
+								const char *principal_runtime,
+								const char *provider_name,
+								const char *provider_kind,
+								const char *provider_endpoint,
+								const char *sandbox_name,
+								const char *profile_name,
+								const char *environment_mode,
+								const char *workdir_name,
+								int32 timeout_ms,
+								int32 process_limit,
+								bool path_present,
+								const char *receipt_schema,
+								const char *receipt_alg,
+								const char *receipt_nonce,
+								const char *attestation_mode,
+								int32 token_charge,
+								int32 cost_charge,
+								const char *detail);
 static int	qx_sandbox_rank(const char *sandbox_name);
 static const char *qx_effective_sandbox_name(const char *tool_sandbox,
 											 const char *principal_sandbox);
@@ -107,6 +161,9 @@ static void qx_write_text_file(const char *path, const char *contents);
 static void qx_resolve_principal_program_path(const char *program_name,
 											  char *resolved,
 											  size_t resolved_len);
+static void qx_resolve_receipt_signer_path(const char *signer_name,
+										   char *resolved,
+										   size_t resolved_len);
 static void qx_launch_principal_program(const char *program_path,
 										const QxSandboxProfile *profile,
 										const char *runtime_dir,
@@ -117,11 +174,18 @@ static void qx_read_external_result(const char *path,
 									QxExternalToolResult *result);
 static void qx_validate_external_result(const QxExternalToolResult *result,
 										const QxSandboxProfile *profile,
+										const char *phase,
+										Oid taskoid,
 										const char *expected_tool,
 										const char *expected_principal,
+										const char *expected_principal_runtime,
 										const char *expected_provider,
+										const char *expected_provider_kind,
+										const char *expected_provider_endpoint,
 										const char *expected_receipt_schema,
+										const char *expected_receipt_alg,
 										const char *expected_receipt_nonce,
+										const char *receipt_key,
 										bool require_attestation);
 static void qx_free_external_result(QxExternalToolResult *result);
 static void qx_execute_tool_contract(const char *contract,
@@ -201,6 +265,287 @@ qx_contract_value(const char *contract, const char *key)
 
 	value = pnstrdup(start, end - start);
 	return value;
+}
+
+static char *
+qx_provider_receipt_key(Oid provideroid)
+{
+	HeapTuple	providertup;
+	Form_pg_qx_provider providerform;
+	char	   *receipt_key;
+
+	providertup = SearchSysCache1(QXPROVIDEROID, ObjectIdGetDatum(provideroid));
+	if (!HeapTupleIsValid(providertup))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("provider %u no longer exists for runtime receipt verification",
+						provideroid)));
+
+	providerform = (Form_pg_qx_provider) GETSTRUCT(providertup);
+	if (!providerform->qxproviderenabled)
+	{
+		ReleaseSysCache(providertup);
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("provider %u is disabled for runtime receipt verification",
+						provideroid)));
+	}
+
+	receipt_key = qx_text_attr_from_syscache(providertup,
+											 Anum_pg_qx_provider_qxproviderreceiptkey,
+											 QXPROVIDEROID);
+	ReleaseSysCache(providertup);
+
+	if (receipt_key == NULL || receipt_key[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("provider %u has no receipt key configured", provideroid)));
+
+	return receipt_key;
+}
+
+static const char *
+qx_default_runtime_for_provider_kind(const char *provider_kind)
+{
+	if (provider_kind != NULL && strcmp(provider_kind, "container") == 0)
+		return "container";
+	if (provider_kind != NULL && strcmp(provider_kind, "microvm") == 0)
+		return "microvm";
+
+	return "host";
+}
+
+static char *
+qx_expected_attestation_mode(const char *provider_kind, bool require_attestation)
+{
+	if (!require_attestation)
+		return pstrdup("optional");
+
+	if (provider_kind != NULL && strcmp(provider_kind, "microvm") == 0)
+		return pstrdup("microvm_receipt_verified");
+
+	if (provider_kind != NULL && strcmp(provider_kind, "container") == 0)
+		return pstrdup("container_receipt_verified");
+
+	if (provider_kind != NULL && strcmp(provider_kind, "remote") == 0)
+		return pstrdup("remote_broker_verified");
+
+	return pstrdup("loopback_verified");
+}
+
+static char *
+qx_receipt_hmac_signature_hex(const char *receipt_key, const char *payload)
+{
+	pg_hmac_ctx *ctx;
+	uint8		digest[PG_SHA256_DIGEST_LENGTH];
+	char	   *hex;
+	int			i;
+
+	ctx = pg_hmac_create(PG_SHA256);
+	if (ctx == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("could not allocate receipt verifier context")));
+
+	if (pg_hmac_init(ctx, (const uint8 *) receipt_key, strlen(receipt_key)) < 0 ||
+		pg_hmac_update(ctx, (const uint8 *) payload, strlen(payload)) < 0 ||
+		pg_hmac_final(ctx, digest, sizeof(digest)) < 0)
+	{
+		const char *reason = pg_hmac_error(ctx);
+
+		pg_hmac_free(ctx);
+		ereport(ERROR,
+				(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+				 errmsg("could not compute provider receipt signature"),
+				 errdetail("%s", reason)));
+	}
+
+	pg_hmac_free(ctx);
+	hex = palloc(QX_RECEIPT_SIG_HEX_LEN);
+	for (i = 0; i < PG_SHA256_DIGEST_LENGTH; i++)
+		snprintf(hex + (i * 2), 3, "%02x", digest[i]);
+	hex[QX_RECEIPT_SIG_HEX_LEN - 1] = '\0';
+	explicit_bzero(digest, sizeof(digest));
+
+	return hex;
+}
+
+#ifdef USE_OPENSSL
+static char *
+qx_openssl_error_string(void)
+{
+	unsigned long errcode;
+	char		buffer[256];
+
+	errcode = ERR_get_error();
+	if (errcode == 0)
+		return pstrdup("no OpenSSL error reported");
+
+	ERR_error_string_n(errcode, buffer, sizeof(buffer));
+	return pstrdup(buffer);
+}
+
+static int
+qx_hex_value(char c)
+{
+	if (c >= '0' && c <= '9')
+		return c - '0';
+	if (c >= 'a' && c <= 'f')
+		return c - 'a' + 10;
+	if (c >= 'A' && c <= 'F')
+		return c - 'A' + 10;
+	return -1;
+}
+
+static bool
+qx_hex_decode_signature(const char *hex, uint8 *dest, size_t expected_len)
+{
+	size_t		hexlen;
+	size_t		i;
+
+	if (hex == NULL)
+		return false;
+
+	hexlen = strlen(hex);
+	if (hexlen != expected_len * 2)
+		return false;
+
+	for (i = 0; i < expected_len; i++)
+	{
+		int			hi = qx_hex_value(hex[i * 2]);
+		int			lo = qx_hex_value(hex[(i * 2) + 1]);
+
+		if (hi < 0 || lo < 0)
+			return false;
+		dest[i] = (uint8) ((hi << 4) | lo);
+	}
+
+	return true;
+}
+
+static bool
+qx_verify_ed25519_receipt_signature(const char *public_key_pem,
+									  const char *payload,
+									  const char *signature_hex)
+{
+	BIO		   *bio = NULL;
+	EVP_PKEY   *pkey = NULL;
+	EVP_MD_CTX *mdctx = NULL;
+	uint8		signature[QX_ED25519_SIG_BYTES];
+	bool		verified = false;
+	int			rc;
+
+	if (public_key_pem == NULL || public_key_pem[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("provider has no public key configured for ed25519 receipt verification")));
+
+	if (!qx_hex_decode_signature(signature_hex, signature, sizeof(signature)))
+		return false;
+
+	bio = BIO_new_mem_buf(public_key_pem, -1);
+	if (bio == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+				 errmsg("could not allocate receipt public-key buffer")));
+
+	pkey = PEM_read_bio_PUBKEY(bio, NULL, NULL, NULL);
+	if (pkey == NULL)
+	{
+		char	   *detail = qx_openssl_error_string();
+
+		BIO_free(bio);
+		ereport(ERROR,
+				(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+				 errmsg("could not load ed25519 receipt public key"),
+				 errdetail("%s", detail)));
+	}
+
+	mdctx = EVP_MD_CTX_new();
+	if (mdctx == NULL)
+	{
+		BIO_free(bio);
+		EVP_PKEY_free(pkey);
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("could not allocate ed25519 verifier context")));
+	}
+
+	rc = EVP_DigestVerifyInit(mdctx, NULL, NULL, NULL, pkey);
+	if (rc != 1)
+	{
+		char	   *detail = qx_openssl_error_string();
+
+		EVP_MD_CTX_free(mdctx);
+		BIO_free(bio);
+		EVP_PKEY_free(pkey);
+		ereport(ERROR,
+				(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+				 errmsg("could not initialize ed25519 receipt verifier"),
+				 errdetail("%s", detail)));
+	}
+
+	rc = EVP_DigestVerify(mdctx,
+						  signature, sizeof(signature),
+						  (const unsigned char *) payload, strlen(payload));
+	verified = (rc == 1);
+
+	EVP_MD_CTX_free(mdctx);
+	BIO_free(bio);
+	EVP_PKEY_free(pkey);
+	explicit_bzero(signature, sizeof(signature));
+
+	return verified;
+}
+#endif
+
+static char *
+qx_receipt_payload(const char *phase,
+				   Oid taskoid,
+				   const char *tool_name,
+				   const char *principal_name,
+				   const char *principal_runtime,
+				   const char *provider_name,
+				   const char *provider_kind,
+				   const char *provider_endpoint,
+				   const char *sandbox_name,
+				   const char *profile_name,
+				   const char *environment_mode,
+				   const char *workdir_name,
+				   int32 timeout_ms,
+				   int32 process_limit,
+				   bool path_present,
+				   const char *receipt_schema,
+				   const char *receipt_alg,
+				   const char *receipt_nonce,
+				   const char *attestation_mode,
+				   int32 token_charge,
+				   int32 cost_charge,
+				   const char *detail)
+{
+	return psprintf("phase=%s;task=%u;tool=%s;principal=%s;principal_runtime=%s;provider=%s;provider_kind=%s;provider_endpoint=%s;sandbox=%s;profile=%s;env=%s;workdir=%s;timeout_ms=%d;process_limit=%d;path_present=%s;receipt_schema=%s;receipt_alg=%s;receipt_nonce=%s;attestation=%s;tokens=%d;cost=%d;detail=%s",
+					phase != NULL ? phase : "submit",
+					taskoid,
+					tool_name != NULL ? tool_name : "<unknown>",
+					principal_name != NULL ? principal_name : "<unknown>",
+					principal_runtime != NULL ? principal_runtime : "host",
+					provider_name != NULL ? provider_name : "<unknown>",
+					provider_kind != NULL ? provider_kind : "loopback",
+					provider_endpoint != NULL ? provider_endpoint : "local://qhapaqxian-tool-runner",
+					sandbox_name != NULL ? sandbox_name : "builtin",
+					profile_name != NULL ? profile_name : "builtin",
+					environment_mode != NULL ? environment_mode : "minimal",
+					workdir_name != NULL ? workdir_name : "pg_qx_runtime",
+					timeout_ms,
+					process_limit,
+					path_present ? "true" : "false",
+					receipt_schema != NULL ? receipt_schema : "qx.receipt.v1",
+					receipt_alg != NULL ? receipt_alg : "hmac-sha256",
+					receipt_nonce != NULL ? receipt_nonce : "<unknown>",
+					attestation_mode != NULL ? attestation_mode : "optional",
+					token_charge,
+					cost_charge,
+					detail != NULL ? detail : "<none>");
 }
 
 static int
@@ -348,6 +693,52 @@ qx_resolve_principal_program_path(const char *program_name,
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("principal program \"%s\" is not executable", candidate)));
+
+	strlcpy(resolved, candidate, resolved_len);
+}
+
+static void
+qx_resolve_receipt_signer_path(const char *signer_name,
+							   char *resolved,
+							   size_t resolved_len)
+{
+	char		bindir[MAXPGPATH];
+	char		candidate[MAXPGPATH];
+	struct stat st;
+
+	if (signer_name == NULL || signer_name[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("principal receipt signer is not configured")));
+
+	strlcpy(bindir, my_exec_path, sizeof(bindir));
+	get_parent_directory(bindir);
+	canonicalize_path(bindir);
+
+	if (is_absolute_path(signer_name))
+		strlcpy(candidate, signer_name, sizeof(candidate));
+	else
+		join_path_components(candidate, bindir, signer_name);
+
+	canonicalize_path(candidate);
+	if (!path_is_prefix_of_path(bindir, candidate))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("receipt signer \"%s\" resolves outside the server bindir",
+						signer_name),
+				 errdetail("Only signer files shipped with the QhapaqXian installation are allowed for asymmetric receipts.")));
+
+	if (stat(candidate, &st) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("receipt signer \"%s\" is not readable", candidate)));
+
+#ifndef WIN32
+	if (S_ISDIR(st.st_mode))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("receipt signer \"%s\" is not a file", candidate)));
+#endif
 
 	strlcpy(resolved, candidate, resolved_len);
 }
@@ -795,8 +1186,12 @@ qx_read_external_result(const char *path, QxExternalToolResult *result)
 			result->tool_name = pstrdup(value);
 		else if (strcmp(key, "PRINCIPAL") == 0)
 			result->principal_name = pstrdup(value);
+		else if (strcmp(key, "PRINCIPAL_RUNTIME") == 0)
+			result->principal_runtime = pstrdup(value);
 		else if (strcmp(key, "PROVIDER") == 0)
 			result->provider_name = pstrdup(value);
+		else if (strcmp(key, "PROVIDER_KIND") == 0)
+			result->provider_kind = pstrdup(value);
 		else if (strcmp(key, "SANDBOX") == 0)
 			result->sandbox_name = pstrdup(value);
 		else if (strcmp(key, "PROFILE") == 0)
@@ -807,8 +1202,12 @@ qx_read_external_result(const char *path, QxExternalToolResult *result)
 			result->workdir_name = pstrdup(value);
 		else if (strcmp(key, "RECEIPT_SCHEMA") == 0)
 			result->receipt_schema = pstrdup(value);
+		else if (strcmp(key, "RECEIPT_ALG") == 0)
+			result->receipt_alg = pstrdup(value);
 		else if (strcmp(key, "RECEIPT_NONCE") == 0)
 			result->receipt_nonce = pstrdup(value);
+		else if (strcmp(key, "RECEIPT_SIG") == 0)
+			result->receipt_signature = pstrdup(value);
 		else if (strcmp(key, "ATTESTATION") == 0)
 			result->attestation_mode = pstrdup(value);
 		else if (strcmp(key, "TIMEOUT_MS") == 0)
@@ -835,13 +1234,23 @@ qx_read_external_result(const char *path, QxExternalToolResult *result)
 static void
 qx_validate_external_result(const QxExternalToolResult *result,
 							const QxSandboxProfile *profile,
+							const char *phase,
+							Oid taskoid,
 							const char *expected_tool,
 							const char *expected_principal,
+							const char *expected_principal_runtime,
 							const char *expected_provider,
+							const char *expected_provider_kind,
+							const char *expected_provider_endpoint,
 							const char *expected_receipt_schema,
+							const char *expected_receipt_alg,
 							const char *expected_receipt_nonce,
+							const char *receipt_key,
 							bool require_attestation)
 {
+	char	   *expected_attestation;
+	char	   *receipt_payload;
+
 	if (expected_tool != NULL &&
 		(result->tool_name == NULL ||
 		 strcmp(result->tool_name, expected_tool) != 0))
@@ -862,6 +1271,16 @@ qx_validate_external_result(const QxExternalToolResult *result,
 						   expected_principal,
 						   result->principal_name != NULL ? result->principal_name : "<null>")));
 
+	if (expected_principal_runtime != NULL &&
+		(result->principal_runtime == NULL ||
+		 strcmp(result->principal_runtime, expected_principal_runtime) != 0))
+		ereport(ERROR,
+				(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+				 errmsg("principal response returned principal-runtime mismatch"),
+				 errdetail("Expected principal runtime \"%s\" but got \"%s\".",
+						   expected_principal_runtime,
+						   result->principal_runtime != NULL ? result->principal_runtime : "<null>")));
+
 	if (expected_provider != NULL &&
 		(result->provider_name == NULL ||
 		 strcmp(result->provider_name, expected_provider) != 0))
@@ -871,6 +1290,16 @@ qx_validate_external_result(const QxExternalToolResult *result,
 				 errdetail("Expected provider \"%s\" but got \"%s\".",
 						   expected_provider,
 						   result->provider_name != NULL ? result->provider_name : "<null>")));
+
+	if (expected_provider_kind != NULL &&
+		(result->provider_kind == NULL ||
+		 strcmp(result->provider_kind, expected_provider_kind) != 0))
+		ereport(ERROR,
+				(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+				 errmsg("principal response returned provider-kind mismatch"),
+				 errdetail("Expected provider kind \"%s\" but got \"%s\".",
+						   expected_provider_kind,
+						   result->provider_kind != NULL ? result->provider_kind : "<null>")));
 
 	if (result->profile_name == NULL ||
 		strcmp(result->profile_name, profile->name) != 0)
@@ -925,6 +1354,16 @@ qx_validate_external_result(const QxExternalToolResult *result,
 						   expected_receipt_schema,
 						   result->receipt_schema != NULL ? result->receipt_schema : "<null>")));
 
+	if (expected_receipt_alg != NULL &&
+		(result->receipt_alg == NULL ||
+		 strcmp(result->receipt_alg, expected_receipt_alg) != 0))
+		ereport(ERROR,
+				(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+				 errmsg("principal response returned receipt algorithm mismatch"),
+				 errdetail("Expected receipt algorithm \"%s\" but got \"%s\".",
+						   expected_receipt_alg,
+						   result->receipt_alg != NULL ? result->receipt_alg : "<null>")));
+
 	if (expected_receipt_nonce != NULL &&
 		(result->receipt_nonce == NULL ||
 		 strcmp(result->receipt_nonce, expected_receipt_nonce) != 0))
@@ -935,14 +1374,79 @@ qx_validate_external_result(const QxExternalToolResult *result,
 						   expected_receipt_nonce,
 						   result->receipt_nonce != NULL ? result->receipt_nonce : "<null>")));
 
-	if (require_attestation &&
-		(result->attestation_mode == NULL ||
-		 strcmp(result->attestation_mode, "loopback_verified") != 0))
+	expected_attestation = qx_expected_attestation_mode(expected_provider_kind,
+														 require_attestation);
+	if (result->attestation_mode == NULL ||
+		strcmp(result->attestation_mode, expected_attestation) != 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
 				 errmsg("principal response failed attestation requirements"),
-				 errdetail("Expected attestation mode \"loopback_verified\" but got \"%s\".",
+				 errdetail("Expected attestation mode \"%s\" but got \"%s\".",
+						   expected_attestation,
 						   result->attestation_mode != NULL ? result->attestation_mode : "<null>")));
+
+	if (result->receipt_signature == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+				 errmsg("principal response omitted a signed receipt"),
+				 errdetail("Providers must return RECEIPT_SIG so the runtime can verify execution evidence.")));
+
+	receipt_payload = qx_receipt_payload(phase,
+										 taskoid,
+										 expected_tool,
+										 expected_principal,
+										 expected_principal_runtime,
+										 expected_provider,
+										 expected_provider_kind,
+										 expected_provider_endpoint,
+										 result->sandbox_name,
+										 result->profile_name,
+										 result->environment_mode,
+										 result->workdir_name,
+										 result->timeout_ms,
+										 result->process_limit,
+										 result->path_present,
+										 result->receipt_schema,
+										 result->receipt_alg,
+										 result->receipt_nonce,
+										 result->attestation_mode,
+										 result->token_charge,
+										 result->cost_charge,
+										 result->detail);
+
+	if (expected_receipt_alg != NULL &&
+		strcmp(expected_receipt_alg, "ed25519") == 0)
+	{
+#ifdef USE_OPENSSL
+		if (!qx_verify_ed25519_receipt_signature(receipt_key,
+												 receipt_payload,
+												 result->receipt_signature))
+			ereport(ERROR,
+					(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+					 errmsg("principal response returned an invalid ed25519 receipt signature")));
+#else
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("ed25519 receipt verification requires OpenSSL support")));
+#endif
+	}
+	else
+	{
+		char	   *expected_signature;
+
+		expected_signature = qx_receipt_hmac_signature_hex(receipt_key,
+														   receipt_payload);
+		if (strcmp(result->receipt_signature, expected_signature) != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+					 errmsg("principal response returned an invalid receipt signature"),
+					 errdetail("Expected HMAC-SHA256 signature \"%s\" but got \"%s\".",
+							   expected_signature,
+							   result->receipt_signature)));
+		pfree(expected_signature);
+	}
+	pfree(expected_attestation);
+	pfree(receipt_payload);
 }
 
 static void
@@ -954,8 +1458,12 @@ qx_free_external_result(QxExternalToolResult *result)
 		pfree(result->tool_name);
 	if (result->principal_name != NULL)
 		pfree(result->principal_name);
+	if (result->principal_runtime != NULL)
+		pfree(result->principal_runtime);
 	if (result->provider_name != NULL)
 		pfree(result->provider_name);
+	if (result->provider_kind != NULL)
+		pfree(result->provider_kind);
 	if (result->sandbox_name != NULL)
 		pfree(result->sandbox_name);
 	if (result->profile_name != NULL)
@@ -966,8 +1474,12 @@ qx_free_external_result(QxExternalToolResult *result)
 		pfree(result->workdir_name);
 	if (result->receipt_schema != NULL)
 		pfree(result->receipt_schema);
+	if (result->receipt_alg != NULL)
+		pfree(result->receipt_alg);
 	if (result->receipt_nonce != NULL)
 		pfree(result->receipt_nonce);
+	if (result->receipt_signature != NULL)
+		pfree(result->receipt_signature);
 	if (result->attestation_mode != NULL)
 		pfree(result->attestation_mode);
 	memset(result, 0, sizeof(*result));
@@ -983,21 +1495,30 @@ qx_execute_tool_contract(const char *contract, const char *phase, Oid taskoid,
 	char	   *tool_sandbox;
 	char	   *principal_name;
 	char	   *principal_sandbox;
+	char	   *principal_runtime;
 	char	   *program_name;
+	char	   *receipt_signer;
 	char	   *provider_name;
+	char	   *provider_oid_str;
 	char	   *provider_kind;
 	char	   *provider_endpoint;
 	char	   *provider_attestation;
 	char	   *receipt_schema;
+	char	   *receipt_alg;
 	char	   *receipt_nonce;
+	char	   *receipt_key;
+	char	   *expected_attestation;
 	const char *effective_sandbox;
 	const QxSandboxProfile *profile;
 	QxSandboxObservation observation;
 	char		runtime_dir[MAXPGPATH];
 	char		program_path[MAXPGPATH];
+	char		signer_path[MAXPGPATH];
 	char		request_path[MAXPGPATH];
 	char		response_path[MAXPGPATH];
 	char	   *request_payload;
+	Oid			provideroid = InvalidOid;
+	const char *resolved_signer = "";
 
 	if (contract == NULL)
 		ereport(ERROR,
@@ -1010,16 +1531,53 @@ qx_execute_tool_contract(const char *contract, const char *phase, Oid taskoid,
 	tool_sandbox = qx_contract_value(contract, "tool_sandbox");
 	principal_name = qx_contract_value(contract, "principal");
 	principal_sandbox = qx_contract_value(contract, "principal_sandbox");
+	principal_runtime = qx_contract_value(contract, "principal_runtime");
 	program_name = qx_contract_value(contract, "program");
+	receipt_signer = qx_contract_value(contract, "receipt_signer");
 	provider_name = qx_contract_value(contract, "provider");
+	provider_oid_str = qx_contract_value(contract, "provider_oid");
 	provider_kind = qx_contract_value(contract, "provider_kind");
 	provider_endpoint = qx_contract_value(contract, "provider_endpoint");
 	provider_attestation = qx_contract_value(contract, "provider_attestation");
 	receipt_schema = qx_contract_value(contract, "receipt_schema");
+	receipt_alg = qx_contract_value(contract, "receipt_alg");
 	receipt_nonce = psprintf("%s:%s:%s",
 							 phase != NULL ? phase : "submit",
 							 tool_name != NULL ? tool_name : "tool",
 							 principal_name != NULL ? principal_name : "principal");
+	if (principal_runtime == NULL || principal_runtime[0] == '\0')
+	{
+		if (principal_runtime != NULL)
+			pfree(principal_runtime);
+		principal_runtime =
+			pstrdup(qx_default_runtime_for_provider_kind(provider_kind));
+	}
+	expected_attestation = qx_expected_attestation_mode(provider_kind,
+														 provider_attestation != NULL &&
+														 strcmp(provider_attestation, "required") == 0);
+
+	if (provider_oid_str == NULL || provider_oid_str[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("tool contract is missing provider_oid for receipt verification")));
+	provideroid = (Oid) strtoul(provider_oid_str, NULL, 10);
+	if (!OidIsValid(provideroid))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("tool contract carried an invalid provider_oid \"%s\"",
+						provider_oid_str)));
+	receipt_key = qx_provider_receipt_key(provideroid);
+	if (receipt_alg != NULL && strcmp(receipt_alg, "ed25519") == 0)
+	{
+		if (receipt_signer == NULL || receipt_signer[0] == '\0')
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("tool contract is missing receipt_signer for ed25519 verification")));
+		qx_resolve_receipt_signer_path(receipt_signer,
+									   signer_path,
+									   sizeof(signer_path));
+		resolved_signer = signer_path;
+	}
 
 	if (qx_sandbox_rank(tool_sandbox) > qx_sandbox_rank(principal_sandbox))
 		ereport(ERROR,
@@ -1037,7 +1595,7 @@ qx_execute_tool_contract(const char *contract, const char *phase, Oid taskoid,
 	qx_runtime_temp_path(response_path, sizeof(response_path), "resp");
 
 	request_payload = psprintf(
-		"PHASE=%s\nTASK_OID=%u\nGOAL_LENGTH=%zu\nINPUT_PRESENT=%s\nTOOL=%s\nHANDLER=%s\nSANDBOX=%s\nPRINCIPAL=%s\nPROVIDER=%s\nPROVIDER_KIND=%s\nPROVIDER_ENDPOINT=%s\nREQUIRE_ATTESTATION=%s\nRECEIPT_SCHEMA=%s\nRECEIPT_NONCE=%s\n",
+		"PHASE=%s\nTASK_OID=%u\nGOAL_LENGTH=%zu\nINPUT_PRESENT=%s\nTOOL=%s\nHANDLER=%s\nSANDBOX=%s\nPRINCIPAL=%s\nPRINCIPAL_RUNTIME=%s\nPROVIDER=%s\nPROVIDER_KIND=%s\nPROVIDER_ENDPOINT=%s\nREQUIRE_ATTESTATION=%s\nRECEIPT_SCHEMA=%s\nRECEIPT_ALG=%s\nRECEIPT_NONCE=%s\nRECEIPT_KEY=%s\nRECEIPT_SIGNER=%s\n",
 		phase,
 		taskoid,
 		goal != NULL ? strlen(goal) : 0,
@@ -1046,12 +1604,16 @@ qx_execute_tool_contract(const char *contract, const char *phase, Oid taskoid,
 		handler_name != NULL ? handler_name : "",
 		tool_sandbox != NULL ? tool_sandbox : "builtin",
 		principal_name != NULL ? principal_name : "",
+		principal_runtime != NULL ? principal_runtime : "host",
 		provider_name != NULL ? provider_name : "",
 		provider_kind != NULL ? provider_kind : "loopback",
 		provider_endpoint != NULL ? provider_endpoint : "local://qhapaqxian-tool-runner",
 		(provider_attestation != NULL && strcmp(provider_attestation, "required") == 0) ? "true" : "false",
 		receipt_schema != NULL ? receipt_schema : "qx.receipt.v1",
-		receipt_nonce);
+		receipt_alg != NULL ? receipt_alg : "hmac-sha256",
+		receipt_nonce,
+		(receipt_alg != NULL && strcmp(receipt_alg, "ed25519") == 0) ? "" : receipt_key,
+		resolved_signer);
 	qx_write_text_file(request_path, request_payload);
 	pfree(request_payload);
 
@@ -1061,11 +1623,18 @@ qx_execute_tool_contract(const char *contract, const char *phase, Oid taskoid,
 								&observation);
 	qx_read_external_result(response_path, result);
 	qx_validate_external_result(result, profile,
+								phase,
+								taskoid,
 								tool_name,
 								principal_name,
+								principal_runtime != NULL ? principal_runtime : "host",
 								provider_name,
+								provider_kind != NULL ? provider_kind : "loopback",
+								provider_endpoint != NULL ? provider_endpoint : "local://qhapaqxian-tool-runner",
 								receipt_schema != NULL ? receipt_schema : "qx.receipt.v1",
+								receipt_alg != NULL ? receipt_alg : "hmac-sha256",
 								receipt_nonce,
+								receipt_key,
 								provider_attestation != NULL &&
 								strcmp(provider_attestation, "required") == 0);
 
@@ -1080,8 +1649,12 @@ qx_execute_tool_contract(const char *contract, const char *phase, Oid taskoid,
 		result->tool_name = pstrdup(tool_name);
 	if (result->principal_name == NULL && principal_name != NULL)
 		result->principal_name = pstrdup(principal_name);
+	if (result->principal_runtime == NULL)
+		result->principal_runtime = pstrdup(principal_runtime != NULL ? principal_runtime : "host");
 	if (result->provider_name == NULL && provider_name != NULL)
 		result->provider_name = pstrdup(provider_name);
+	if (result->provider_kind == NULL)
+		result->provider_kind = pstrdup(provider_kind != NULL ? provider_kind : "loopback");
 	if (result->sandbox_name == NULL)
 		result->sandbox_name = pstrdup(effective_sandbox);
 	if (result->profile_name == NULL)
@@ -1092,12 +1665,16 @@ qx_execute_tool_contract(const char *contract, const char *phase, Oid taskoid,
 		result->workdir_name = pstrdup("pg_qx_runtime");
 	if (result->receipt_schema == NULL)
 		result->receipt_schema = pstrdup(receipt_schema != NULL ? receipt_schema : "qx.receipt.v1");
+	if (result->receipt_alg == NULL)
+		result->receipt_alg = pstrdup(receipt_alg != NULL ? receipt_alg : "hmac-sha256");
 	if (result->receipt_nonce == NULL)
 		result->receipt_nonce = pstrdup(receipt_nonce);
 	if (result->attestation_mode == NULL)
-		result->attestation_mode = pstrdup((provider_attestation != NULL &&
-											strcmp(provider_attestation, "required") == 0) ?
-										   "loopback_verified" : "optional");
+		result->attestation_mode = expected_attestation;
+	else
+		pfree(expected_attestation);
+	if (result->receipt_signature == NULL)
+		result->receipt_signature = pstrdup("verified");
 	if (result->timeout_ms == 0)
 		result->timeout_ms = profile->timeout_ms;
 	if (result->process_limit == 0)
@@ -1115,6 +1692,9 @@ qx_execute_tool_contract(const char *contract, const char *phase, Oid taskoid,
 		result->detail = augmented_detail;
 	}
 
+	if (receipt_signer != NULL)
+		pfree(receipt_signer);
+
 	if (tool_name != NULL)
 		pfree(tool_name);
 	if (handler_name != NULL)
@@ -1125,10 +1705,14 @@ qx_execute_tool_contract(const char *contract, const char *phase, Oid taskoid,
 		pfree(principal_name);
 	if (principal_sandbox != NULL)
 		pfree(principal_sandbox);
+	if (principal_runtime != NULL)
+		pfree(principal_runtime);
 	if (program_name != NULL)
 		pfree(program_name);
 	if (provider_name != NULL)
 		pfree(provider_name);
+	if (provider_oid_str != NULL)
+		pfree(provider_oid_str);
 	if (provider_kind != NULL)
 		pfree(provider_kind);
 	if (provider_endpoint != NULL)
@@ -1137,8 +1721,12 @@ qx_execute_tool_contract(const char *contract, const char *phase, Oid taskoid,
 		pfree(provider_attestation);
 	if (receipt_schema != NULL)
 		pfree(receipt_schema);
+	if (receipt_alg != NULL)
+		pfree(receipt_alg);
 	if (receipt_nonce != NULL)
 		pfree(receipt_nonce);
+	if (receipt_key != NULL)
+		pfree(receipt_key);
 }
 
 static List *
@@ -1714,10 +2302,12 @@ QxRuntimeSubmitTask(const QxRuntimeTaskRequest *request)
 						  tool_result.token_charge,
 						  tool_result.cost_charge,
 						  "external_submit");
-	payload = psprintf("phase=submit;tool=%s;principal=%s;provider=%s;effective_sandbox=%s;profile=%s;env=%s;cwd=%s;process_limit=%d;timeout_ms=%d;receipt_schema=%s;receipt_nonce=%s;attestation=%s;tokens=%d;cost=%d;detail=%s",
+	payload = psprintf("phase=submit;tool=%s;principal=%s;principal_runtime=%s;provider=%s;provider_kind=%s;effective_sandbox=%s;profile=%s;env=%s;cwd=%s;process_limit=%d;timeout_ms=%d;receipt_schema=%s;receipt_alg=%s;receipt_nonce=%s;receipt_sig=%s;attestation=%s;tokens=%d;cost=%d;detail=%s",
 					   tool_result.tool_name != NULL ? tool_result.tool_name : "<unknown>",
 					   tool_result.principal_name != NULL ? tool_result.principal_name : "<unknown>",
+					   tool_result.principal_runtime != NULL ? tool_result.principal_runtime : "<unknown>",
 					   tool_result.provider_name != NULL ? tool_result.provider_name : "<unknown>",
+					   tool_result.provider_kind != NULL ? tool_result.provider_kind : "<unknown>",
 					   tool_result.sandbox_name != NULL ? tool_result.sandbox_name : "<unknown>",
 					   tool_result.profile_name != NULL ? tool_result.profile_name : "<unknown>",
 					   tool_result.environment_mode != NULL ? tool_result.environment_mode : "<unknown>",
@@ -1725,7 +2315,9 @@ QxRuntimeSubmitTask(const QxRuntimeTaskRequest *request)
 					   tool_result.process_limit,
 					   tool_result.timeout_ms,
 					   tool_result.receipt_schema != NULL ? tool_result.receipt_schema : "<unknown>",
+					   tool_result.receipt_alg != NULL ? tool_result.receipt_alg : "<unknown>",
 					   tool_result.receipt_nonce != NULL ? tool_result.receipt_nonce : "<unknown>",
+					   tool_result.receipt_signature != NULL ? "verified" : "missing",
 					   tool_result.attestation_mode != NULL ? tool_result.attestation_mode : "<unknown>",
 					   tool_result.token_charge,
 					   tool_result.cost_charge,
@@ -1958,10 +2550,12 @@ QxRuntimeResumeTask(Oid taskoid, const char *checkpoint_label, Oid ownerid)
 						  tool_result.token_charge,
 						  tool_result.cost_charge,
 						  "external_resume");
-	payload = psprintf("phase=resume;tool=%s;principal=%s;provider=%s;effective_sandbox=%s;profile=%s;env=%s;cwd=%s;process_limit=%d;timeout_ms=%d;receipt_schema=%s;receipt_nonce=%s;attestation=%s;tokens=%d;cost=%d;detail=%s",
+	payload = psprintf("phase=resume;tool=%s;principal=%s;principal_runtime=%s;provider=%s;provider_kind=%s;effective_sandbox=%s;profile=%s;env=%s;cwd=%s;process_limit=%d;timeout_ms=%d;receipt_schema=%s;receipt_alg=%s;receipt_nonce=%s;receipt_sig=%s;attestation=%s;tokens=%d;cost=%d;detail=%s",
 					   tool_result.tool_name != NULL ? tool_result.tool_name : "<unknown>",
 					   tool_result.principal_name != NULL ? tool_result.principal_name : "<unknown>",
+					   tool_result.principal_runtime != NULL ? tool_result.principal_runtime : "<unknown>",
 					   tool_result.provider_name != NULL ? tool_result.provider_name : "<unknown>",
+					   tool_result.provider_kind != NULL ? tool_result.provider_kind : "<unknown>",
 					   tool_result.sandbox_name != NULL ? tool_result.sandbox_name : "<unknown>",
 					   tool_result.profile_name != NULL ? tool_result.profile_name : "<unknown>",
 					   tool_result.environment_mode != NULL ? tool_result.environment_mode : "<unknown>",
@@ -1969,7 +2563,9 @@ QxRuntimeResumeTask(Oid taskoid, const char *checkpoint_label, Oid ownerid)
 					   tool_result.process_limit,
 					   tool_result.timeout_ms,
 					   tool_result.receipt_schema != NULL ? tool_result.receipt_schema : "<unknown>",
+					   tool_result.receipt_alg != NULL ? tool_result.receipt_alg : "<unknown>",
 					   tool_result.receipt_nonce != NULL ? tool_result.receipt_nonce : "<unknown>",
+					   tool_result.receipt_signature != NULL ? "verified" : "missing",
 					   tool_result.attestation_mode != NULL ? tool_result.attestation_mode : "<unknown>",
 					   tool_result.token_charge,
 					   tool_result.cost_charge,

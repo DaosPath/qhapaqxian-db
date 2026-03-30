@@ -8,21 +8,53 @@ SELECT 'init' FROM pg_create_logical_replication_slot('qx_semantic_slot', 'qhapa
 CREATE PROVIDER public.loopback_provider
   KIND 'loopback'
   ENDPOINT 'local://qhapaqxian-tool-runner'
+  RECEIPT KEY 'loopback-stage20-key'
+  ATTESTATION ENABLE;
+CREATE PROVIDER public.container_provider
+  KIND 'container'
+  ENDPOINT 'container://broker/pool'
+  USING 'ed25519'
+  RECEIPT KEY $$-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEATQR0xvmOgsHyUp6bWkQ7xlKHg40piOubNdB+Ew80TOs=
+-----END PUBLIC KEY-----$$
+  ATTESTATION ENABLE;
+CREATE PROVIDER public.microvm_provider
+  KIND 'microvm'
+  ENDPOINT 'microvm://broker/primary'
+  USING 'ed25519'
+  RECEIPT KEY $$-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEATQR0xvmOgsHyUp6bWkQ7xlKHg40piOubNdB+Ew80TOs=
+-----END PUBLIC KEY-----$$
   ATTESTATION ENABLE;
 CREATE PRINCIPAL public.search_runner
   PROGRAM 'qhapaqxian-tool-runner'
   SANDBOX 'restricted'
+  RUNTIME 'host'
   PROVIDER public.loopback_provider;
+CREATE PRINCIPAL public.extract_runner
+  PROGRAM 'qhapaqxian-tool-runner'
+  SANDBOX 'isolated'
+  RUNTIME 'container'
+  PROVIDER public.container_provider
+  SIGNER 'qx_remote_ed25519_private.pem';
 CREATE PRINCIPAL public.summarize_runner
   PROGRAM 'qhapaqxian-tool-runner'
   SANDBOX 'isolated'
-  PROVIDER public.loopback_provider;
+  RUNTIME 'microvm'
+  PROVIDER public.microvm_provider
+  SIGNER 'qx_remote_ed25519_private.pem';
 CREATE TOOL public.search
   HANDLER 'builtin.search'
   SANDBOX 'restricted'
   PRINCIPAL 'search_runner'
   TOKEN COST 11
   COST 7;
+CREATE TOOL public.extract
+  HANDLER 'builtin.extract'
+  SANDBOX 'isolated'
+  PRINCIPAL 'extract_runner'
+  TOKEN COST 15
+  COST 10;
 CREATE TOOL public.summarize
   HANDLER 'builtin.summarize'
   SANDBOX 'isolated'
@@ -30,7 +62,7 @@ CREATE TOOL public.summarize
   TOKEN COST 13
   COST 9;
 CREATE NAMESPACE POLICY guarded FOR SCHEMA public
-  TOOLS (search, summarize)
+  TOOLS (extract, search, summarize)
   KNOWN TOOLS ENABLE
   BUDGET ENABLE;
 CREATE AGENT archivist

@@ -28,3 +28,10 @@ Planned test ownership:
 Bootstrap rule:
 - no deep fork patch should land without a matching automated test plan in one
   of the upstream PostgreSQL harnesses above.
+- asymmetric remote-receipt coverage requires OpenSSL-enabled builds; Stage 21
+  suites should run with `--with-openssl` or equivalent Meson `-Dssl=openssl`
+  so `ed25519` provider verification is exercised rather than compiled out.
+- brokered `container://` and `microvm://` provider coverage should stay in the
+  same regression harnesses; Stage 22 does not claim kernel-level isolation, so
+  tests must assert provider/runtime compatibility, receipt payload integrity,
+  and trace-visible runtime class rather than fake container launches.

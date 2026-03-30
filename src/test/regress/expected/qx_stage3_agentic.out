@@ -1,24 +1,58 @@
--- QhapaqXian DB Stage 19 provider receipt slice
+-- QhapaqXian DB Stage 22 brokered container/microvm principal slice
 CREATE PROVIDER public.loopback_provider
   KIND 'loopback'
   ENDPOINT 'local://qhapaqxian-tool-runner'
+  RECEIPT KEY 'loopback-stage20-key'
+  ATTESTATION ENABLE;
+CREATE PROVIDER public.container_provider
+  KIND 'container'
+  ENDPOINT 'container://broker/pool'
+  USING 'ed25519'
+  RECEIPT KEY $$-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEATQR0xvmOgsHyUp6bWkQ7xlKHg40piOubNdB+Ew80TOs=
+-----END PUBLIC KEY-----$$
+  ATTESTATION ENABLE;
+CREATE PROVIDER public.microvm_provider
+  KIND 'microvm'
+  ENDPOINT 'microvm://broker/primary'
+  USING 'ed25519'
+  RECEIPT KEY $$-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEATQR0xvmOgsHyUp6bWkQ7xlKHg40piOubNdB+Ew80TOs=
+-----END PUBLIC KEY-----$$
   ATTESTATION ENABLE;
 ALTER PROVIDER public.loopback_provider
   ENDPOINT 'local://qhapaqxian-tool-runner'
+  RECEIPT KEY 'loopback-stage20-key'
   ATTESTATION ENABLE
   ENABLE;
 CREATE PRINCIPAL public.search_runner
   PROGRAM 'qhapaqxian-tool-runner'
   SANDBOX 'restricted'
+  RUNTIME 'host'
   PROVIDER public.loopback_provider;
+CREATE PRINCIPAL public.extract_runner
+  PROGRAM 'qhapaqxian-tool-runner'
+  SANDBOX 'isolated'
+  RUNTIME 'container'
+  PROVIDER public.container_provider
+  SIGNER 'qx_remote_ed25519_private.pem';
 CREATE PRINCIPAL public.summarize_runner
   PROGRAM 'qhapaqxian-tool-runner'
   SANDBOX 'isolated'
-  PROVIDER public.loopback_provider;
+  RUNTIME 'microvm'
+  PROVIDER public.microvm_provider
+  SIGNER 'qx_remote_ed25519_private.pem';
 ALTER PRINCIPAL public.search_runner
   PROVIDER public.loopback_provider
   PROGRAM 'qhapaqxian-tool-runner'
-  SANDBOX 'restricted';
+  SANDBOX 'restricted'
+  RUNTIME 'host';
+CREATE TOOL public.extract
+  HANDLER 'builtin.extract'
+  SANDBOX 'isolated'
+  PRINCIPAL 'extract_runner'
+  TOKEN COST 15
+  COST 10;
 CREATE TOOL public.search
   HANDLER 'builtin.search'
   SANDBOX 'restricted'
@@ -36,7 +70,7 @@ CREATE NAMESPACE POLICY guarded FOR SCHEMA public
   KNOWN TOOLS ENABLE
   BUDGET ENABLE;
 ALTER NAMESPACE POLICY guarded FOR SCHEMA public
-  SET TOOLS (search, summarize)
+  SET TOOLS (extract, search, summarize)
   KNOWN TOOLS ENABLE
   BUDGET ENABLE;
 CREATE NAMESPACE POLICY strict FOR SCHEMA public
@@ -109,28 +143,35 @@ SELECT qxprovidername::text AS provider_name,
        qxproviderenabled AS enabled,
        qxproviderattestationrequired AS attestation_required,
        qxproviderkind::text AS provider_kind,
-       qxproviderendpoint::text AS provider_endpoint
+       qxproviderendpoint::text AS provider_endpoint,
+       qxproviderreceiptalg::text AS receipt_alg,
+       qxproviderreceiptkey IS NOT NULL AS has_receipt_key
 FROM pg_qx_provider
 ORDER BY qxprovidername;
-   provider_name   | in_public_schema | enabled | attestation_required | provider_kind |       provider_endpoint        
--------------------+------------------+---------+----------------------+---------------+--------------------------------
- loopback_provider | t                | t       | t                    | loopback      | local://qhapaqxian-tool-runner
-(1 row)
+   provider_name    | in_public_schema | enabled | attestation_required | provider_kind |       provider_endpoint        | receipt_alg | has_receipt_key 
+--------------------+------------------+---------+----------------------+---------------+--------------------------------+-------------+-----------------
+ container_provider | t                | t       | t                    | container     | container://broker/pool        | ed25519     | t
+ loopback_provider  | t                | t       | t                    | loopback      | local://qhapaqxian-tool-runner | hmac-sha256 | t
+ microvm_provider   | t                | t       | t                    | microvm       | microvm://broker/primary       | ed25519     | t
+(3 rows)
 
 SELECT qxprincipalname::text AS principal_name,
        qxprincipalnamespace = 'public'::regnamespace AS in_public_schema,
        qxprincipalenabled AS enabled,
        qxprincipalsandbox::text AS sandbox_name,
+       qxprincipalruntimeclass::text AS runtime_class,
        qxprincipalprogram::text AS program_name,
+       qxprincipalreceiptsigner IS NOT NULL AS has_receipt_signer,
        qxprincipalproviderid <> 0 AS has_provider_oid,
        qxprincipalprovider::text AS provider_name
 FROM pg_qx_principal
 ORDER BY qxprincipalname;
-  principal_name  | in_public_schema | enabled | sandbox_name |      program_name      | has_provider_oid |   provider_name   
-------------------+------------------+---------+--------------+------------------------+------------------+-------------------
- search_runner    | t                | t       | restricted   | qhapaqxian-tool-runner | t                | loopback_provider
- summarize_runner | t                | t       | isolated     | qhapaqxian-tool-runner | t                | loopback_provider
-(2 rows)
+  principal_name  | in_public_schema | enabled | sandbox_name | runtime_class |      program_name      | has_receipt_signer | has_provider_oid |   provider_name    
+------------------+------------------+---------+--------------+---------------+------------------------+--------------------+------------------+--------------------
+ extract_runner   | t                | t       | isolated     | container     | qhapaqxian-tool-runner | t                  | t                | container_provider
+ search_runner    | t                | t       | restricted   | host          | qhapaqxian-tool-runner | f                  | t                | loopback_provider
+ summarize_runner | t                | t       | isolated     | microvm       | qhapaqxian-tool-runner | t                  | t                | microvm_provider
+(3 rows)
 
 SELECT qxtoolname::text AS tool_name,
        qxtoolenabled AS enabled,
@@ -144,9 +185,10 @@ FROM pg_qx_tool
 ORDER BY qxtoolname;
  tool_name | enabled | token_cost | cost_units | sandbox_name | has_principal_oid |  principal_name  | policy_is_null 
 -----------+---------+------------+------------+--------------+-------------------+------------------+----------------
+ extract   | t       |         15 |         10 | isolated     | t                 | extract_runner   | t
  search    | t       |         11 |          7 | restricted   | t                 | search_runner    | t
  summarize | t       |         13 |          9 | isolated     | t                 | summarize_runner | f
-(2 rows)
+(3 rows)
 
 CREATE AGENT archivist
   IDENTITY imperial;
@@ -200,8 +242,8 @@ EXPLAIN AGENT RUN TASK summarize_docs IN SESSION :qx_session_oid
   GOAL 'summarize docs'
   INPUT jsonb_build_object('topic', 'parser')
   PRIORITY high;
-                                                                                                                                                                                                                                                                                                                     AGENT PLAN                                                                                                                                                                                                                                                                                                                      
------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                                                                                                                                                                                                                                                                AGENT PLAN                                                                                                                                                                                                                                                                                                                                                                
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  AgentPlan v1
    Command: RUN TASK
    Goal: summarize docs
@@ -221,7 +263,7 @@ EXPLAIN AGENT RUN TASK summarize_docs IN SESSION :qx_session_oid
    Estimated Cost: 79
    Estimated Tool Calls: 2
    Authorized Tool Budget: tokens=24 cost=16
-   Authorized Tools: tool=search;handler=builtin.search;tool_sandbox=restricted;principal=search_runner;principal_sandbox=restricted;program=qhapaqxian-tool-runner;provider=loopback_provider;provider_kind=loopback;provider_endpoint=local://qhapaqxian-tool-runner;provider_attestation=required;receipt_schema=qx.receipt.v1, tool=summarize;handler=builtin.summarize;tool_sandbox=isolated;principal=summarize_runner;principal_sandbox=isolated;program=qhapaqxian-tool-runner;provider=loopback_provider;provider_kind=loopback;provider_endpoint=local://qhapaqxian-tool-runner;provider_attestation=required;receipt_schema=qx.receipt.v1
+   Authorized Tools: tool=search;handler=builtin.search;tool_sandbox=restricted;principal=search_runner;principal_sandbox=restricted;principal_runtime=host;program=qhapaqxian-tool-runner;provider=loopback_provider;provider_kind=loopback;provider_endpoint=local://qhapaqxian-tool-runner;provider_attestation=required;receipt_schema=qx.receipt.v1;receipt_alg=hmac-sha256, tool=summarize;handler=builtin.summarize;tool_sandbox=isolated;principal=summarize_runner;principal_sandbox=isolated;principal_runtime=microvm;program=qhapaqxian-tool-runner;provider=microvm_provider;provider_kind=microvm;provider_endpoint=microvm://broker/primary;provider_attestation=required;receipt_schema=qx.receipt.v1;receipt_alg=ed25519
    Steps:
      1. validate_session [cost=8, checkpoint=false, retry=false]
         check session existence, ownership, database, and active state
@@ -352,8 +394,8 @@ ORDER BY oid;
 (1 row)
 
 EXPLAIN AGENT RESUME TASK :qx_task_oid FROM CHECKPOINT 'stage8.after_capture';
-                                                                                                                                                                                                                                                                                                                     AGENT PLAN                                                                                                                                                                                                                                                                                                                      
------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                                                                                                                                                                                                                                                                AGENT PLAN                                                                                                                                                                                                                                                                                                                                                                
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  AgentPlan v1
    Command: RESUME TASK
    Identity: imperial
@@ -370,7 +412,7 @@ EXPLAIN AGENT RESUME TASK :qx_task_oid FROM CHECKPOINT 'stage8.after_capture';
    Estimated Cost: 133
    Estimated Tool Calls: 2
    Authorized Tool Budget: tokens=24 cost=16
-   Authorized Tools: tool=search;handler=builtin.search;tool_sandbox=restricted;principal=search_runner;principal_sandbox=restricted;program=qhapaqxian-tool-runner;provider=loopback_provider;provider_kind=loopback;provider_endpoint=local://qhapaqxian-tool-runner;provider_attestation=required;receipt_schema=qx.receipt.v1, tool=summarize;handler=builtin.summarize;tool_sandbox=isolated;principal=summarize_runner;principal_sandbox=isolated;program=qhapaqxian-tool-runner;provider=loopback_provider;provider_kind=loopback;provider_endpoint=local://qhapaqxian-tool-runner;provider_attestation=required;receipt_schema=qx.receipt.v1
+   Authorized Tools: tool=search;handler=builtin.search;tool_sandbox=restricted;principal=search_runner;principal_sandbox=restricted;principal_runtime=host;program=qhapaqxian-tool-runner;provider=loopback_provider;provider_kind=loopback;provider_endpoint=local://qhapaqxian-tool-runner;provider_attestation=required;receipt_schema=qx.receipt.v1;receipt_alg=hmac-sha256, tool=summarize;handler=builtin.summarize;tool_sandbox=isolated;principal=summarize_runner;principal_sandbox=isolated;principal_runtime=microvm;program=qhapaqxian-tool-runner;provider=microvm_provider;provider_kind=microvm;provider_endpoint=microvm://broker/primary;provider_attestation=required;receipt_schema=qx.receipt.v1;receipt_alg=ed25519
    Steps:
      1. validate_task [cost=7, checkpoint=false, retry=false]
         check task visibility, ownership, and checkpointed state
@@ -533,20 +575,20 @@ FETCH MEMORY FOR AGENT archivist
 (1 row)
 
 SHOW TRACE FOR TASK :qx_task_oid LIMIT 20;
- trace_state |        trace_name        |                                                                                                                                                                                                                              trace_detail                                                                                                                                                                                                                              | has_step | has_semantic_lsn 
--------------+--------------------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------+------------------
- closed      | runtime.queue            | goal=summarize docs;priority=high                                                                                                                                                                                                                                                                                                                                                                                                                                      | f        | t
- closed      | runtime.dispatch         | attempt_opened;state=r;identity=imperial;namespace_policy=guarded;tools=2;budget_cost=128;budget_tokens=4096                                                                                                                                                                                                                                                                                                                                                           | t        | t
- closed      | runtime.authorize_tools  | namespace_policy=guarded;authorized_tools=2;tool_tokens=24;tool_cost=16                                                                                                                                                                                                                                                                                                                                                                                                | t        | t
- closed      | runtime.external_submit  | phase=submit;tool=search;principal=search_runner;provider=loopback_provider;effective_sandbox=restricted;profile=restricted;env=minimal;cwd=pg_qx_runtime;process_limit=1;timeout_ms=2000;receipt_schema=qx.receipt.v1;receipt_nonce=submit:search:search_runner;attestation=loopback_verified;tokens=70;cost=16;detail=tool search via search_runner for submit phase on task <task>;launch_mode=profiled_process;restricted_identity=true;wall_ms=<ms>               | t        | t
- closed      | runtime.capture_input    | input_present=true;task_name=summarize_docs                                                                                                                                                                                                                                                                                                                                                                                                                            | t        | t
- closed      | runtime.checkpoint       | checkpoint=stage8.after_capture;task_state=k                                                                                                                                                                                                                                                                                                                                                                                                                           | t        | t
- closed      | runtime.pause            | Task paused at durable checkpoint and awaits RESUME TASK                                                                                                                                                                                                                                                                                                                                                                                                               | f        | t
- closed      | runtime.resume           | checkpoint=stage8.after_capture;resume_requested;next_step=6                                                                                                                                                                                                                                                                                                                                                                                                           | f        | t
- closed      | runtime.resume_dispatch  | resume_from=stage8.after_capture;state=r                                                                                                                                                                                                                                                                                                                                                                                                                               | t        | t
- closed      | runtime.external_resume  | phase=resume;tool=summarize;principal=summarize_runner;provider=loopback_provider;effective_sandbox=isolated;profile=isolated;env=minimal;cwd=pg_qx_runtime;process_limit=1;timeout_ms=1200;receipt_schema=qx.receipt.v1;receipt_nonce=resume:summarize:summarize_runner;attestation=loopback_verified;tokens=91;cost=22;detail=tool summarize via summarize_runner for resume phase on task <task>;launch_mode=profiled_process;restricted_identity=true;wall_ms=<ms> | t        | t
- closed      | runtime.final_checkpoint | checkpoint=stage8.final;task_state=c                                                                                                                                                                                                                                                                                                                                                                                                                                   | t        | t
- closed      | runtime.complete         | Task completed after resumable attempt handoff                                                                                                                                                                                                                                                                                                                                                                                                                         | f        | t
+ trace_state |        trace_name        |                                                                                                                                                                                                                                                                             trace_detail                                                                                                                                                                                                                                                                              | has_step | has_semantic_lsn 
+-------------+--------------------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------+------------------
+ closed      | runtime.queue            | goal=summarize docs;priority=high                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | f        | t
+ closed      | runtime.dispatch         | attempt_opened;state=r;identity=imperial;namespace_policy=guarded;tools=2;budget_cost=128;budget_tokens=4096                                                                                                                                                                                                                                                                                                                                                                                                                                                          | t        | t
+ closed      | runtime.authorize_tools  | namespace_policy=guarded;authorized_tools=2;tool_tokens=24;tool_cost=16                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | t        | t
+ closed      | runtime.external_submit  | phase=submit;tool=search;principal=search_runner;principal_runtime=host;provider=loopback_provider;provider_kind=loopback;effective_sandbox=restricted;profile=restricted;env=minimal;cwd=pg_qx_runtime;process_limit=1;timeout_ms=2000;receipt_schema=qx.receipt.v1;receipt_alg=hmac-sha256;receipt_nonce=submit:search:search_runner;receipt_sig=verified;attestation=loopback_verified;tokens=70;cost=16;detail=tool search via search_runner for submit phase on task <task>;launch_mode=profiled_process;restricted_identity=true;wall_ms=<ms>                   | t        | t
+ closed      | runtime.capture_input    | input_present=true;task_name=summarize_docs                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | t        | t
+ closed      | runtime.checkpoint       | checkpoint=stage8.after_capture;task_state=k                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | t        | t
+ closed      | runtime.pause            | Task paused at durable checkpoint and awaits RESUME TASK                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | f        | t
+ closed      | runtime.resume           | checkpoint=stage8.after_capture;resume_requested;next_step=6                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | f        | t
+ closed      | runtime.resume_dispatch  | resume_from=stage8.after_capture;state=r                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | t        | t
+ closed      | runtime.external_resume  | phase=resume;tool=summarize;principal=summarize_runner;principal_runtime=microvm;provider=microvm_provider;provider_kind=microvm;effective_sandbox=isolated;profile=isolated;env=minimal;cwd=pg_qx_runtime;process_limit=1;timeout_ms=1200;receipt_schema=qx.receipt.v1;receipt_alg=ed25519;receipt_nonce=resume:summarize:summarize_runner;receipt_sig=verified;attestation=microvm_receipt_verified;tokens=91;cost=22;detail=tool summarize via summarize_runner for resume phase on task <task>;launch_mode=profiled_process;restricted_identity=true;wall_ms=<ms> | t        | t
+ closed      | runtime.final_checkpoint | checkpoint=stage8.final;task_state=c                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | t        | t
+ closed      | runtime.complete         | Task completed after resumable attempt handoff                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | f        | t
 (12 rows)
 
 SELECT qxtracename::text AS trace_name,
@@ -555,29 +597,53 @@ SELECT qxtracename::text AS trace_name,
          WHEN qxtracename = 'runtime.external_resume' THEN qxtracedetail LIKE '%effective_sandbox=isolated%'
          ELSE false
        END AS expected_sandbox,
-       qxtracedetail LIKE '%provider=loopback_provider%' AS has_provider,
-       qxtracedetail LIKE '%profile=%' AS has_profile,
+       CASE
+        WHEN qxtracename = 'runtime.external_submit' THEN qxtracedetail LIKE '%provider=loopback_provider%'
+        WHEN qxtracename = 'runtime.external_resume' THEN qxtracedetail LIKE '%provider=microvm_provider%'
+        ELSE false
+      END AS expected_provider,
+      CASE
+        WHEN qxtracename = 'runtime.external_submit' THEN qxtracedetail LIKE '%provider_kind=loopback%'
+        WHEN qxtracename = 'runtime.external_resume' THEN qxtracedetail LIKE '%provider_kind=microvm%'
+        ELSE false
+      END AS expected_provider_kind,
+      CASE
+        WHEN qxtracename = 'runtime.external_submit' THEN qxtracedetail LIKE '%principal_runtime=host%'
+        WHEN qxtracename = 'runtime.external_resume' THEN qxtracedetail LIKE '%principal_runtime=microvm%'
+        ELSE false
+      END AS expected_principal_runtime,
+      qxtracedetail LIKE '%profile=%' AS has_profile,
        qxtracedetail LIKE '%env=minimal%' AS minimal_env,
        qxtracedetail LIKE '%cwd=pg_qx_runtime%' AS runtime_workdir,
        qxtracedetail LIKE '%process_limit=1%' AS single_process_cap,
        qxtracedetail LIKE '%timeout_ms=%' AS has_timeout,
        qxtracedetail LIKE '%receipt_schema=qx.receipt.v1%' AS has_receipt_schema,
        CASE
+         WHEN qxtracename = 'runtime.external_submit' THEN qxtracedetail LIKE '%receipt_alg=hmac-sha256%'
+         WHEN qxtracename = 'runtime.external_resume' THEN qxtracedetail LIKE '%receipt_alg=ed25519%'
+         ELSE false
+       END AS has_receipt_alg,
+       CASE
          WHEN qxtracename = 'runtime.external_submit' THEN qxtracedetail LIKE '%receipt_nonce=submit:search:search_runner%'
          WHEN qxtracename = 'runtime.external_resume' THEN qxtracedetail LIKE '%receipt_nonce=resume:summarize:summarize_runner%'
          ELSE false
        END AS expected_receipt_nonce,
-       qxtracedetail LIKE '%attestation=loopback_verified%' AS has_attestation,
+       qxtracedetail LIKE '%receipt_sig=verified%' AS has_receipt_sig,
+      CASE
+        WHEN qxtracename = 'runtime.external_submit' THEN qxtracedetail LIKE '%attestation=loopback_verified%'
+        WHEN qxtracename = 'runtime.external_resume' THEN qxtracedetail LIKE '%attestation=microvm_receipt_verified%'
+        ELSE false
+      END AS expected_attestation,
        qxtracedetail LIKE '%launch_mode=profiled_process%' AS has_launch_mode,
        qxtracedetail LIKE '%restricted_identity=%' AS has_restricted_identity,
        qxtracedetail LIKE '%wall_ms=%' AS has_wall_time
 FROM pg_qx_trace
 WHERE qxtracename IN ('runtime.external_submit', 'runtime.external_resume')
 ORDER BY oid;
-       trace_name        | expected_sandbox | has_provider | has_profile | minimal_env | runtime_workdir | single_process_cap | has_timeout | has_receipt_schema | expected_receipt_nonce | has_attestation | has_launch_mode | has_restricted_identity | has_wall_time 
--------------------------+------------------+--------------+-------------+-------------+-----------------+--------------------+-------------+--------------------+------------------------+-----------------+-----------------+-------------------------+---------------
- runtime.external_submit | t                | t            | t           | t           | t               | t                  | t           | t                  | t                      | t               | t               | t                       | t
- runtime.external_resume | t                | t            | t           | t           | t               | t                  | t           | t                  | t                      | t               | t               | t                       | t
+       trace_name        | expected_sandbox | expected_provider | expected_provider_kind | expected_principal_runtime | has_profile | minimal_env | runtime_workdir | single_process_cap | has_timeout | has_receipt_schema | has_receipt_alg | expected_receipt_nonce | has_receipt_sig | expected_attestation | has_launch_mode | has_restricted_identity | has_wall_time 
+-------------------------+------------------+-------------------+------------------------+----------------------------+-------------+-------------+-----------------+--------------------+-------------+--------------------+-----------------+------------------------+-----------------+----------------------+-----------------+-------------------------+---------------
+ runtime.external_submit | t                | t                 | t                      | t                          | t           | t           | t               | t                  | t           | t                  | t               | t                      | t               | t                    | t               | t                       | t
+ runtime.external_resume | t                | t                 | t                      | t                          | t           | t           | t               | t                  | t           | t                  | t               | t                      | t               | t                    | t               | t                       | t
 (2 rows)
 
 CREATE AGENT tiny_budget

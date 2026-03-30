@@ -31,6 +31,9 @@ Current bootstrap status:
 - Stage 17 stronger runtime sandbox enforcement is in-tree with OS-level launch profiles, minimal-environment principal execution, sealed runtime workdirs, and timeout/process limits enforced by the launcher
 - Stage 18 restricted-identity principal execution is in-tree with restricted-token launch for non-`builtin` principals on Windows and parent-observed launch receipts in runtime traces
 - Stage 19 provider-backed execution receipts are in-tree with `CREATE/ALTER PROVIDER`, `pg_qx_provider`, principal-to-provider binding, and runtime verification of provider identity, receipt schema, receipt nonce, and attestation evidence
+- Stage 20 brokered remote providers and HMAC-signed receipts are in-tree with `remote://` providers, provider-scoped receipt keys, signed receipt verification in runtime, and operator-visible receipt algorithm/signature evidence
+- Stage 21 asymmetric remote receipts are in-tree with provider-side `ed25519` verification, principal receipt signers, OpenSSL-backed runtime signature checks, and sealed Windows runner packaging that stages required runtime DLLs into `bindir`
+- Stage 22 brokered container and microVM principal classes are in-tree with `container://` / `microvm://` providers, principal runtime-class DDL, runtime/provider compatibility enforcement, and receipt payloads that carry verified principal-runtime identity
 
 What this fork is:
 - a real fork target for an AgentDB
@@ -64,6 +67,9 @@ Immediate fork governance files:
 - `docs/stage-17/README.md`
 - `docs/stage-18/README.md`
 - `docs/stage-19/README.md`
+- `docs/stage-20/README.md`
+- `docs/stage-21/README.md`
+- `docs/stage-22/README.md`
 - `docs/bootstrap-plan.md`
 - `docs/rebase-strategy.md`
 - `docs/patch-ledger.md`
