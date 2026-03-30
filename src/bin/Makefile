@@ -33,6 +33,7 @@ SUBDIRS = \
 	pg_waldump \
 	pg_walsummary \
 	pgbench \
+	qhapaqxian_tool_runner \
 	psql \
 	scripts
 

@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * qx_security.c
- *	  identity, namespace, tool, and budget helpers for QhapaqXian Engine
+ *	  identity, namespace, principal, tool, and budget helpers
  *
  *-------------------------------------------------------------------------
  */
@@ -17,6 +17,9 @@
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_qx_identity.h"
 #include "catalog/pg_qx_namespace.h"
+#include "catalog/pg_qx_provider.h"
+#include "catalog/pg_qx_principal.h"
+#include "catalog/pg_qx_tool.h"
 #include "commands/defrem.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
@@ -36,6 +39,10 @@ static void qx_security_set_nodetree(Datum *values, bool *nulls,
 static char *qx_security_text_attr(HeapTuple tup, AttrNumber attnum,
 								   int cacheid);
 static bool qx_tool_name_in_list(List *tools, const char *tool_name);
+static int	qx_sandbox_rank(const char *sandbox_name);
+static char *qx_tool_contract_for_tuples(HeapTuple tooltup,
+										 HeapTuple principaltup,
+										 HeapTuple providertup);
 
 static void
 qx_security_set_text(Datum *values, bool *nulls, AttrNumber attnum,
@@ -97,6 +104,84 @@ qx_tool_name_in_list(List *tools, const char *tool_name)
 	}
 
 	return false;
+}
+
+static int
+qx_sandbox_rank(const char *sandbox_name)
+{
+	if (sandbox_name == NULL || strcmp(sandbox_name, "builtin") == 0)
+		return 0;
+	if (strcmp(sandbox_name, "restricted") == 0)
+		return 1;
+	if (strcmp(sandbox_name, "isolated") == 0)
+		return 2;
+
+	ereport(ERROR,
+			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+			 errmsg("unsupported sandbox \"%s\"", sandbox_name)));
+	return -1;
+}
+
+static char *
+qx_tool_contract_for_tuples(HeapTuple tooltup, HeapTuple principaltup,
+							HeapTuple providertup)
+{
+	Form_pg_qx_tool toolform = (Form_pg_qx_tool) GETSTRUCT(tooltup);
+	Form_pg_qx_principal principalform = (Form_pg_qx_principal) GETSTRUCT(principaltup);
+	Form_pg_qx_provider providerform = (Form_pg_qx_provider) GETSTRUCT(providertup);
+	char	   *handler_name;
+	char	   *tool_sandbox;
+	char	   *principal_sandbox;
+	char	   *principal_program;
+	char	   *provider_kind;
+	char	   *provider_endpoint;
+	char	   *contract;
+
+	handler_name = qx_security_text_attr(tooltup,
+										 Anum_pg_qx_tool_qxtoolhandler,
+										 QXTOOLOID);
+	tool_sandbox = qx_security_text_attr(tooltup,
+										 Anum_pg_qx_tool_qxtoolsandbox,
+										 QXTOOLOID);
+	principal_sandbox = qx_security_text_attr(principaltup,
+											  Anum_pg_qx_principal_qxprincipalsandbox,
+											  QXPRINCIPALOID);
+	principal_program = qx_security_text_attr(principaltup,
+											  Anum_pg_qx_principal_qxprincipalprogram,
+											  QXPRINCIPALOID);
+	provider_kind = qx_security_text_attr(providertup,
+										  Anum_pg_qx_provider_qxproviderkind,
+										  QXPROVIDEROID);
+	provider_endpoint = qx_security_text_attr(providertup,
+											  Anum_pg_qx_provider_qxproviderendpoint,
+											  QXPROVIDEROID);
+
+	contract = psprintf("tool=%s;handler=%s;tool_sandbox=%s;principal=%s;principal_sandbox=%s;program=%s;provider=%s;provider_kind=%s;provider_endpoint=%s;provider_attestation=%s;receipt_schema=qx.receipt.v1",
+						NameStr(toolform->qxtoolname),
+						handler_name != NULL ? handler_name : "<none>",
+						tool_sandbox != NULL ? tool_sandbox : "builtin",
+						NameStr(principalform->qxprincipalname),
+						principal_sandbox != NULL ? principal_sandbox : "builtin",
+						principal_program != NULL ? principal_program : "",
+						NameStr(providerform->qxprovidername),
+						provider_kind != NULL ? provider_kind : "loopback",
+						provider_endpoint != NULL ? provider_endpoint : "local://qhapaqxian-tool-runner",
+						providerform->qxproviderattestationrequired ? "required" : "optional");
+
+	if (handler_name != NULL)
+		pfree(handler_name);
+	if (tool_sandbox != NULL)
+		pfree(tool_sandbox);
+	if (principal_sandbox != NULL)
+		pfree(principal_sandbox);
+	if (principal_program != NULL)
+		pfree(principal_program);
+	if (provider_kind != NULL)
+		pfree(provider_kind);
+	if (provider_endpoint != NULL)
+		pfree(provider_endpoint);
+
+	return contract;
 }
 
 void
@@ -197,127 +282,102 @@ QxDeserializeToolList(const char *serialized)
 }
 
 Oid
-QxEnsureNamespacePolicy(Oid namespaceoid, Oid ownerid, Oid authrole,
-						const char *policy_name, List *allowed_tools)
+QxLookupNamespacePolicy(Oid namespaceoid, const char *policy_name,
+						bool missing_ok)
 {
-	HeapTuple	existing;
-	Relation	rel;
-	Datum		values[Natts_pg_qx_namespace];
-	bool		nulls[Natts_pg_qx_namespace];
-	HeapTuple	tup;
+	HeapTuple	policytup;
 	Oid			policyoid;
-	ObjectAddress myself;
-	ObjectAddress referenced;
-	char	   *stored_policy_name = NULL;
-	char	   *resolved_policy_name;
-	char	   *stored_allowed_tools = NULL;
-	List	   *allowed = NIL;
-	ListCell   *lc;
 
-	resolved_policy_name = pstrdup((policy_name != NULL && policy_name[0] != '\0') ?
-								   policy_name : "namespace.default");
+	if (policy_name == NULL || policy_name[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("namespace policy name must not be empty")));
 
-	existing = SearchSysCache1(QXNAMESPACENSPID, ObjectIdGetDatum(namespaceoid));
-	if (HeapTupleIsValid(existing))
+	policytup = SearchSysCache2(QXNAMESPACENAMENSP,
+								CStringGetDatum(policy_name),
+								ObjectIdGetDatum(namespaceoid));
+	if (!HeapTupleIsValid(policytup))
 	{
-		Form_pg_qx_namespace policyform = (Form_pg_qx_namespace) GETSTRUCT(existing);
+		if (missing_ok)
+			return InvalidOid;
 
-		if (!has_privs_of_role(ownerid, policyform->qxnamespaceowner))
-		{
-			ReleaseSysCache(existing);
-			ereport(ERROR,
-					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-					 errmsg("permission denied to use namespace policy for schema \"%s\"",
-							get_namespace_name(namespaceoid)),
-					 errdetail("Only the namespace policy owner or a member of that role may bind agents in the schema.")));
-		}
-
-		stored_policy_name = qx_security_text_attr(existing,
-												   Anum_pg_qx_namespace_qxnamespacepolicy,
-												   QXNAMESPACENSPID);
-		stored_allowed_tools = qx_security_text_attr(existing,
-													 Anum_pg_qx_namespace_qxallowedtools,
-													 QXNAMESPACENSPID);
-		allowed = QxDeserializeToolList(stored_allowed_tools);
-
-		if (policyform->qxrequireknowntools)
-		{
-			foreach(lc, allowed_tools)
-			{
-				const char *tool_name = strVal(lfirst(lc));
-
-				if (!qx_tool_name_in_list(allowed, tool_name))
-				{
-					char	   *policy_label = pstrdup(stored_policy_name != NULL ?
-													 stored_policy_name :
-													 resolved_policy_name);
-
-					if (stored_policy_name != NULL)
-						pfree(stored_policy_name);
-					if (stored_allowed_tools != NULL)
-						pfree(stored_allowed_tools);
-					ReleaseSysCache(existing);
-					ereport(ERROR,
-							(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-							 errmsg("tool \"%s\" is not allowed by namespace policy \"%s\"",
-									tool_name,
-									policy_label),
-							 errdetail("Register the tool in the namespace policy before binding it to an agent in this schema.")));
-				}
-			}
-		}
-
-		policyoid = policyform->oid;
-		if (stored_policy_name != NULL)
-			pfree(stored_policy_name);
-		if (stored_allowed_tools != NULL)
-			pfree(stored_allowed_tools);
-		ReleaseSysCache(existing);
-		pfree(resolved_policy_name);
-
-		return policyoid;
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("namespace policy \"%s\" does not exist in schema \"%s\"",
+						policy_name, get_namespace_name(namespaceoid)),
+				 errdetail("Create the namespace policy before binding agents or tools to it.")));
 	}
 
-	rel = table_open(QxNamespaceRelationId, RowExclusiveLock);
-
-	memset(values, 0, sizeof(values));
-	memset(nulls, false, sizeof(nulls));
-
-	policyoid = GetNewOidWithIndex(rel, QxNamespaceOidIndexId,
-								   Anum_pg_qx_namespace_oid);
-	values[Anum_pg_qx_namespace_oid - 1] = ObjectIdGetDatum(policyoid);
-	values[Anum_pg_qx_namespace_qxnamespaceid - 1] =
-		ObjectIdGetDatum(namespaceoid);
-	values[Anum_pg_qx_namespace_qxnamespaceowner - 1] =
-		ObjectIdGetDatum(ownerid);
-	values[Anum_pg_qx_namespace_qxnamespaceauthrole - 1] =
-		ObjectIdGetDatum(authrole);
-	values[Anum_pg_qx_namespace_qxrequireknowntools - 1] = BoolGetDatum(true);
-	values[Anum_pg_qx_namespace_qxenforcebudgets - 1] = BoolGetDatum(true);
-	qx_security_set_text(values, nulls,
-						 Anum_pg_qx_namespace_qxnamespacepolicy,
-						 resolved_policy_name);
-	qx_security_set_nodetree(values, nulls,
-							 Anum_pg_qx_namespace_qxallowedtools,
-							 allowed_tools);
-
-	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
-	CatalogTupleInsert(rel, tup);
-	heap_freetuple(tup);
-	table_close(rel, RowExclusiveLock);
-
-	ObjectAddressSet(myself, QxNamespaceRelationId, policyoid);
-	recordDependencyOnOwner(QxNamespaceRelationId, policyoid, ownerid);
-	ObjectAddressSet(referenced, NamespaceRelationId, namespaceoid);
-	recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
-	ObjectAddressSet(referenced, AuthIdRelationId, authrole);
-	recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
-	recordDependencyOnCurrentExtension(&myself, false);
-	InvokeObjectPostCreateHook(QxNamespaceRelationId, policyoid, 0);
-
-	pfree(resolved_policy_name);
+	policyoid = ((Form_pg_qx_namespace) GETSTRUCT(policytup))->oid;
+	ReleaseSysCache(policytup);
 
 	return policyoid;
+}
+
+Oid
+QxLookupPrincipal(Oid namespaceoid, const char *principal_name,
+				  bool missing_ok)
+{
+	HeapTuple	principaltup;
+	Oid			principaloid;
+
+	if (principal_name == NULL || principal_name[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("principal name must not be empty")));
+
+	principaltup = SearchSysCache2(QXPRINCIPALNAMENSP,
+								   CStringGetDatum(principal_name),
+								   ObjectIdGetDatum(namespaceoid));
+	if (!HeapTupleIsValid(principaltup))
+	{
+		if (missing_ok)
+			return InvalidOid;
+
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("principal \"%s\" does not exist in schema \"%s\"",
+						principal_name, get_namespace_name(namespaceoid)),
+				 errdetail("Create the principal before binding it to a tool.")));
+	}
+
+	principaloid = ((Form_pg_qx_principal) GETSTRUCT(principaltup))->oid;
+	ReleaseSysCache(principaltup);
+
+	return principaloid;
+}
+
+Oid
+QxLookupProvider(Oid namespaceoid, const char *provider_name,
+				 bool missing_ok)
+{
+	HeapTuple	providertup;
+	Oid			provideroid;
+
+	if (provider_name == NULL || provider_name[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("provider name must not be empty")));
+
+	providertup = SearchSysCache2(QXPROVIDERNAMENSP,
+								  CStringGetDatum(provider_name),
+								  ObjectIdGetDatum(namespaceoid));
+	if (!HeapTupleIsValid(providertup))
+	{
+		if (missing_ok)
+			return InvalidOid;
+
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("provider \"%s\" does not exist in schema \"%s\"",
+						provider_name, get_namespace_name(namespaceoid)),
+				 errdetail("Create the provider before binding it to a principal.")));
+	}
+
+	provideroid = ((Form_pg_qx_provider) GETSTRUCT(providertup))->oid;
+	ReleaseSysCache(providertup);
+
+	return provideroid;
 }
 
 Oid
@@ -400,11 +460,137 @@ QxEnsureOperationalIdentity(Oid namespaceoid, Oid ownerid,
 }
 
 void
-QxEnsureToolCatalogEntries(Oid namespaceoid, Oid ownerid, List *tools)
+QxValidateRegisteredTools(Oid namespaceoid, List *tools, bool require_enabled)
 {
-	(void) namespaceoid;
-	(void) ownerid;
-	(void) tools;
+	ListCell   *lc;
+
+	foreach(lc, tools)
+	{
+		const char *tool_name = strVal(lfirst(lc));
+		HeapTuple	tooltup;
+		Form_pg_qx_tool toolform;
+
+		tooltup = SearchSysCache2(QXTOOLNAMENSP,
+								  CStringGetDatum(tool_name),
+								  ObjectIdGetDatum(namespaceoid));
+		if (!HeapTupleIsValid(tooltup))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("tool \"%s\" is not registered in schema \"%s\"",
+							tool_name, get_namespace_name(namespaceoid)),
+					 errdetail("Register the tool with CREATE TOOL before referencing it from a namespace policy or agent.")));
+
+		toolform = (Form_pg_qx_tool) GETSTRUCT(tooltup);
+		if (require_enabled)
+		{
+			HeapTuple	principaltup;
+			HeapTuple	providertup;
+			char	   *tool_sandbox;
+			char	   *principal_sandbox;
+			Form_pg_qx_principal principalform;
+			Form_pg_qx_provider providerform;
+
+			if (!toolform->qxtoolenabled)
+			{
+				ReleaseSysCache(tooltup);
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("tool \"%s\" is disabled in schema \"%s\"",
+								tool_name, get_namespace_name(namespaceoid)),
+						 errdetail("Enable the tool before binding it to an agent runtime.")));
+			}
+
+			if (!OidIsValid(toolform->qxtoolprincipalid))
+			{
+				ReleaseSysCache(tooltup);
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("tool \"%s\" has no principal binding", tool_name),
+						 errdetail("Bind the tool to a namespace principal before enabling agent execution.")));
+			}
+
+			principaltup = SearchSysCache1(QXPRINCIPALOID,
+										   ObjectIdGetDatum(toolform->qxtoolprincipalid));
+			if (!HeapTupleIsValid(principaltup))
+			{
+				ReleaseSysCache(tooltup);
+				elog(ERROR, "cache lookup failed for QhapaqXian principal %u",
+					 toolform->qxtoolprincipalid);
+			}
+
+			principalform = (Form_pg_qx_principal) GETSTRUCT(principaltup);
+			if (!principalform->qxprincipalenabled)
+			{
+				ReleaseSysCache(principaltup);
+				ReleaseSysCache(tooltup);
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("principal for tool \"%s\" is disabled", tool_name),
+						 errdetail("Enable the principal before binding the tool to an agent runtime.")));
+			}
+
+			if (!OidIsValid(principalform->qxprincipalproviderid))
+			{
+				ReleaseSysCache(principaltup);
+				ReleaseSysCache(tooltup);
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("principal for tool \"%s\" has no provider binding", tool_name),
+						 errdetail("Bind the principal to a provider before enabling agent execution.")));
+			}
+
+			providertup = SearchSysCache1(QXPROVIDEROID,
+										  ObjectIdGetDatum(principalform->qxprincipalproviderid));
+			if (!HeapTupleIsValid(providertup))
+			{
+				ReleaseSysCache(principaltup);
+				ReleaseSysCache(tooltup);
+				elog(ERROR, "cache lookup failed for QhapaqXian provider %u",
+					 principalform->qxprincipalproviderid);
+			}
+
+			providerform = (Form_pg_qx_provider) GETSTRUCT(providertup);
+			if (!providerform->qxproviderenabled)
+			{
+				ReleaseSysCache(providertup);
+				ReleaseSysCache(principaltup);
+				ReleaseSysCache(tooltup);
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("provider for tool \"%s\" is disabled", tool_name),
+						 errdetail("Enable the provider before binding the tool to an agent runtime.")));
+			}
+
+			tool_sandbox = qx_security_text_attr(tooltup,
+												 Anum_pg_qx_tool_qxtoolsandbox,
+												 QXTOOLOID);
+			principal_sandbox = qx_security_text_attr(principaltup,
+													  Anum_pg_qx_principal_qxprincipalsandbox,
+													  QXPRINCIPALOID);
+			if (qx_sandbox_rank(tool_sandbox) > qx_sandbox_rank(principal_sandbox))
+			{
+				if (tool_sandbox != NULL)
+					pfree(tool_sandbox);
+				if (principal_sandbox != NULL)
+					pfree(principal_sandbox);
+				ReleaseSysCache(principaltup);
+				ReleaseSysCache(tooltup);
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("tool \"%s\" exceeds its principal sandbox ceiling",
+								tool_name)));
+			}
+
+			if (tool_sandbox != NULL)
+				pfree(tool_sandbox);
+			if (principal_sandbox != NULL)
+				pfree(principal_sandbox);
+			ReleaseSysCache(providertup);
+			ReleaseSysCache(principaltup);
+		}
+
+		ReleaseSysCache(tooltup);
+	}
 }
 
 char *
@@ -429,18 +615,18 @@ char *
 QxNamespacePolicyNameById(Oid policyoid)
 {
 	HeapTuple	policytup;
+	Form_pg_qx_namespace policyform;
 	char	   *name;
 
 	policytup = SearchSysCache1(QXNAMESPACEOID, ObjectIdGetDatum(policyoid));
 	if (!HeapTupleIsValid(policytup))
 		elog(ERROR, "cache lookup failed for QhapaqXian namespace policy %u", policyoid);
 
-	name = qx_security_text_attr(policytup,
-								 Anum_pg_qx_namespace_qxnamespacepolicy,
-								 QXNAMESPACEOID);
+	policyform = (Form_pg_qx_namespace) GETSTRUCT(policytup);
+	name = pstrdup(NameStr(policyform->qxnamespacepolicyname));
 	ReleaseSysCache(policytup);
 
-	return name != NULL ? name : pstrdup("namespace.default");
+	return name;
 }
 
 void
@@ -480,15 +666,22 @@ QxAuthorizeToolsForNamespace(Oid namespacepolicyoid, Oid namespaceoid,
 	allowed_tools = QxDeserializeToolList(serialized_allowed_tools);
 
 	authz->namespace_policy_oid = policyform->oid;
-	authz->namespace_policy_name = qx_security_text_attr(policytup,
-														 Anum_pg_qx_namespace_qxnamespacepolicy,
-														 QXNAMESPACEOID);
+	authz->namespace_policy_name = pstrdup(NameStr(policyform->qxnamespacepolicyname));
 	authz->require_known_tools = policyform->qxrequireknowntools;
 	authz->enforce_budgets = policyform->qxenforcebudgets;
 
 	foreach(lc, tools)
 	{
 		const char *tool_name = strVal(lfirst(lc));
+		HeapTuple	tooltup;
+		HeapTuple	principaltup;
+		HeapTuple	providertup;
+		Form_pg_qx_tool toolform;
+		Form_pg_qx_principal principalform;
+		Form_pg_qx_provider providerform;
+		char	   *tool_sandbox;
+		char	   *principal_sandbox;
+		char	   *contract;
 
 		if (policyform->qxrequireknowntools &&
 			!qx_tool_name_in_list(allowed_tools, tool_name))
@@ -501,12 +694,129 @@ QxAuthorizeToolsForNamespace(Oid namespacepolicyoid, Oid namespaceoid,
 					 errmsg("tool \"%s\" is not allowed by namespace policy \"%s\"",
 							tool_name,
 							authz->namespace_policy_name != NULL ?
-							authz->namespace_policy_name : "namespace.default")));
+							authz->namespace_policy_name : "<unknown>"),
+					 errdetail("Register the tool in the namespace policy before executing the agent task.")));
 		}
 
+		tooltup = SearchSysCache2(QXTOOLNAMENSP,
+								  CStringGetDatum(tool_name),
+								  ObjectIdGetDatum(namespaceoid));
+		if (!HeapTupleIsValid(tooltup))
+		{
+			if (serialized_allowed_tools != NULL)
+				pfree(serialized_allowed_tools);
+			ReleaseSysCache(policytup);
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("tool \"%s\" is not registered in schema \"%s\"",
+							tool_name, get_namespace_name(namespaceoid))));
+		}
+
+		toolform = (Form_pg_qx_tool) GETSTRUCT(tooltup);
+		if (!toolform->qxtoolenabled)
+		{
+			ReleaseSysCache(tooltup);
+			if (serialized_allowed_tools != NULL)
+				pfree(serialized_allowed_tools);
+			ReleaseSysCache(policytup);
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("tool \"%s\" is disabled in schema \"%s\"",
+							tool_name, get_namespace_name(namespaceoid))));
+		}
+
+		if (!OidIsValid(toolform->qxtoolprincipalid))
+		{
+			ReleaseSysCache(tooltup);
+			if (serialized_allowed_tools != NULL)
+				pfree(serialized_allowed_tools);
+			ReleaseSysCache(policytup);
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("tool \"%s\" has no principal binding", tool_name)));
+		}
+
+		principaltup = SearchSysCache1(QXPRINCIPALOID,
+									   ObjectIdGetDatum(toolform->qxtoolprincipalid));
+		if (!HeapTupleIsValid(principaltup))
+		{
+			ReleaseSysCache(tooltup);
+			elog(ERROR, "cache lookup failed for QhapaqXian principal %u",
+				 toolform->qxtoolprincipalid);
+		}
+
+		principalform = (Form_pg_qx_principal) GETSTRUCT(principaltup);
+		if (!principalform->qxprincipalenabled)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("principal \"%s\" is disabled in schema \"%s\"",
+							NameStr(principalform->qxprincipalname),
+							get_namespace_name(namespaceoid))));
+		}
+
+		if (!OidIsValid(principalform->qxprincipalproviderid))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("principal \"%s\" has no provider binding",
+							NameStr(principalform->qxprincipalname))));
+
+		providertup = SearchSysCache1(QXPROVIDEROID,
+									  ObjectIdGetDatum(principalform->qxprincipalproviderid));
+		if (!HeapTupleIsValid(providertup))
+		{
+			ReleaseSysCache(principaltup);
+			ReleaseSysCache(tooltup);
+			elog(ERROR, "cache lookup failed for QhapaqXian provider %u",
+				 principalform->qxprincipalproviderid);
+		}
+
+		providerform = (Form_pg_qx_provider) GETSTRUCT(providertup);
+		if (!providerform->qxproviderenabled)
+		{
+			ReleaseSysCache(providertup);
+			ReleaseSysCache(principaltup);
+			ReleaseSysCache(tooltup);
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("provider \"%s\" is disabled in schema \"%s\"",
+							NameStr(providerform->qxprovidername),
+							get_namespace_name(namespaceoid))));
+		}
+
+		tool_sandbox = qx_security_text_attr(tooltup,
+												 Anum_pg_qx_tool_qxtoolsandbox,
+												 QXTOOLOID);
+		principal_sandbox = qx_security_text_attr(principaltup,
+													  Anum_pg_qx_principal_qxprincipalsandbox,
+													  QXPRINCIPALOID);
+		if (qx_sandbox_rank(tool_sandbox) > qx_sandbox_rank(principal_sandbox))
+		{
+			if (tool_sandbox != NULL)
+				pfree(tool_sandbox);
+			if (principal_sandbox != NULL)
+				pfree(principal_sandbox);
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("tool \"%s\" exceeds the sandbox ceiling of principal \"%s\"",
+							tool_name, NameStr(principalform->qxprincipalname))));
+		}
+
+		if (tool_sandbox != NULL)
+			pfree(tool_sandbox);
+		if (principal_sandbox != NULL)
+			pfree(principal_sandbox);
+
+		contract = qx_tool_contract_for_tuples(tooltup, principaltup, providertup);
 		authz->tool_count += 1;
-		authz->tool_token_cost += 8;
-		authz->tool_cost_units += 4;
+		authz->tool_token_cost += toolform->qxtooltokencost;
+		authz->tool_cost_units += toolform->qxtoolcostunits;
+		authz->tool_oids = lappend_oid(authz->tool_oids, toolform->oid);
+		authz->tool_contracts = lappend(authz->tool_contracts,
+										makeString(contract));
+		ReleaseSysCache(providertup);
+		ReleaseSysCache(principaltup);
+		ReleaseSysCache(tooltup);
 	}
 
 	if (serialized_allowed_tools != NULL)

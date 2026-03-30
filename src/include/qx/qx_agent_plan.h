@@ -63,6 +63,7 @@ typedef struct QxAgentPlan
 	int32		authorized_tool_tokens;
 	int32		authorized_tool_cost;
 	List	   *authorized_tools;	/* list of String */
+	List	   *authorized_tool_oids;	/* list of Oid */
 	List	   *steps;			/* list of QxAgentPlanStep */
 } QxAgentPlan;
 

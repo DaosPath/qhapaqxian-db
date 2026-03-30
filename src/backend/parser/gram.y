@@ -315,7 +315,11 @@ static int qx_parse_memory_scope(char *scope, int location,
 		UnlistenStmt UpdateStmt VacuumStmt
 		VariableResetStmt VariableSetStmt VariableShowStmt
 		ViewStmt CheckPointStmt CreateConversionStmt
-		CreateAgentStmt StartSessionStmt RunTaskStmt ResumeTaskStmt ExplainAgentStmt
+		CreateAgentStmt CreateNamespacePolicyStmt AlterNamespacePolicyStmt
+		CreateProviderStmt AlterProviderStmt
+		CreatePrincipalStmt AlterPrincipalStmt
+		CreateToolStmt AlterToolStmt
+		StartSessionStmt RunTaskStmt ResumeTaskStmt ExplainAgentStmt
 		RememberStmt FetchMemoryStmt ShowTraceStmt
 		DeallocateStmt PrepareStmt ExecuteStmt
 		DropOwnedStmt ReassignOwnedStmt
@@ -357,16 +361,32 @@ static int qx_parse_memory_scope(char *scope, int location,
 %type <list>	utility_option_list
 %type <node>	utility_option_arg
 %type <node>	qx_explainable_stmt
+%type <rolespec>	qx_opt_namespace_auth_role qx_opt_alter_namespace_auth_role
 %type <str>		qx_opt_agent_identity qx_opt_agent_model
 				qx_opt_agent_memory_profile qx_opt_agent_policy
 				qx_opt_task_name qx_opt_task_priority
 				qx_opt_resume_checkpoint qx_opt_memory_match
+				qx_opt_provider_kind qx_opt_provider_endpoint
+				qx_opt_alter_principal_program
+				qx_opt_alter_principal_sandbox
+				qx_opt_tool_policy qx_opt_alter_tool_handler
+				qx_opt_alter_tool_sandbox qx_opt_alter_tool_principal
+				qx_opt_alter_tool_policy
+				qx_opt_alter_provider_kind qx_opt_alter_provider_endpoint
 %type <list>	qx_opt_agent_tools qx_opt_agent_budget
 				qx_opt_memory_scopes qx_memory_scope_list
 				qx_opt_memory_tags qx_memory_tag_list
+				qx_namespace_allowed_tools qx_opt_alter_namespace_tools
 %type <node>	qx_opt_session_context qx_opt_task_input
 %type <boolean>	qx_opt_returning_session qx_opt_returning_task
+%type <range>	qx_principal_provider qx_opt_alter_principal_provider
 %type <ival>	qx_memory_scope qx_opt_fetch_limit qx_opt_show_trace_limit
+				qx_namespace_known_tools_mode qx_namespace_budget_mode
+				qx_opt_alter_namespace_known_tools qx_opt_alter_namespace_budget
+				qx_opt_provider_attestation qx_opt_alter_provider_attestation
+				qx_opt_alter_principal_enabled
+				qx_opt_alter_tool_token_cost qx_opt_alter_tool_cost_units
+				qx_opt_alter_tool_enabled qx_opt_alter_provider_enabled
 %type <defelt>	drop_option
 %type <boolean>	opt_or_replace opt_no
 				opt_grant_grant_option
@@ -719,7 +739,7 @@ static int qx_parse_memory_scope(char *scope, int location,
 /* ordinary key words in alphabetical order */
 %token <keyword> ABORT_P ABSENT ABSOLUTE_P ACCESS ACTION ADD_P ADMIN AFTER
 	AGENT AGGREGATE ALL ALSO ALTER ALWAYS ANALYSE ANALYZE AND ANY ARRAY AS ASC
-	ASENSITIVE ASSERTION ASSIGNMENT ASYMMETRIC ATOMIC AT ATTACH ATTRIBUTE AUTHORIZATION
+	ASENSITIVE ASSERTION ASSIGNMENT ASYMMETRIC ATOMIC AT ATTESTATION ATTACH ATTRIBUTE AUTHORIZATION
 
 	BACKWARD BEFORE BEGIN_P BETWEEN BIGINT BINARY BIT
 	BOOLEAN_P BOTH BREADTH BY
@@ -738,7 +758,7 @@ static int qx_parse_memory_scope(char *scope, int location,
 	DETACH DICTIONARY DISABLE_P DISCARD DISTINCT DO DOCUMENT_P DOMAIN_P
 	DOUBLE_P DROP
 
-	EACH ELSE EMPTY_P ENABLE_P ENCODING ENCRYPTED END_P ENUM_P ERROR_P ESCAPE
+	EACH ELSE EMPTY_P ENABLE_P ENCODING ENCRYPTED END_P ENDPOINT ENUM_P ERROR_P ESCAPE
 	EVENT EXCEPT EXCLUDE EXCLUDING EXCLUSIVE EXECUTE EXISTS EXPLAIN EXPRESSION
 	EXTENSION EXTERNAL EXTRACT
 
@@ -757,7 +777,7 @@ static int qx_parse_memory_scope(char *scope, int location,
 	JOIN JSON JSON_ARRAY JSON_ARRAYAGG JSON_EXISTS JSON_OBJECT JSON_OBJECTAGG
 	JSON_QUERY JSON_SCALAR JSON_SERIALIZE JSON_TABLE JSON_VALUE
 
-	KEEP KEY KEYS
+	KEEP KEY KEYS KIND KNOWN
 
 	LABEL LANGUAGE LARGE_P LAST_P LATERAL_P
 	LEADING LEAKPROOF LEAST LEFT LEVEL LIKE LIMIT LISTEN LOAD LOCAL
@@ -766,7 +786,7 @@ static int qx_parse_memory_scope(char *scope, int location,
 	MAPPING MATCH MATCHED MATERIALIZED MAXVALUE MEMORY MERGE MERGE_ACTION METHOD
 	MINUTE_P MINVALUE MODE MODEL MONTH_P MOVE
 
-	NAME_P NAMES NATIONAL NATURAL NCHAR NESTED NEW NEXT NFC NFD NFKC NFKD NO
+	NAME_P NAMES NAMESPACE NATIONAL NATURAL NCHAR NESTED NEW NEXT NFC NFD NFKC NFKD NO
 	NONE NORMALIZE NORMALIZED
 	NOT NOTHING NOTIFY NOTNULL NOWAIT NULL_P NULLIF
 	NULLS_P NUMERIC
@@ -777,17 +797,17 @@ static int qx_parse_memory_scope(char *scope, int location,
 
 	PARALLEL PARAMETER PARSER PARTIAL PARTITION PASSING PASSWORD PATH
 	PLACING PLAN PLANS POLICY PRIORITY PROFILE
-	POSITION PRECEDING PRECISION PRESERVE PREPARE PREPARED PRIMARY
-	PRIOR PRIVILEGES PROCEDURAL PROCEDURE PROCEDURES PROGRAM PUBLICATION
+	POSITION PRECEDING PRECISION PRESERVE PREPARE PREPARED PRIMARY PRINCIPAL
+	PRIOR PRIVILEGES PROCEDURAL PROCEDURE PROCEDURES PROGRAM PROVIDER PUBLICATION
 
 	QUOTE QUOTES
 
-	RANGE READ REAL REASSIGN RECHECK RECURSIVE REF_P REFERENCES REFERENCING
+	RANGE READ REAL REASSIGN RECHECK RECEIPT RECURSIVE REF_P REFERENCES REFERENCING
 	REFRESH REINDEX RELATIVE_P RELEASE RENAME REPEATABLE REPLACE REPLICA
 	RESET RESTART RESTRICT REMEMBER RESUME RETURN RETURNING RETURNS REVOKE RIGHT ROLE ROLLBACK ROLLUP
 	ROUTINE ROUTINES ROW ROWS RULE RUN
 
-	SAVEPOINT SCALAR SCHEMA SCHEMAS SCOPE SCROLL SEARCH SECOND_P SECURITY SELECT
+	SANDBOX SAVEPOINT SCALAR SCHEMA SCHEMAS SCOPE SCROLL SEARCH SECOND_P SECURITY SELECT
 	SEQUENCE SEQUENCES
 	SERIALIZABLE SERVER SESSION SESSION_USER SET SETS SETOF SHARE SHOW
 	SIMILAR SIMPLE SKIP SMALLINT SNAPSHOT SOME SOURCE SQL_P STABLE STANDALONE_P
@@ -795,7 +815,7 @@ static int qx_parse_memory_scope(char *scope, int location,
 	SUBSCRIPTION SUBSTRING SUPPORT SYMMETRIC SYSID SYSTEM_P SYSTEM_USER
 
 	TABLE TABLES TABLESAMPLE TABLESPACE TAGS TARGET TASK TEMP TEMPLATE TEMPORARY TEXT_P THEN
-	TIES TIME TIMESTAMP TO TOOLS TRACE TRAILING TRANSACTION TRANSFORM
+	TIES TIME TIMESTAMP TO TOKEN TOOL TOOLS TRACE TRAILING TRANSACTION TRANSFORM
 	TREAT TRIGGER TRIM TRUE_P
 	TRUNCATE TRUSTED TYPE_P TYPES_P
 
@@ -1030,12 +1050,16 @@ stmt:
 			| AlterObjectSchemaStmt
 			| AlterOwnerStmt
 			| AlterOperatorStmt
+			| AlterNamespacePolicyStmt
+			| AlterProviderStmt
+			| AlterPrincipalStmt
 			| AlterTypeStmt
 			| AlterPolicyStmt
 			| AlterSeqStmt
 			| AlterSystemStmt
 			| AlterTableStmt
 			| AlterTblSpcStmt
+			| AlterToolStmt
 			| AlterCompositeTypeStmt
 			| AlterPublicationStmt
 			| AlterRoleSetStmt
@@ -1057,6 +1081,9 @@ stmt:
 			| CreateAsStmt
 			| CreateAssertionStmt
 			| CreateAgentStmt
+			| CreateNamespacePolicyStmt
+			| CreateProviderStmt
+			| CreatePrincipalStmt
 			| CreateCastStmt
 			| CreateConversionStmt
 			| CreateDomainStmt
@@ -1079,6 +1106,7 @@ stmt:
 			| CreateSubscriptionStmt
 			| CreateStatsStmt
 			| CreateTableSpaceStmt
+			| CreateToolStmt
 			| CreateTransformStmt
 			| CreateTrigStmt
 			| CreateEventTrigStmt
@@ -2002,9 +2030,263 @@ CreateAgentStmt:
 				}
 		;
 
+CreateNamespacePolicyStmt:
+			CREATE NAMESPACE POLICY name FOR SCHEMA name
+			qx_opt_namespace_auth_role
+			qx_namespace_allowed_tools
+			qx_namespace_known_tools_mode
+			qx_namespace_budget_mode
+				{
+					CreateNamespacePolicyStmt *n = makeNode(CreateNamespacePolicyStmt);
+
+					n->policy_name = $4;
+					n->schema_name = $7;
+					n->auth_role = $8;
+					n->allowed_tools = $9;
+					n->require_known_tools = ($10 != 0);
+					n->enforce_budgets = ($11 != 0);
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+		;
+
+AlterNamespacePolicyStmt:
+			ALTER NAMESPACE POLICY name FOR SCHEMA name
+			qx_opt_alter_namespace_auth_role
+			qx_opt_alter_namespace_tools
+			qx_opt_alter_namespace_known_tools
+			qx_opt_alter_namespace_budget
+				{
+					AlterNamespacePolicyStmt *n = makeNode(AlterNamespacePolicyStmt);
+
+					n->policy_name = $4;
+					n->schema_name = $7;
+					n->auth_role = $8;
+					n->set_auth_role = ($8 != NULL);
+					n->allowed_tools = $9;
+					n->set_allowed_tools = ($9 != NIL);
+					n->require_known_tools = ($10 > 0);
+					n->set_require_known_tools = ($10 >= 0);
+					n->enforce_budgets = ($11 > 0);
+					n->set_enforce_budgets = ($11 >= 0);
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+		;
+
+CreateProviderStmt:
+			CREATE PROVIDER qualified_name KIND Sconst ENDPOINT Sconst
+			qx_opt_provider_attestation
+				{
+					CreateProviderStmt *n = makeNode(CreateProviderStmt);
+
+					n->provider_name = $3;
+					n->provider_kind = $5;
+					n->endpoint_name = $7;
+					n->attestation_required = ($8 != 0);
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+		;
+
+AlterProviderStmt:
+			ALTER PROVIDER qualified_name
+			qx_opt_alter_provider_kind
+			qx_opt_alter_provider_endpoint
+			qx_opt_alter_provider_attestation
+			qx_opt_alter_provider_enabled
+				{
+					AlterProviderStmt *n = makeNode(AlterProviderStmt);
+
+					n->provider_name = $3;
+					n->provider_kind = $4;
+					n->set_kind = ($4 != NULL);
+					n->endpoint_name = $5;
+					n->set_endpoint = ($5 != NULL);
+					n->attestation_required = ($6 > 0);
+					n->set_attestation_required = ($6 >= 0);
+					n->enabled = ($7 > 0);
+					n->set_enabled = ($7 >= 0);
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+		;
+
+CreatePrincipalStmt:
+			CREATE PRINCIPAL qualified_name PROGRAM Sconst SANDBOX Sconst
+			qx_principal_provider
+				{
+					CreatePrincipalStmt *n = makeNode(CreatePrincipalStmt);
+
+					n->principal_name = $3;
+					n->program_name = $5;
+					n->sandbox_name = $7;
+					n->provider_name = $8;
+					n->enabled = true;
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+		;
+
+AlterPrincipalStmt:
+			ALTER PRINCIPAL qualified_name
+			qx_opt_alter_principal_provider
+			qx_opt_alter_principal_program
+			qx_opt_alter_principal_sandbox
+			qx_opt_alter_principal_enabled
+				{
+					AlterPrincipalStmt *n = makeNode(AlterPrincipalStmt);
+
+					n->principal_name = $3;
+					n->provider_name = $4;
+					n->set_provider = ($4 != NULL);
+					n->program_name = $5;
+					n->set_program = ($5 != NULL);
+					n->sandbox_name = $6;
+					n->set_sandbox = ($6 != NULL);
+					n->enabled = ($7 > 0);
+					n->set_enabled = ($7 >= 0);
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+		;
+
+CreateToolStmt:
+			CREATE TOOL qualified_name HANDLER Sconst SANDBOX Sconst PRINCIPAL Sconst
+			TOKEN COST Iconst COST Iconst qx_opt_tool_policy
+				{
+					CreateToolStmt *n = makeNode(CreateToolStmt);
+
+					n->tool_name = $3;
+					n->handler_name = $5;
+					n->sandbox_name = $7;
+					n->principal_name = $9;
+					n->token_cost = $12;
+					n->cost_units = $14;
+					n->policy_name = $15;
+					n->enabled = true;
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+		;
+
+AlterToolStmt:
+			ALTER TOOL qualified_name
+			qx_opt_alter_tool_handler
+			qx_opt_alter_tool_sandbox
+			qx_opt_alter_tool_principal
+			qx_opt_alter_tool_token_cost
+			qx_opt_alter_tool_cost_units
+			qx_opt_alter_tool_policy
+			qx_opt_alter_tool_enabled
+				{
+					AlterToolStmt *n = makeNode(AlterToolStmt);
+
+					n->tool_name = $3;
+					n->handler_name = $4;
+					n->set_handler = ($4 != NULL);
+					n->sandbox_name = $5;
+					n->set_sandbox = ($5 != NULL);
+					n->principal_name = $6;
+					n->set_principal = ($6 != NULL);
+					n->token_cost = $7;
+					n->set_token_cost = ($7 >= 0);
+					n->cost_units = $8;
+					n->set_cost_units = ($8 >= 0);
+					n->policy_name = $9;
+					n->set_policy = ($9 != NULL);
+					n->enabled = ($10 > 0);
+					n->set_enabled = ($10 >= 0);
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+		;
+
 qx_opt_agent_identity:
 			IDENTITY_P name							{ $$ = $2; }
 			| /* EMPTY */							{ $$ = NULL; }
+		;
+
+qx_opt_namespace_auth_role:
+			AUTHORIZATION ROLE '=' RoleSpec		{ $$ = $4; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
+qx_opt_alter_namespace_auth_role:
+			AUTHORIZATION ROLE '=' RoleSpec		{ $$ = $4; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
+qx_namespace_allowed_tools:
+			TOOLS '(' name_list ')'					{ $$ = $3; }
+			| /* EMPTY */							{ $$ = NIL; }
+		;
+
+qx_namespace_known_tools_mode:
+			KNOWN TOOLS ENABLE_P					{ $$ = 1; }
+			| KNOWN TOOLS DISABLE_P				{ $$ = 0; }
+			| /* EMPTY */							{ $$ = 1; }
+		;
+
+qx_namespace_budget_mode:
+			BUDGET ENABLE_P						{ $$ = 1; }
+			| BUDGET DISABLE_P					{ $$ = 0; }
+			| /* EMPTY */							{ $$ = 1; }
+		;
+
+qx_opt_alter_namespace_tools:
+			SET TOOLS '(' name_list ')'			{ $$ = $4; }
+			| /* EMPTY */							{ $$ = NIL; }
+		;
+
+qx_opt_alter_namespace_known_tools:
+			KNOWN TOOLS ENABLE_P					{ $$ = 1; }
+			| KNOWN TOOLS DISABLE_P				{ $$ = 0; }
+			| /* EMPTY */							{ $$ = -1; }
+		;
+
+qx_opt_alter_namespace_budget:
+			BUDGET ENABLE_P						{ $$ = 1; }
+			| BUDGET DISABLE_P					{ $$ = 0; }
+			| /* EMPTY */							{ $$ = -1; }
+		;
+
+qx_opt_provider_kind:
+			KIND Sconst							{ $$ = $2; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
+qx_opt_provider_endpoint:
+			ENDPOINT Sconst						{ $$ = $2; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
+qx_opt_provider_attestation:
+			ATTESTATION ENABLE_P				{ $$ = 1; }
+			| ATTESTATION DISABLE_P				{ $$ = 0; }
+			| /* EMPTY */							{ $$ = 0; }
+		;
+
+qx_opt_alter_provider_kind:
+			KIND Sconst							{ $$ = $2; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
+qx_opt_alter_provider_endpoint:
+			ENDPOINT Sconst						{ $$ = $2; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
+qx_opt_alter_provider_attestation:
+			ATTESTATION ENABLE_P				{ $$ = 1; }
+			| ATTESTATION DISABLE_P				{ $$ = 0; }
+			| /* EMPTY */							{ $$ = -1; }
+		;
+
+qx_opt_alter_provider_enabled:
+			ENABLE_P								{ $$ = 1; }
+			| DISABLE_P							{ $$ = 0; }
+			| /* EMPTY */							{ $$ = -1; }
 		;
 
 qx_opt_agent_model:
@@ -2030,6 +2312,72 @@ qx_opt_agent_policy:
 qx_opt_agent_budget:
 			BUDGET '(' utility_option_list ')'	{ $$ = $3; }
 			| /* EMPTY */							{ $$ = NIL; }
+		;
+
+qx_opt_tool_policy:
+			POLICY name							{ $$ = $2; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
+qx_opt_alter_tool_handler:
+			HANDLER Sconst						{ $$ = $2; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
+qx_opt_alter_tool_sandbox:
+			SANDBOX Sconst						{ $$ = $2; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
+qx_opt_alter_tool_principal:
+			PRINCIPAL Sconst						{ $$ = $2; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
+qx_opt_alter_principal_program:
+			PROGRAM Sconst							{ $$ = $2; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
+qx_opt_alter_principal_sandbox:
+			SANDBOX Sconst							{ $$ = $2; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
+qx_principal_provider:
+			PROVIDER qualified_name				{ $$ = $2; }
+		;
+
+qx_opt_alter_principal_provider:
+			PROVIDER qualified_name				{ $$ = $2; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
+qx_opt_alter_principal_enabled:
+			ENABLE_P								{ $$ = 1; }
+			| DISABLE_P							{ $$ = 0; }
+			| /* EMPTY */							{ $$ = -1; }
+		;
+
+qx_opt_alter_tool_token_cost:
+			TOKEN COST Iconst					{ $$ = $3; }
+			| /* EMPTY */							{ $$ = -1; }
+		;
+
+qx_opt_alter_tool_cost_units:
+			COST Iconst							{ $$ = $2; }
+			| /* EMPTY */							{ $$ = -1; }
+		;
+
+qx_opt_alter_tool_policy:
+			POLICY name							{ $$ = $2; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
+qx_opt_alter_tool_enabled:
+			ENABLE_P								{ $$ = 1; }
+			| DISABLE_P							{ $$ = 0; }
+			| /* EMPTY */							{ $$ = -1; }
 		;
 
 StartSessionStmt:
@@ -17806,6 +18154,7 @@ unreserved_keyword:
 			| ASSERTION
 			| ASSIGNMENT
 			| AT
+			| ATTESTATION
 			| ATOMIC
 			| ATTACH
 			| ATTRIBUTE
@@ -17875,6 +18224,7 @@ unreserved_keyword:
 			| ENABLE_P
 			| ENCODING
 			| ENCRYPTED
+			| ENDPOINT
 			| ENUM_P
 			| ERROR_P
 			| ESCAPE
@@ -17930,6 +18280,8 @@ unreserved_keyword:
 			| KEEP
 			| KEY
 			| KEYS
+			| KIND
+			| KNOWN
 			| LABEL
 			| LANGUAGE
 			| LARGE_P
@@ -17959,6 +18311,7 @@ unreserved_keyword:
 			| MOVE
 			| NAME_P
 			| NAMES
+			| NAMESPACE
 			| NESTED
 			| NEW
 			| NEXT
@@ -18002,6 +18355,7 @@ unreserved_keyword:
 			| PREPARE
 			| PREPARED
 			| PRESERVE
+			| PRINCIPAL
 			| PRIOR
 			| PRIORITY
 			| PRIVILEGES
@@ -18010,6 +18364,7 @@ unreserved_keyword:
 			| PROCEDURES
 			| PROFILE
 			| PROGRAM
+			| PROVIDER
 			| PUBLICATION
 			| QUOTE
 			| QUOTES
@@ -18017,6 +18372,7 @@ unreserved_keyword:
 			| READ
 			| REASSIGN
 			| RECHECK
+			| RECEIPT
 			| RECURSIVE
 			| REF_P
 			| REFERENCING
@@ -18044,6 +18400,7 @@ unreserved_keyword:
 			| ROWS
 			| RULE
 			| RUN
+			| SANDBOX
 			| SAVEPOINT
 			| SCALAR
 			| SCHEMA
@@ -18093,6 +18450,8 @@ unreserved_keyword:
 			| TEMPORARY
 			| TEXT_P
 			| TIES
+			| TOKEN
+			| TOOL
 			| TOOLS
 			| TRACE
 			| TRANSACTION
@@ -18366,6 +18725,7 @@ bare_label_keyword:
 			| ASSIGNMENT
 			| ASYMMETRIC
 			| AT
+			| ATTESTATION
 			| ATOMIC
 			| ATTACH
 			| ATTRIBUTE
@@ -18464,6 +18824,7 @@ bare_label_keyword:
 			| ENABLE_P
 			| ENCODING
 			| ENCRYPTED
+			| ENDPOINT
 			| END_P
 			| ENUM_P
 			| ERROR_P
@@ -18547,6 +18908,8 @@ bare_label_keyword:
 			| KEEP
 			| KEY
 			| KEYS
+			| KIND
+			| KNOWN
 			| LABEL
 			| LANGUAGE
 			| LARGE_P
@@ -18580,6 +18943,7 @@ bare_label_keyword:
 			| MOVE
 			| NAME_P
 			| NAMES
+			| NAMESPACE
 			| NATIONAL
 			| NATURAL
 			| NCHAR
@@ -18638,6 +19002,7 @@ bare_label_keyword:
 			| PREPARE
 			| PREPARED
 			| PRESERVE
+			| PRINCIPAL
 			| PRIMARY
 			| PRIOR
 			| PRIVILEGES
@@ -18645,6 +19010,7 @@ bare_label_keyword:
 			| PROCEDURE
 			| PROCEDURES
 			| PROGRAM
+			| PROVIDER
 			| PUBLICATION
 			| QUOTE
 			| QUOTES
@@ -18653,6 +19019,7 @@ bare_label_keyword:
 			| REAL
 			| REASSIGN
 			| RECHECK
+			| RECEIPT
 			| RECURSIVE
 			| REF_P
 			| REFERENCES
@@ -18682,6 +19049,8 @@ bare_label_keyword:
 			| ROW
 			| ROWS
 			| RULE
+			| RUN
+			| SANDBOX
 			| SAVEPOINT
 			| SCALAR
 			| SCHEMA
@@ -18743,6 +19112,9 @@ bare_label_keyword:
 			| TIES
 			| TIME
 			| TIMESTAMP
+			| TOKEN
+			| TOOL
+			| TOOLS
 			| TRACE
 			| TRAILING
 			| TRANSACTION

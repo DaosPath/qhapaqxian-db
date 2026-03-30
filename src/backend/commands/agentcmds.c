@@ -108,10 +108,17 @@ CreateAgentCommand(CreateAgentStmt *stmt)
 	memset(nulls, false, sizeof(nulls));
 
 	QxValidateToolList(stmt->tools);
-	namespacepolicyoid = QxEnsureNamespacePolicy(namespaceoid, ownerid,
-												 ownerid,
+	QxValidateRegisteredTools(namespaceoid, stmt->tools, true);
+	if (stmt->policy_name == NULL || stmt->policy_name[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("agent \"%s\" requires an explicit namespace policy", agentname),
+				 errdetail("QhapaqXian no longer auto-creates namespace policies during CREATE AGENT."),
+				 errhint("Create the policy first with CREATE NAMESPACE POLICY ... FOR SCHEMA %s, then reference it with POLICY <name>.",
+						 get_namespace_name(namespaceoid))));
+	namespacepolicyoid = QxLookupNamespacePolicy(namespaceoid,
 												 stmt->policy_name,
-												 stmt->tools);
+												 false);
 	identityoid = QxEnsureOperationalIdentity(namespaceoid, ownerid,
 											  stmt->identity_name,
 											  ownerid,

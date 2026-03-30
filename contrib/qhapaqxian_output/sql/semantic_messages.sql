@@ -2,6 +2,40 @@ SET synchronous_commit = on;
 
 SELECT 'init' FROM pg_create_logical_replication_slot('qx_semantic_slot', 'qhapaqxian_output');
 
+CREATE PROVIDER public.loopback_provider
+  KIND 'loopback'
+  ENDPOINT 'local://qhapaqxian-tool-runner'
+  ATTESTATION ENABLE;
+
+CREATE PRINCIPAL public.search_runner
+  PROGRAM 'qhapaqxian-tool-runner'
+  SANDBOX 'restricted'
+  PROVIDER public.loopback_provider;
+
+CREATE PRINCIPAL public.summarize_runner
+  PROGRAM 'qhapaqxian-tool-runner'
+  SANDBOX 'isolated'
+  PROVIDER public.loopback_provider;
+
+CREATE TOOL public.search
+  HANDLER 'builtin.search'
+  SANDBOX 'restricted'
+  PRINCIPAL 'search_runner'
+  TOKEN COST 11
+  COST 7;
+
+CREATE TOOL public.summarize
+  HANDLER 'builtin.summarize'
+  SANDBOX 'isolated'
+  PRINCIPAL 'summarize_runner'
+  TOKEN COST 13
+  COST 9;
+
+CREATE NAMESPACE POLICY guarded FOR SCHEMA public
+  TOOLS (search, summarize)
+  KNOWN TOOLS ENABLE
+  BUDGET ENABLE;
+
 CREATE AGENT archivist
   IDENTITY imperial
   MODEL 'openai:gpt-5.4'

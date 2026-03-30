@@ -28,6 +28,7 @@ typedef struct QxRuntimeTaskRequest
 	Node	   *input;
 	const char *priority;
 	List	   *authorized_tools;
+	List	   *authorized_tool_oids;
 	int32		budget_tokens;
 	int32		budget_cost;
 	int32		estimated_tokens;

@@ -1,4 +1,66 @@
--- QhapaqXian DB Stage 12 security isolation slice
+-- QhapaqXian DB Stage 19 provider receipt slice
+
+CREATE PROVIDER public.loopback_provider
+  KIND 'loopback'
+  ENDPOINT 'local://qhapaqxian-tool-runner'
+  ATTESTATION ENABLE;
+
+ALTER PROVIDER public.loopback_provider
+  ENDPOINT 'local://qhapaqxian-tool-runner'
+  ATTESTATION ENABLE
+  ENABLE;
+
+CREATE PRINCIPAL public.search_runner
+  PROGRAM 'qhapaqxian-tool-runner'
+  SANDBOX 'restricted'
+  PROVIDER public.loopback_provider;
+
+CREATE PRINCIPAL public.summarize_runner
+  PROGRAM 'qhapaqxian-tool-runner'
+  SANDBOX 'isolated'
+  PROVIDER public.loopback_provider;
+
+ALTER PRINCIPAL public.search_runner
+  PROVIDER public.loopback_provider
+  PROGRAM 'qhapaqxian-tool-runner'
+  SANDBOX 'restricted';
+
+CREATE TOOL public.search
+  HANDLER 'builtin.search'
+  SANDBOX 'restricted'
+  PRINCIPAL 'search_runner'
+  TOKEN COST 9
+  COST 5;
+
+CREATE TOOL public.summarize
+  HANDLER 'builtin.summarize'
+  SANDBOX 'builtin'
+  PRINCIPAL 'summarize_runner'
+  TOKEN COST 13
+  COST 9;
+
+CREATE NAMESPACE POLICY guarded FOR SCHEMA public
+  TOOLS (search)
+  KNOWN TOOLS ENABLE
+  BUDGET ENABLE;
+
+ALTER NAMESPACE POLICY guarded FOR SCHEMA public
+  SET TOOLS (search, summarize)
+  KNOWN TOOLS ENABLE
+  BUDGET ENABLE;
+
+CREATE NAMESPACE POLICY strict FOR SCHEMA public
+  TOOLS (search)
+  KNOWN TOOLS ENABLE
+  BUDGET ENABLE;
+
+ALTER TOOL public.search
+  TOKEN COST 11
+  COST 7;
+
+ALTER TOOL public.summarize
+  SANDBOX 'isolated'
+  POLICY guarded;
 
 CREATE AGENT archivist
   IDENTITY imperial
@@ -22,15 +84,17 @@ SELECT qxagentname::text AS agent_name,
 FROM pg_qx_agent
 WHERE qxagentname = 'archivist';
 
-SELECT qxnamespaceid = 'public'::regnamespace AS binds_public_schema,
+SELECT qxnamespacepolicyname::text AS policy_row_name,
+       qxnamespacepolicy::text AS policy_name,
+       qxnamespaceid = 'public'::regnamespace AS binds_public_schema,
        qxnamespaceowner = (SELECT oid FROM pg_roles WHERE rolname = current_user) AS owned_by_current_user,
        qxnamespaceauthrole = (SELECT oid FROM pg_roles WHERE rolname = current_user) AS auth_role_is_current_user,
        qxrequireknowntools AS require_known_tools,
        qxenforcebudgets AS enforce_budgets,
-       qxnamespacepolicy::text AS policy_name,
        qxallowedtools IS NOT NULL AS has_allowed_tools
 FROM pg_qx_namespace
-WHERE qxnamespaceid = 'public'::regnamespace;
+WHERE qxnamespaceid = 'public'::regnamespace
+ORDER BY qxnamespacepolicyname;
 
 SELECT qxidentityname::text AS identity_name,
        qxidentitynamespace = 'public'::regnamespace AS in_public_schema,
@@ -41,10 +105,33 @@ SELECT qxidentityname::text AS identity_name,
 FROM pg_qx_identity
 WHERE qxidentityname = 'imperial';
 
+SELECT qxprovidername::text AS provider_name,
+       qxprovidernamespace = 'public'::regnamespace AS in_public_schema,
+       qxproviderenabled AS enabled,
+       qxproviderattestationrequired AS attestation_required,
+       qxproviderkind::text AS provider_kind,
+       qxproviderendpoint::text AS provider_endpoint
+FROM pg_qx_provider
+ORDER BY qxprovidername;
+
+SELECT qxprincipalname::text AS principal_name,
+       qxprincipalnamespace = 'public'::regnamespace AS in_public_schema,
+       qxprincipalenabled AS enabled,
+       qxprincipalsandbox::text AS sandbox_name,
+       qxprincipalprogram::text AS program_name,
+       qxprincipalproviderid <> 0 AS has_provider_oid,
+       qxprincipalprovider::text AS provider_name
+FROM pg_qx_principal
+ORDER BY qxprincipalname;
+
 SELECT qxtoolname::text AS tool_name,
        qxtoolenabled AS enabled,
        qxtooltokencost AS token_cost,
-       qxtoolcostunits AS cost_units
+       qxtoolcostunits AS cost_units,
+       qxtoolsandbox::text AS sandbox_name,
+       qxtoolprincipalid <> 0 AS has_principal_oid,
+       qxtoolprincipal::text AS principal_name,
+       qxtoolpolicy IS NULL AS policy_is_null
 FROM pg_qx_tool
 ORDER BY qxtoolname;
 
@@ -249,6 +336,32 @@ FETCH MEMORY FOR AGENT archivist
   LIMIT 5;
 
 SHOW TRACE FOR TASK :qx_task_oid LIMIT 20;
+
+SELECT qxtracename::text AS trace_name,
+       CASE
+         WHEN qxtracename = 'runtime.external_submit' THEN qxtracedetail LIKE '%effective_sandbox=restricted%'
+         WHEN qxtracename = 'runtime.external_resume' THEN qxtracedetail LIKE '%effective_sandbox=isolated%'
+         ELSE false
+       END AS expected_sandbox,
+       qxtracedetail LIKE '%provider=loopback_provider%' AS has_provider,
+       qxtracedetail LIKE '%profile=%' AS has_profile,
+       qxtracedetail LIKE '%env=minimal%' AS minimal_env,
+       qxtracedetail LIKE '%cwd=pg_qx_runtime%' AS runtime_workdir,
+       qxtracedetail LIKE '%process_limit=1%' AS single_process_cap,
+       qxtracedetail LIKE '%timeout_ms=%' AS has_timeout,
+       qxtracedetail LIKE '%receipt_schema=qx.receipt.v1%' AS has_receipt_schema,
+       CASE
+         WHEN qxtracename = 'runtime.external_submit' THEN qxtracedetail LIKE '%receipt_nonce=submit:search:search_runner%'
+         WHEN qxtracename = 'runtime.external_resume' THEN qxtracedetail LIKE '%receipt_nonce=resume:summarize:summarize_runner%'
+         ELSE false
+       END AS expected_receipt_nonce,
+       qxtracedetail LIKE '%attestation=loopback_verified%' AS has_attestation,
+       qxtracedetail LIKE '%launch_mode=profiled_process%' AS has_launch_mode,
+       qxtracedetail LIKE '%restricted_identity=%' AS has_restricted_identity,
+       qxtracedetail LIKE '%wall_ms=%' AS has_wall_time
+FROM pg_qx_trace
+WHERE qxtracename IN ('runtime.external_submit', 'runtime.external_resume')
+ORDER BY oid;
 
 CREATE AGENT tiny_budget
   IDENTITY sentinel

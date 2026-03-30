@@ -224,7 +224,8 @@ qx_plan_run_task(RunTaskStmt *stmt, Oid ownerid)
 								 authorized_tools,
 								 &toolauth);
 	plan->namespace_policy_name = toolauth.namespace_policy_name;
-	plan->authorized_tools = authorized_tools;
+	plan->authorized_tools = toolauth.tool_contracts;
+	plan->authorized_tool_oids = toolauth.tool_oids;
 	plan->budget_tokens = budget.token_limit;
 	plan->budget_cost = budget.cost_limit;
 	plan->estimated_tool_calls = toolauth.tool_count;

@@ -20,6 +20,7 @@
 #include "catalog/pg_type.h"
 #include "commands/tracecmds.h"
 #include "executor/executor.h"
+#include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "tcop/tcopprot.h"
 #include "utils/acl.h"
@@ -34,6 +35,11 @@ static Oid qx_extract_oid_literal(Node *expr, const char *subject,
 static const char *qx_trace_state_label(char state);
 static char *qx_get_trace_text_attr(TupleDesc tupdesc, HeapTuple tup,
 									AttrNumber attnum);
+static char *qx_replace_trace_fragment(const char *source, const char *needle,
+										 const char *replacement);
+static char *qx_replace_trace_numeric_value(const char *source, const char *key,
+											 const char *replacement);
+static char *qx_normalize_trace_detail(const char *detail, Oid taskoid);
 
 static Oid
 qx_extract_oid_literal(Node *expr, const char *subject, const char *detail,
@@ -89,6 +95,117 @@ qx_get_trace_text_attr(TupleDesc tupdesc, HeapTuple tup, AttrNumber attnum)
 		return NULL;
 
 	return TextDatumGetCString(datum);
+}
+
+static char *
+qx_replace_trace_fragment(const char *source, const char *needle,
+						  const char *replacement)
+{
+	const char *cursor;
+	const char *match;
+	char	   *result;
+	char	   *writeptr;
+	size_t		source_len;
+	size_t		needle_len;
+	size_t		replacement_len;
+	size_t		match_count = 0;
+	size_t		result_len;
+
+	if (source == NULL || needle == NULL || replacement == NULL)
+		return NULL;
+
+	needle_len = strlen(needle);
+	if (needle_len == 0)
+		return pstrdup(source);
+
+	replacement_len = strlen(replacement);
+	source_len = strlen(source);
+	cursor = source;
+	while ((match = strstr(cursor, needle)) != NULL)
+	{
+		match_count++;
+		cursor = match + needle_len;
+	}
+
+	if (match_count == 0)
+		return pstrdup(source);
+
+	result_len = source_len + match_count * (replacement_len - needle_len);
+	result = palloc(result_len + 1);
+	writeptr = result;
+	cursor = source;
+	while ((match = strstr(cursor, needle)) != NULL)
+	{
+		size_t		prefix_len = match - cursor;
+
+		memcpy(writeptr, cursor, prefix_len);
+		writeptr += prefix_len;
+		memcpy(writeptr, replacement, replacement_len);
+		writeptr += replacement_len;
+		cursor = match + needle_len;
+	}
+
+	strcpy(writeptr, cursor);
+	return result;
+}
+
+static char *
+qx_replace_trace_numeric_value(const char *source, const char *key,
+							   const char *replacement)
+{
+	const char *match;
+	const char *value_start;
+	const char *value_end;
+	StringInfoData rewritten;
+
+	if (source == NULL || key == NULL || replacement == NULL)
+		return NULL;
+
+	match = strstr(source, key);
+	if (match == NULL)
+		return pstrdup(source);
+
+	value_start = match + strlen(key);
+	value_end = value_start;
+	while (*value_end >= '0' && *value_end <= '9')
+		value_end++;
+
+	if (value_end == value_start)
+		return pstrdup(source);
+
+	initStringInfo(&rewritten);
+	appendBinaryStringInfo(&rewritten, source, match - source);
+	appendStringInfoString(&rewritten, key);
+	appendStringInfoString(&rewritten, replacement);
+	appendStringInfoString(&rewritten, value_end);
+
+	return rewritten.data;
+}
+
+static char *
+qx_normalize_trace_detail(const char *detail, Oid taskoid)
+{
+	char	   *task_fragment;
+	char	   *task_equals_fragment;
+	char	   *normalized;
+	char	   *rewritten;
+	char	   *final_detail;
+
+	if (detail == NULL)
+		return NULL;
+
+	task_fragment = psprintf("task %u", taskoid);
+	task_equals_fragment = psprintf("task=%u", taskoid);
+	normalized = qx_replace_trace_fragment(detail, task_fragment, "task <task>");
+	rewritten = qx_replace_trace_fragment(normalized, task_equals_fragment,
+										  "task=<task>");
+	final_detail = qx_replace_trace_numeric_value(rewritten, "wall_ms=", "<ms>");
+	pfree(task_fragment);
+	pfree(task_equals_fragment);
+	pfree(normalized);
+	pfree(rewritten);
+
+	return final_detail;
 }
 
 TupleDesc
@@ -162,6 +279,7 @@ ShowTraceCommand(ShowTraceStmt *stmt, DestReceiver *dest)
 		bool		nulls[5];
 		char	   *name;
 		char	   *detail;
+		char	   *normalized_detail;
 
 		if (form->qxtracedbid != MyDatabaseId)
 			continue;
@@ -170,6 +288,7 @@ ShowTraceCommand(ShowTraceStmt *stmt, DestReceiver *dest)
 									  Anum_pg_qx_trace_qxtracename);
 		detail = qx_get_trace_text_attr(RelationGetDescr(rel), tup,
 										Anum_pg_qx_trace_qxtracedetail);
+		normalized_detail = qx_normalize_trace_detail(detail, taskoid);
 
 		memset(values, 0, sizeof(values));
 		memset(nulls, false, sizeof(nulls));
@@ -179,8 +298,8 @@ ShowTraceCommand(ShowTraceStmt *stmt, DestReceiver *dest)
 			values[1] = CStringGetTextDatum(name);
 		else
 			nulls[1] = true;
-		if (detail != NULL)
-			values[2] = CStringGetTextDatum(detail);
+		if (normalized_detail != NULL)
+			values[2] = CStringGetTextDatum(normalized_detail);
 		else
 			nulls[2] = true;
 		values[3] = BoolGetDatum(OidIsValid(form->qxtracestepid));
@@ -193,6 +312,8 @@ ShowTraceCommand(ShowTraceStmt *stmt, DestReceiver *dest)
 			pfree(name);
 		if (detail != NULL)
 			pfree(detail);
+		if (normalized_detail != NULL)
+			pfree(normalized_detail);
 
 		if (emitted >= stmt->limit_count)
 			break;

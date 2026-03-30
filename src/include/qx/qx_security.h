@@ -29,18 +29,22 @@ typedef struct QxToolAuthorization
 	int32		tool_token_cost;
 	int32		tool_cost_units;
 	List	   *tool_oids;		/* list of Oid */
+	List	   *tool_contracts;	/* list of String */
 } QxToolAuthorization;
 
-extern Oid QxEnsureNamespacePolicy(Oid namespaceoid, Oid ownerid,
-								   Oid authrole, const char *policy_name,
-								   List *allowed_tools);
+extern Oid QxLookupPrincipal(Oid namespaceoid, const char *principal_name,
+							 bool missing_ok);
+extern Oid QxLookupProvider(Oid namespaceoid, const char *provider_name,
+							bool missing_ok);
 extern Oid QxEnsureOperationalIdentity(Oid namespaceoid, Oid ownerid,
 									   const char *identity_name,
 									   Oid authrole,
 									   const char *policy_name,
 									   List *budget_options);
-extern void QxEnsureToolCatalogEntries(Oid namespaceoid, Oid ownerid,
-									   List *tools);
+extern Oid QxLookupNamespacePolicy(Oid namespaceoid, const char *policy_name,
+								   bool missing_ok);
+extern void QxValidateRegisteredTools(Oid namespaceoid, List *tools,
+									  bool require_enabled);
 extern char *QxIdentityNameById(Oid identityoid);
 extern char *QxNamespacePolicyNameById(Oid policyoid);
 extern void QxBudgetPolicyFromDefList(List *budget_options,

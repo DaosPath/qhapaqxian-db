@@ -83,6 +83,8 @@ CATALOG_HEADERS := \
 	pg_subscription.h \
 	pg_subscription_rel.h \
 	pg_qx_namespace.h \
+	pg_qx_provider.h \
+	pg_qx_principal.h \
 	pg_qx_tool.h \
 	pg_qx_identity.h \
 	pg_qx_agent.h \

@@ -47,6 +47,7 @@
 #include "commands/prepare.h"
 #include "commands/proclang.h"
 #include "commands/publicationcmds.h"
+#include "commands/qxpolicycmds.h"
 #include "commands/schemacmds.h"
 #include "commands/seclabel.h"
 #include "commands/sequence.h"
@@ -151,6 +152,9 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 		case T_AlterObjectDependsStmt:
 		case T_AlterObjectSchemaStmt:
 		case T_AlterOpFamilyStmt:
+		case T_AlterNamespacePolicyStmt:
+		case T_AlterPrincipalStmt:
+		case T_AlterProviderStmt:
 		case T_AlterOperatorStmt:
 		case T_AlterOwnerStmt:
 		case T_AlterPolicyStmt:
@@ -162,6 +166,7 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 		case T_AlterSubscriptionStmt:
 		case T_AlterTSConfigurationStmt:
 		case T_AlterTSDictionaryStmt:
+		case T_AlterToolStmt:
 		case T_AlterTableMoveAllStmt:
 		case T_AlterTableSpaceOptionsStmt:
 		case T_AlterTableStmt:
@@ -181,6 +186,9 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 		case T_CreateForeignServerStmt:
 		case T_CreateForeignTableStmt:
 		case T_CreateFunctionStmt:
+		case T_CreateNamespacePolicyStmt:
+		case T_CreatePrincipalStmt:
+		case T_CreateProviderStmt:
 		case T_CreateOpClassStmt:
 		case T_CreateOpFamilyStmt:
 		case T_CreatePLangStmt:
@@ -195,6 +203,7 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 		case T_CreateSubscriptionStmt:
 		case T_CreateTableAsStmt:
 		case T_CreateTableSpaceStmt:
+		case T_CreateToolStmt:
 		case T_CreateTransformStmt:
 		case T_CreateTrigStmt:
 		case T_CreateUserMappingStmt:
@@ -723,6 +732,38 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 
 		case T_CreateAgentStmt:
 			CreateAgentCommand((CreateAgentStmt *) parsetree);
+			break;
+
+		case T_CreateNamespacePolicyStmt:
+			CreateNamespacePolicyCommand((CreateNamespacePolicyStmt *) parsetree);
+			break;
+
+		case T_AlterNamespacePolicyStmt:
+			AlterNamespacePolicyCommand((AlterNamespacePolicyStmt *) parsetree);
+			break;
+
+		case T_CreateProviderStmt:
+			CreateProviderCommand((CreateProviderStmt *) parsetree);
+			break;
+
+		case T_AlterProviderStmt:
+			AlterProviderCommand((AlterProviderStmt *) parsetree);
+			break;
+
+		case T_CreatePrincipalStmt:
+			CreatePrincipalCommand((CreatePrincipalStmt *) parsetree);
+			break;
+
+		case T_AlterPrincipalStmt:
+			AlterPrincipalCommand((AlterPrincipalStmt *) parsetree);
+			break;
+
+		case T_CreateToolStmt:
+			CreateToolCommand((CreateToolStmt *) parsetree);
+			break;
+
+		case T_AlterToolStmt:
+			AlterToolCommand((AlterToolStmt *) parsetree);
 			break;
 
 		case T_StartSessionStmt:
@@ -2461,6 +2502,38 @@ CreateCommandTag(Node *parsetree)
 			tag = CMDTAG_CREATE_AGENT;
 			break;
 
+		case T_CreateNamespacePolicyStmt:
+			tag = CMDTAG_CREATE_NAMESPACE_POLICY;
+			break;
+
+		case T_AlterNamespacePolicyStmt:
+			tag = CMDTAG_ALTER_NAMESPACE_POLICY;
+			break;
+
+		case T_CreateProviderStmt:
+			tag = CMDTAG_CREATE_PROVIDER;
+			break;
+
+		case T_AlterProviderStmt:
+			tag = CMDTAG_ALTER_PROVIDER;
+			break;
+
+		case T_CreatePrincipalStmt:
+			tag = CMDTAG_CREATE_PRINCIPAL;
+			break;
+
+		case T_AlterPrincipalStmt:
+			tag = CMDTAG_ALTER_PRINCIPAL;
+			break;
+
+		case T_CreateToolStmt:
+			tag = CMDTAG_CREATE_TOOL;
+			break;
+
+		case T_AlterToolStmt:
+			tag = CMDTAG_ALTER_TOOL;
+			break;
+
 		case T_StartSessionStmt:
 			tag = CMDTAG_START_SESSION;
 			break;
@@ -3387,6 +3460,14 @@ GetCommandLogLevel(Node *parsetree)
 			break;
 
 		case T_CreateAgentStmt:
+		case T_CreateNamespacePolicyStmt:
+		case T_AlterNamespacePolicyStmt:
+		case T_CreateProviderStmt:
+		case T_AlterProviderStmt:
+		case T_CreatePrincipalStmt:
+		case T_AlterPrincipalStmt:
+		case T_CreateToolStmt:
+		case T_AlterToolStmt:
 			lev = LOGSTMT_DDL;
 			break;
 

@@ -2652,6 +2652,136 @@ typedef struct CreateAgentStmt
 	ParseLoc	location;
 } CreateAgentStmt;
 
+typedef struct CreateNamespacePolicyStmt
+{
+	pg_node_attr(nodetag_number(483))
+
+	NodeTag		type;
+	char	   *policy_name;
+	char	   *schema_name;
+	RoleSpec   *auth_role;
+	List	   *allowed_tools;	/* list of String */
+	bool		require_known_tools;
+	bool		enforce_budgets;
+	ParseLoc	location;
+} CreateNamespacePolicyStmt;
+
+typedef struct AlterNamespacePolicyStmt
+{
+	pg_node_attr(nodetag_number(484))
+
+	NodeTag		type;
+	char	   *policy_name;
+	char	   *schema_name;
+	RoleSpec   *auth_role;
+	bool		set_auth_role;
+	List	   *allowed_tools;	/* list of String */
+	bool		set_allowed_tools;
+	bool		require_known_tools;
+	bool		set_require_known_tools;
+	bool		enforce_budgets;
+	bool		set_enforce_budgets;
+	ParseLoc	location;
+} AlterNamespacePolicyStmt;
+
+typedef struct CreateProviderStmt
+{
+	pg_node_attr(nodetag_number(489))
+
+	NodeTag		type;
+	RangeVar   *provider_name;
+	char	   *provider_kind;
+	char	   *endpoint_name;
+	bool		attestation_required;
+	ParseLoc	location;
+} CreateProviderStmt;
+
+typedef struct AlterProviderStmt
+{
+	pg_node_attr(nodetag_number(490))
+
+	NodeTag		type;
+	RangeVar   *provider_name;
+	char	   *provider_kind;
+	bool		set_kind;
+	char	   *endpoint_name;
+	bool		set_endpoint;
+	bool		attestation_required;
+	bool		set_attestation_required;
+	bool		enabled;
+	bool		set_enabled;
+	ParseLoc	location;
+} AlterProviderStmt;
+
+typedef struct CreatePrincipalStmt
+{
+	pg_node_attr(nodetag_number(487))
+
+	NodeTag		type;
+	RangeVar   *principal_name;
+	RangeVar   *provider_name;
+	char	   *program_name;
+	char	   *sandbox_name;
+	bool		enabled;
+	ParseLoc	location;
+} CreatePrincipalStmt;
+
+typedef struct AlterPrincipalStmt
+{
+	pg_node_attr(nodetag_number(488))
+
+	NodeTag		type;
+	RangeVar   *principal_name;
+	RangeVar   *provider_name;
+	bool		set_provider;
+	char	   *program_name;
+	bool		set_program;
+	char	   *sandbox_name;
+	bool		set_sandbox;
+	bool		enabled;
+	bool		set_enabled;
+	ParseLoc	location;
+} AlterPrincipalStmt;
+
+typedef struct CreateToolStmt
+{
+	pg_node_attr(nodetag_number(485))
+
+	NodeTag		type;
+	RangeVar   *tool_name;
+	char	   *handler_name;
+	char	   *sandbox_name;
+	char	   *principal_name;
+	char	   *policy_name;
+	int32		token_cost;
+	int32		cost_units;
+	bool		enabled;
+	ParseLoc	location;
+} CreateToolStmt;
+
+typedef struct AlterToolStmt
+{
+	pg_node_attr(nodetag_number(486))
+
+	NodeTag		type;
+	RangeVar   *tool_name;
+	char	   *handler_name;
+	bool		set_handler;
+	char	   *sandbox_name;
+	bool		set_sandbox;
+	char	   *principal_name;
+	bool		set_principal;
+	char	   *policy_name;
+	bool		set_policy;
+	int32		token_cost;
+	bool		set_token_cost;
+	int32		cost_units;
+	bool		set_cost_units;
+	bool		enabled;
+	bool		set_enabled;
+	ParseLoc	location;
+} AlterToolStmt;
+
 typedef struct StartSessionStmt
 {
 	NodeTag		type;

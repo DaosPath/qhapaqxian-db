@@ -17,12 +17,15 @@ CATALOG(pg_qx_tool,9585,QxToolRelationId)
 	NameData	qxtoolname;
 	Oid			qxtoolnamespace BKI_LOOKUP(pg_namespace);
 	Oid			qxtoolowner BKI_LOOKUP(pg_authid);
+	Oid			qxtoolprincipalid BKI_LOOKUP(pg_qx_principal);
 	bool		qxtoolenabled BKI_DEFAULT(t);
 	int32		qxtooltokencost BKI_DEFAULT(8);
 	int32		qxtoolcostunits BKI_DEFAULT(4);
 
 #ifdef CATALOG_VARLEN
 	text		qxtoolhandler BKI_FORCE_NULL;
+	text		qxtoolsandbox BKI_FORCE_NULL;
+	text		qxtoolprincipal BKI_FORCE_NULL;
 	text		qxtoolpolicy BKI_FORCE_NULL;
 #endif
 } FormData_pg_qx_tool;

@@ -20,6 +20,7 @@ subdir('pg_waldump')
 subdir('pg_walsummary')
 subdir('pgbench')
 subdir('pgevent')
+subdir('qhapaqxian_tool_runner')
 subdir('psql')
 if host_system == 'windows'
   subdir('qhapaqxian_launcher')

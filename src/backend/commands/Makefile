@@ -49,6 +49,7 @@ OBJS = \
 	prepare.o \
 	proclang.o \
 	publicationcmds.o \
+	qxpolicycmds.o \
 	schemacmds.o \
 	seclabel.o \
 	sequence.o \

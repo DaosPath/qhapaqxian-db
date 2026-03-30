@@ -37,6 +37,7 @@ backend_sources += files(
   'prepare.c',
   'proclang.c',
   'publicationcmds.c',
+  'qxpolicycmds.c',
   'schemacmds.c',
   'seclabel.c',
   'sequence.c',

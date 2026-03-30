@@ -25,7 +25,12 @@ Current state:
 - Stage 12 security isolation has started with owner-filtered `pg_stat_qx_*` views, direct catalog revocation for non-privileged roles, and regression coverage for non-owner visibility;
 - Stage 13 operational identity and budget-admission work is implemented with native `pg_qx_identity`, identity snapshots in `pg_qx_agent` / `pg_qx_session` / `pg_qx_task`, and planner-side budget rejection before runtime submission;
 - Stage 14 namespace policy, runtime tool authorization, and live budget metering are implemented with `pg_qx_namespace`, task-level authorization snapshots, runtime consumption counters, and expanded `pg_stat_qx_*` visibility;
-- the next execution step is deeper security hardening: first-class namespace-policy DDL, executable tool principals/sandboxes, and budget enforcement tied to real provider execution paths, unless deeper storage is justified by benchmarks.
+- Stage 15 explicit namespace-policy DDL, real tool registry, and historical-debt cleanup are implemented with `CREATE/ALTER NAMESPACE POLICY`, `CREATE/ALTER TOOL`, `pg_qx_tool`-backed authorization/metering, and mandatory explicit policy binding in `CREATE AGENT`;
+- Stage 16 principal-backed execution is implemented with `CREATE/ALTER PRINCIPAL`, `pg_qx_principal`, bindir-scoped external tool runners, resume-safe runtime sequencing, and metering charged from external runner responses;
+- Stage 17 stronger runtime isolation is implemented with OS-level sandbox profiles, minimal-environment execution, sealed runtime workdirs, and launcher-enforced timeout/process ceilings for principal programs;
+- Stage 18 restricted-identity execution is implemented with restricted-token launch for non-`builtin` principals on Windows and parent-observed launch receipts in runtime traces;
+- Stage 19 provider-backed runtime receipts are implemented with native `CREATE/ALTER PROVIDER`, `pg_qx_provider`, principal-to-provider binding, and runtime verification of provider identity, receipt schema, receipt nonce, and attestation mode before budget charging;
+- the next execution step is no longer local provider debt but broader external-runtime scope: remote providers, signed/remote attestation, or container/microVM execution when the product chooses to leave the single-host fork boundary.
 
 Immediate non-goals:
 - renaming all PostgreSQL binaries

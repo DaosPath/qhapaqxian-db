@@ -11,7 +11,7 @@ Naming boundary:
 
 Current bootstrap status:
 - upstream base imported from PostgreSQL `REL_17_STABLE`
-- first fork branch: `codex/bootstrap`
+- first fork branch: `bootstrap`
 - architecture seed stored in `docs/`
 - no global product rebrand of upstream binaries yet
 - Stage 3 agentic parser/AST/utility patches are in-tree
@@ -26,6 +26,11 @@ Current bootstrap status:
 - Stage 12 security-isolation seed is in-tree with owner-filtered `pg_stat_qx_*` views and revoked raw catalog access for non-privileged roles
 - Stage 13 operational identities and planner-side budget snapshots are in-tree with native `pg_qx_identity`, session/task identity linkage, and budget admission checks
 - Stage 14 namespace policy, runtime tool authorization, and live budget metering are in-tree with native `pg_qx_namespace`, task-level authorization snapshots, and runtime consumption counters
+- Stage 15 explicit namespace-policy DDL, real tool registry, and historical-debt cleanup are in-tree with `CREATE/ALTER NAMESPACE POLICY`, `CREATE/ALTER TOOL`, `pg_qx_tool`-backed authorization/metering, and removal of implicit policy creation in `CREATE AGENT`
+- Stage 16 principal-backed external tool execution is in-tree with `CREATE/ALTER PRINCIPAL`, `pg_qx_principal`, out-of-process tool execution, and metering tied to external runner responses
+- Stage 17 stronger runtime sandbox enforcement is in-tree with OS-level launch profiles, minimal-environment principal execution, sealed runtime workdirs, and timeout/process limits enforced by the launcher
+- Stage 18 restricted-identity principal execution is in-tree with restricted-token launch for non-`builtin` principals on Windows and parent-observed launch receipts in runtime traces
+- Stage 19 provider-backed execution receipts are in-tree with `CREATE/ALTER PROVIDER`, `pg_qx_provider`, principal-to-provider binding, and runtime verification of provider identity, receipt schema, receipt nonce, and attestation evidence
 
 What this fork is:
 - a real fork target for an AgentDB
@@ -54,6 +59,11 @@ Immediate fork governance files:
 - `docs/stage-12/README.md`
 - `docs/stage-13/README.md`
 - `docs/stage-14/README.md`
+- `docs/stage-15/README.md`
+- `docs/stage-16/README.md`
+- `docs/stage-17/README.md`
+- `docs/stage-18/README.md`
+- `docs/stage-19/README.md`
 - `docs/bootstrap-plan.md`
 - `docs/rebase-strategy.md`
 - `docs/patch-ledger.md`

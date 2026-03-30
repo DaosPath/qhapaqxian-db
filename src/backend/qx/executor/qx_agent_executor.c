@@ -36,6 +36,7 @@ QxExecuteAgentPlan(const QxAgentPlan *plan)
 				request.input = plan->input;
 				request.priority = plan->priority;
 				request.authorized_tools = plan->authorized_tools;
+				request.authorized_tool_oids = plan->authorized_tool_oids;
 				request.budget_tokens = plan->budget_tokens;
 				request.budget_cost = plan->budget_cost;
 				request.estimated_tokens = plan->estimated_tokens;

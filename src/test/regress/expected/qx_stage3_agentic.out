@@ -1,4 +1,54 @@
--- QhapaqXian DB Stage 12 security isolation slice
+-- QhapaqXian DB Stage 19 provider receipt slice
+CREATE PROVIDER public.loopback_provider
+  KIND 'loopback'
+  ENDPOINT 'local://qhapaqxian-tool-runner'
+  ATTESTATION ENABLE;
+ALTER PROVIDER public.loopback_provider
+  ENDPOINT 'local://qhapaqxian-tool-runner'
+  ATTESTATION ENABLE
+  ENABLE;
+CREATE PRINCIPAL public.search_runner
+  PROGRAM 'qhapaqxian-tool-runner'
+  SANDBOX 'restricted'
+  PROVIDER public.loopback_provider;
+CREATE PRINCIPAL public.summarize_runner
+  PROGRAM 'qhapaqxian-tool-runner'
+  SANDBOX 'isolated'
+  PROVIDER public.loopback_provider;
+ALTER PRINCIPAL public.search_runner
+  PROVIDER public.loopback_provider
+  PROGRAM 'qhapaqxian-tool-runner'
+  SANDBOX 'restricted';
+CREATE TOOL public.search
+  HANDLER 'builtin.search'
+  SANDBOX 'restricted'
+  PRINCIPAL 'search_runner'
+  TOKEN COST 9
+  COST 5;
+CREATE TOOL public.summarize
+  HANDLER 'builtin.summarize'
+  SANDBOX 'builtin'
+  PRINCIPAL 'summarize_runner'
+  TOKEN COST 13
+  COST 9;
+CREATE NAMESPACE POLICY guarded FOR SCHEMA public
+  TOOLS (search)
+  KNOWN TOOLS ENABLE
+  BUDGET ENABLE;
+ALTER NAMESPACE POLICY guarded FOR SCHEMA public
+  SET TOOLS (search, summarize)
+  KNOWN TOOLS ENABLE
+  BUDGET ENABLE;
+CREATE NAMESPACE POLICY strict FOR SCHEMA public
+  TOOLS (search)
+  KNOWN TOOLS ENABLE
+  BUDGET ENABLE;
+ALTER TOOL public.search
+  TOKEN COST 11
+  COST 7;
+ALTER TOOL public.summarize
+  SANDBOX 'isolated'
+  POLICY guarded;
 CREATE AGENT archivist
   IDENTITY imperial
   MODEL 'openai:gpt-5.4'
@@ -24,19 +74,22 @@ WHERE qxagentname = 'archivist';
  archivist  | t                | t                        | t                | t                     | imperial      | openai:gpt-5.4 | episodic       | guarded     | t         | t
 (1 row)
 
-SELECT qxnamespaceid = 'public'::regnamespace AS binds_public_schema,
+SELECT qxnamespacepolicyname::text AS policy_row_name,
+       qxnamespacepolicy::text AS policy_name,
+       qxnamespaceid = 'public'::regnamespace AS binds_public_schema,
        qxnamespaceowner = (SELECT oid FROM pg_roles WHERE rolname = current_user) AS owned_by_current_user,
        qxnamespaceauthrole = (SELECT oid FROM pg_roles WHERE rolname = current_user) AS auth_role_is_current_user,
        qxrequireknowntools AS require_known_tools,
        qxenforcebudgets AS enforce_budgets,
-       qxnamespacepolicy::text AS policy_name,
        qxallowedtools IS NOT NULL AS has_allowed_tools
 FROM pg_qx_namespace
-WHERE qxnamespaceid = 'public'::regnamespace;
- binds_public_schema | owned_by_current_user | auth_role_is_current_user | require_known_tools | enforce_budgets | policy_name | has_allowed_tools 
----------------------+-----------------------+---------------------------+---------------------+-----------------+-------------+-------------------
- t                   | t                     | t                         | t                   | t               | guarded     | t
-(1 row)
+WHERE qxnamespaceid = 'public'::regnamespace
+ORDER BY qxnamespacepolicyname;
+ policy_row_name | policy_name | binds_public_schema | owned_by_current_user | auth_role_is_current_user | require_known_tools | enforce_budgets | has_allowed_tools 
+-----------------+-------------+---------------------+-----------------------+---------------------------+---------------------+-----------------+-------------------
+ guarded         | guarded     | t                   | t                     | t                         | t                   | t               | t
+ strict          | strict      | t                   | t                     | t                         | t                   | t               | t
+(2 rows)
 
 SELECT qxidentityname::text AS identity_name,
        qxidentitynamespace = 'public'::regnamespace AS in_public_schema,
@@ -51,15 +104,49 @@ WHERE qxidentityname = 'imperial';
  imperial      | t                | t                     | t                         | guarded     | t
 (1 row)
 
+SELECT qxprovidername::text AS provider_name,
+       qxprovidernamespace = 'public'::regnamespace AS in_public_schema,
+       qxproviderenabled AS enabled,
+       qxproviderattestationrequired AS attestation_required,
+       qxproviderkind::text AS provider_kind,
+       qxproviderendpoint::text AS provider_endpoint
+FROM pg_qx_provider
+ORDER BY qxprovidername;
+   provider_name   | in_public_schema | enabled | attestation_required | provider_kind |       provider_endpoint        
+-------------------+------------------+---------+----------------------+---------------+--------------------------------
+ loopback_provider | t                | t       | t                    | loopback      | local://qhapaqxian-tool-runner
+(1 row)
+
+SELECT qxprincipalname::text AS principal_name,
+       qxprincipalnamespace = 'public'::regnamespace AS in_public_schema,
+       qxprincipalenabled AS enabled,
+       qxprincipalsandbox::text AS sandbox_name,
+       qxprincipalprogram::text AS program_name,
+       qxprincipalproviderid <> 0 AS has_provider_oid,
+       qxprincipalprovider::text AS provider_name
+FROM pg_qx_principal
+ORDER BY qxprincipalname;
+  principal_name  | in_public_schema | enabled | sandbox_name |      program_name      | has_provider_oid |   provider_name   
+------------------+------------------+---------+--------------+------------------------+------------------+-------------------
+ search_runner    | t                | t       | restricted   | qhapaqxian-tool-runner | t                | loopback_provider
+ summarize_runner | t                | t       | isolated     | qhapaqxian-tool-runner | t                | loopback_provider
+(2 rows)
+
 SELECT qxtoolname::text AS tool_name,
        qxtoolenabled AS enabled,
        qxtooltokencost AS token_cost,
-       qxtoolcostunits AS cost_units
+       qxtoolcostunits AS cost_units,
+       qxtoolsandbox::text AS sandbox_name,
+       qxtoolprincipalid <> 0 AS has_principal_oid,
+       qxtoolprincipal::text AS principal_name,
+       qxtoolpolicy IS NULL AS policy_is_null
 FROM pg_qx_tool
 ORDER BY qxtoolname;
- tool_name | enabled | token_cost | cost_units 
------------+---------+------------+------------
-(0 rows)
+ tool_name | enabled | token_cost | cost_units | sandbox_name | has_principal_oid |  principal_name  | policy_is_null 
+-----------+---------+------------+------------+--------------+-------------------+------------------+----------------
+ search    | t       |         11 |          7 | restricted   | t                 | search_runner    | t
+ summarize | t       |         13 |          9 | isolated     | t                 | summarize_runner | f
+(2 rows)
 
 CREATE AGENT archivist
   IDENTITY imperial;
@@ -113,8 +200,8 @@ EXPLAIN AGENT RUN TASK summarize_docs IN SESSION :qx_session_oid
   GOAL 'summarize docs'
   INPUT jsonb_build_object('topic', 'parser')
   PRIORITY high;
-                                              AGENT PLAN                                              
-------------------------------------------------------------------------------------------------------
+                                                                                                                                                                                                                                                                                                                     AGENT PLAN                                                                                                                                                                                                                                                                                                                      
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  AgentPlan v1
    Command: RUN TASK
    Goal: summarize docs
@@ -130,17 +217,17 @@ EXPLAIN AGENT RUN TASK summarize_docs IN SESSION :qx_session_oid
    Resumable: false
    Budget Tokens: 4096
    Budget Cost: 128
-   Estimated Tokens: 72
-   Estimated Cost: 71
+   Estimated Tokens: 80
+   Estimated Cost: 79
    Estimated Tool Calls: 2
-   Authorized Tool Budget: tokens=16 cost=8
-   Authorized Tools: search, summarize
+   Authorized Tool Budget: tokens=24 cost=16
+   Authorized Tools: tool=search;handler=builtin.search;tool_sandbox=restricted;principal=search_runner;principal_sandbox=restricted;program=qhapaqxian-tool-runner;provider=loopback_provider;provider_kind=loopback;provider_endpoint=local://qhapaqxian-tool-runner;provider_attestation=required;receipt_schema=qx.receipt.v1, tool=summarize;handler=builtin.summarize;tool_sandbox=isolated;principal=summarize_runner;principal_sandbox=isolated;program=qhapaqxian-tool-runner;provider=loopback_provider;provider_kind=loopback;provider_endpoint=local://qhapaqxian-tool-runner;provider_attestation=required;receipt_schema=qx.receipt.v1
    Steps:
      1. validate_session [cost=8, checkpoint=false, retry=false]
         check session existence, ownership, database, and active state
      2. snapshot_identity_policy [cost=11, checkpoint=false, retry=false]
         freeze agent identity and policy/budget context for the attempt
-     3. authorize_tools [cost=8, checkpoint=false, retry=false]
+     3. authorize_tools [cost=16, checkpoint=false, retry=false]
         validate the task tool allowlist against namespace policy and registered tool catalog entries
      4. enqueue_attempt [cost=17, checkpoint=false, retry=true]
         persist the task shell and open attempt 1 in the embedded runtime
@@ -182,7 +269,7 @@ FROM pg_qx_task
 ORDER BY oid;
    task_name    |      goal      | priority | state | linked_policy | linked_identity | has_input | budget_tokens | budget_cost | authorized_tool_tokens | authorized_tool_cost | estimated_tokens | estimated_cost | consumed_tokens | consumed_cost | has_authorized_tools | linked_session | has_attempt | has_checkpoint 
 ----------------+----------------+----------+-------+---------------+-----------------+-----------+---------------+-------------+------------------------+----------------------+------------------+----------------+-----------------+---------------+----------------------+----------------+-------------+----------------
- summarize_docs | summarize docs | high     | k     | t             | t               | t         |          4096 |         128 |                     16 |                    8 |               72 |             71 |              60 |            52 | t                    | t              | t           | t
+ summarize_docs | summarize docs | high     | k     | t             | t               | t         |          4096 |         128 |                     24 |                   16 |               80 |             79 |             114 |            60 | t                    | t              | t           | t
 (1 row)
 
 SELECT qxattemptseqno AS seqno,
@@ -204,10 +291,11 @@ ORDER BY qxstepseqno;
  seqno |         step_name         | state 
 -------+---------------------------+-------
      1 | stage8.scheduler_admit    | c
-     2 | stage14.authorize_tools   | c
-     3 | stage8.capture_input      | c
-     4 | stage8.checkpoint_barrier | c
-(4 rows)
+     2 | stage15.authorize_tools   | c
+     3 | stage16.external_submit   | c
+     4 | stage8.capture_input      | c
+     5 | stage8.checkpoint_barrier | c
+(5 rows)
 
 SELECT qxeventkind::text AS event_kind,
        qxeventlsn <> '0/0'::pg_lsn AS has_semantic_lsn,
@@ -222,10 +310,11 @@ ORDER BY oid;
  TASK_QUEUED           | t                | t             | t           | f
  TASK_DISPATCHED       | t                | t             | t           | t
  TASK_TOOLS_AUTHORIZED | t                | t             | t           | t
+ TASK_TOOL_EXECUTED    | t                | t             | t           | t
  TASK_INPUT_CAPTURED   | t                | t             | t           | t
  TASK_CHECKPOINTED     | t                | t             | t           | t
  TASK_READY_FOR_RESUME | t                | t             | t           | f
-(7 rows)
+(8 rows)
 
 SELECT qxtracename::text AS trace_name,
        qxtracestate AS trace_state,
@@ -240,10 +329,11 @@ ORDER BY oid;
  runtime.queue           | c           | t                | t             | t
  runtime.dispatch        | c           | t                | t             | t
  runtime.authorize_tools | c           | t                | t             | t
+ runtime.external_submit | c           | t                | t             | t
  runtime.capture_input   | c           | t                | t             | t
  runtime.checkpoint      | c           | t                | t             | t
  runtime.pause           | c           | t                | t             | t
-(7 rows)
+(8 rows)
 
 SELECT qxcheckpointlabel::text AS checkpoint_label,
        qxcheckpointstate AS checkpoint_state,
@@ -258,12 +348,12 @@ FROM pg_qx_checkpoint
 ORDER BY oid;
    checkpoint_label   | checkpoint_state | task_state | has_semantic_lsn | lsn_monotonic | next_step | linked_attempt | linked_task | has_data 
 ----------------------+------------------+------------+------------------+---------------+-----------+----------------+-------------+----------
- stage8.after_capture | d                | k          | t                | t             |         5 | t              | t           | t
+ stage8.after_capture | d                | k          | t                | t             |         6 | t              | t           | t
 (1 row)
 
 EXPLAIN AGENT RESUME TASK :qx_task_oid FROM CHECKPOINT 'stage8.after_capture';
-                                   AGENT PLAN                                    
----------------------------------------------------------------------------------
+                                                                                                                                                                                                                                                                                                                     AGENT PLAN                                                                                                                                                                                                                                                                                                                      
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  AgentPlan v1
    Command: RESUME TASK
    Identity: imperial
@@ -276,11 +366,11 @@ EXPLAIN AGENT RESUME TASK :qx_task_oid FROM CHECKPOINT 'stage8.after_capture';
    Resumable: true
    Budget Tokens: 4096
    Budget Cost: 128
-   Estimated Tokens: 72
-   Estimated Cost: 125
+   Estimated Tokens: 80
+   Estimated Cost: 133
    Estimated Tool Calls: 2
-   Authorized Tool Budget: tokens=16 cost=8
-   Authorized Tools: search, summarize
+   Authorized Tool Budget: tokens=24 cost=16
+   Authorized Tools: tool=search;handler=builtin.search;tool_sandbox=restricted;principal=search_runner;principal_sandbox=restricted;program=qhapaqxian-tool-runner;provider=loopback_provider;provider_kind=loopback;provider_endpoint=local://qhapaqxian-tool-runner;provider_attestation=required;receipt_schema=qx.receipt.v1, tool=summarize;handler=builtin.summarize;tool_sandbox=isolated;principal=summarize_runner;principal_sandbox=isolated;program=qhapaqxian-tool-runner;provider=loopback_provider;provider_kind=loopback;provider_endpoint=local://qhapaqxian-tool-runner;provider_attestation=required;receipt_schema=qx.receipt.v1
    Steps:
      1. validate_task [cost=7, checkpoint=false, retry=false]
         check task visibility, ownership, and checkpointed state
@@ -305,7 +395,7 @@ FROM pg_qx_task
 ORDER BY oid;
    task_name    | state | consumed_tokens | consumed_cost | has_attempt | has_checkpoint 
 ----------------+-------+-----------------+---------------+-------------+----------------
- summarize_docs | c     |              72 |            77 | t           | t
+ summarize_docs | c     |             217 |           107 | t           | t
 (1 row)
 
 SELECT qxattemptseqno AS seqno,
@@ -328,12 +418,14 @@ ORDER BY qxstepseqno;
  seqno |         step_name         | state 
 -------+---------------------------+-------
      1 | stage8.scheduler_admit    | c
-     2 | stage14.authorize_tools   | c
-     3 | stage8.capture_input      | c
-     4 | stage8.checkpoint_barrier | c
-     5 | stage8.resume_dispatch    | c
-     6 | stage8.complete           | c
-(6 rows)
+     2 | stage15.authorize_tools   | c
+     3 | stage16.external_submit   | c
+     4 | stage8.capture_input      | c
+     5 | stage8.checkpoint_barrier | c
+     6 | stage8.resume_dispatch    | c
+     7 | stage16.external_resume   | c
+     8 | stage8.complete           | c
+(8 rows)
 
 SELECT qxeventkind::text AS event_kind,
        qxeventlsn <> '0/0'::pg_lsn AS has_semantic_lsn,
@@ -348,14 +440,16 @@ ORDER BY oid;
  TASK_QUEUED            | t                | t             | t           | f
  TASK_DISPATCHED        | t                | t             | t           | t
  TASK_TOOLS_AUTHORIZED  | t                | t             | t           | t
+ TASK_TOOL_EXECUTED     | t                | t             | t           | t
  TASK_INPUT_CAPTURED    | t                | t             | t           | t
  TASK_CHECKPOINTED      | t                | t             | t           | t
  TASK_READY_FOR_RESUME  | t                | t             | t           | f
  TASK_RESUMED           | t                | t             | t           | f
  TASK_RESUME_DISPATCHED | t                | t             | t           | t
+ TASK_TOOL_EXECUTED     | t                | t             | t           | t
  TASK_CHECKPOINTED      | t                | t             | t           | t
  TASK_COMPLETED         | t                | t             | t           | f
-(11 rows)
+(13 rows)
 
 SELECT qxtracename::text AS trace_name,
        qxtracestate AS trace_state,
@@ -370,14 +464,16 @@ ORDER BY oid;
  runtime.queue            | c           | t                | t             | t
  runtime.dispatch         | c           | t                | t             | t
  runtime.authorize_tools  | c           | t                | t             | t
+ runtime.external_submit  | c           | t                | t             | t
  runtime.capture_input    | c           | t                | t             | t
  runtime.checkpoint       | c           | t                | t             | t
  runtime.pause            | c           | t                | t             | t
  runtime.resume           | c           | t                | t             | t
  runtime.resume_dispatch  | c           | t                | t             | t
+ runtime.external_resume  | c           | t                | t             | t
  runtime.final_checkpoint | c           | t                | t             | t
  runtime.complete         | c           | t                | t             | t
-(11 rows)
+(13 rows)
 
 SELECT qxcheckpointlabel::text AS checkpoint_label,
        qxcheckpointstate AS checkpoint_state,
@@ -390,7 +486,7 @@ FROM pg_qx_checkpoint
 ORDER BY oid;
    checkpoint_label   | checkpoint_state | task_state | has_semantic_lsn | lsn_monotonic | next_step | linked_attempt 
 ----------------------+------------------+------------+------------------+---------------+-----------+----------------
- stage8.after_capture | d                | k          | t                | t             |         5 | t
+ stage8.after_capture | d                | k          | t                | t             |         6 | t
  stage8.final         | d                | c          | t                | t             |         0 | t
 (2 rows)
 
@@ -437,19 +533,52 @@ FETCH MEMORY FOR AGENT archivist
 (1 row)
 
 SHOW TRACE FOR TASK :qx_task_oid LIMIT 20;
- trace_state |        trace_name        |                                                 trace_detail                                                 | has_step | has_semantic_lsn 
--------------+--------------------------+--------------------------------------------------------------------------------------------------------------+----------+------------------
- closed      | runtime.queue            | goal=summarize docs;priority=high                                                                            | f        | t
- closed      | runtime.dispatch         | attempt_opened;state=r;identity=imperial;namespace_policy=guarded;tools=2;budget_cost=128;budget_tokens=4096 | t        | t
- closed      | runtime.authorize_tools  | namespace_policy=guarded;authorized_tools=2;tool_tokens=16;tool_cost=8                                       | t        | t
- closed      | runtime.capture_input    | input_present=true;task_name=summarize_docs                                                                  | t        | t
- closed      | runtime.checkpoint       | checkpoint=stage8.after_capture;task_state=k                                                                 | t        | t
- closed      | runtime.pause            | Task paused at durable checkpoint and awaits RESUME TASK                                                     | f        | t
- closed      | runtime.resume           | checkpoint=stage8.after_capture;resume_requested;next_step=5                                                 | f        | t
- closed      | runtime.resume_dispatch  | resume_from=stage8.after_capture;state=r                                                                     | t        | t
- closed      | runtime.final_checkpoint | checkpoint=stage8.final;task_state=c                                                                         | t        | t
- closed      | runtime.complete         | Task completed after resumable attempt handoff                                                               | f        | t
-(10 rows)
+ trace_state |        trace_name        |                                                                                                                                                                                                                              trace_detail                                                                                                                                                                                                                              | has_step | has_semantic_lsn 
+-------------+--------------------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------+------------------
+ closed      | runtime.queue            | goal=summarize docs;priority=high                                                                                                                                                                                                                                                                                                                                                                                                                                      | f        | t
+ closed      | runtime.dispatch         | attempt_opened;state=r;identity=imperial;namespace_policy=guarded;tools=2;budget_cost=128;budget_tokens=4096                                                                                                                                                                                                                                                                                                                                                           | t        | t
+ closed      | runtime.authorize_tools  | namespace_policy=guarded;authorized_tools=2;tool_tokens=24;tool_cost=16                                                                                                                                                                                                                                                                                                                                                                                                | t        | t
+ closed      | runtime.external_submit  | phase=submit;tool=search;principal=search_runner;provider=loopback_provider;effective_sandbox=restricted;profile=restricted;env=minimal;cwd=pg_qx_runtime;process_limit=1;timeout_ms=2000;receipt_schema=qx.receipt.v1;receipt_nonce=submit:search:search_runner;attestation=loopback_verified;tokens=70;cost=16;detail=tool search via search_runner for submit phase on task <task>;launch_mode=profiled_process;restricted_identity=true;wall_ms=<ms>               | t        | t
+ closed      | runtime.capture_input    | input_present=true;task_name=summarize_docs                                                                                                                                                                                                                                                                                                                                                                                                                            | t        | t
+ closed      | runtime.checkpoint       | checkpoint=stage8.after_capture;task_state=k                                                                                                                                                                                                                                                                                                                                                                                                                           | t        | t
+ closed      | runtime.pause            | Task paused at durable checkpoint and awaits RESUME TASK                                                                                                                                                                                                                                                                                                                                                                                                               | f        | t
+ closed      | runtime.resume           | checkpoint=stage8.after_capture;resume_requested;next_step=6                                                                                                                                                                                                                                                                                                                                                                                                           | f        | t
+ closed      | runtime.resume_dispatch  | resume_from=stage8.after_capture;state=r                                                                                                                                                                                                                                                                                                                                                                                                                               | t        | t
+ closed      | runtime.external_resume  | phase=resume;tool=summarize;principal=summarize_runner;provider=loopback_provider;effective_sandbox=isolated;profile=isolated;env=minimal;cwd=pg_qx_runtime;process_limit=1;timeout_ms=1200;receipt_schema=qx.receipt.v1;receipt_nonce=resume:summarize:summarize_runner;attestation=loopback_verified;tokens=91;cost=22;detail=tool summarize via summarize_runner for resume phase on task <task>;launch_mode=profiled_process;restricted_identity=true;wall_ms=<ms> | t        | t
+ closed      | runtime.final_checkpoint | checkpoint=stage8.final;task_state=c                                                                                                                                                                                                                                                                                                                                                                                                                                   | t        | t
+ closed      | runtime.complete         | Task completed after resumable attempt handoff                                                                                                                                                                                                                                                                                                                                                                                                                         | f        | t
+(12 rows)
+
+SELECT qxtracename::text AS trace_name,
+       CASE
+         WHEN qxtracename = 'runtime.external_submit' THEN qxtracedetail LIKE '%effective_sandbox=restricted%'
+         WHEN qxtracename = 'runtime.external_resume' THEN qxtracedetail LIKE '%effective_sandbox=isolated%'
+         ELSE false
+       END AS expected_sandbox,
+       qxtracedetail LIKE '%provider=loopback_provider%' AS has_provider,
+       qxtracedetail LIKE '%profile=%' AS has_profile,
+       qxtracedetail LIKE '%env=minimal%' AS minimal_env,
+       qxtracedetail LIKE '%cwd=pg_qx_runtime%' AS runtime_workdir,
+       qxtracedetail LIKE '%process_limit=1%' AS single_process_cap,
+       qxtracedetail LIKE '%timeout_ms=%' AS has_timeout,
+       qxtracedetail LIKE '%receipt_schema=qx.receipt.v1%' AS has_receipt_schema,
+       CASE
+         WHEN qxtracename = 'runtime.external_submit' THEN qxtracedetail LIKE '%receipt_nonce=submit:search:search_runner%'
+         WHEN qxtracename = 'runtime.external_resume' THEN qxtracedetail LIKE '%receipt_nonce=resume:summarize:summarize_runner%'
+         ELSE false
+       END AS expected_receipt_nonce,
+       qxtracedetail LIKE '%attestation=loopback_verified%' AS has_attestation,
+       qxtracedetail LIKE '%launch_mode=profiled_process%' AS has_launch_mode,
+       qxtracedetail LIKE '%restricted_identity=%' AS has_restricted_identity,
+       qxtracedetail LIKE '%wall_ms=%' AS has_wall_time
+FROM pg_qx_trace
+WHERE qxtracename IN ('runtime.external_submit', 'runtime.external_resume')
+ORDER BY oid;
+       trace_name        | expected_sandbox | has_provider | has_profile | minimal_env | runtime_workdir | single_process_cap | has_timeout | has_receipt_schema | expected_receipt_nonce | has_attestation | has_launch_mode | has_restricted_identity | has_wall_time 
+-------------------------+------------------+--------------+-------------+-------------+-----------------+--------------------+-------------+--------------------+------------------------+-----------------+-----------------+-------------------------+---------------
+ runtime.external_submit | t                | t            | t           | t           | t               | t                  | t           | t                  | t                      | t               | t               | t                       | t
+ runtime.external_resume | t                | t            | t           | t           | t               | t                  | t           | t                  | t                      | t               | t               | t                       | t
+(2 rows)
 
 CREATE AGENT tiny_budget
   IDENTITY sentinel
@@ -480,7 +609,7 @@ ORDER BY agent_name;
  agent_name  | namespace_policy_name | active_session_count | task_count | completed_task_count | memory_count 
 -------------+-----------------------+----------------------+------------+----------------------+--------------
  archivist   | guarded               |                    1 |          1 |                    1 |            2
- tiny_budget | guarded               |                    1 |          0 |                    0 |            0
+ tiny_budget | strict                |                    1 |          0 |                    0 |            0
 (2 rows)
 
 SELECT session_oid = :qx_session_oid AS session_match,
@@ -497,8 +626,8 @@ FROM pg_stat_qx_sessions
 ORDER BY session_oid;
  session_match | agent_name  | identity_name | namespace_policy_name | session_status | has_context | task_count | completed_task_count | memory_count | trace_count 
 ---------------+-------------+---------------+-----------------------+----------------+-------------+------------+----------------------+--------------+-------------
- t             | archivist   | imperial      | guarded               | active         | t           |          1 |                    1 |            2 |          11
- f             | tiny_budget | sentinel      | guarded               | active         | f           |          0 |                    0 |            0 |           1
+ t             | archivist   | imperial      | guarded               | active         | t           |          1 |                    1 |            2 |          13
+ f             | tiny_budget | sentinel      | strict                | active         | f           |          0 |                    0 |            0 |           1
 (2 rows)
 
 SELECT task_oid = :qx_task_oid AS task_match,
@@ -524,7 +653,7 @@ FROM pg_stat_qx_tasks
 ORDER BY task_oid;
  task_match | agent_name | identity_name | namespace_policy_name |   task_name    | task_state | budget_tokens | budget_cost | consumed_tokens | consumed_cost | remaining_tokens | remaining_cost | has_attempt | has_checkpoint | attempt_count | step_count | event_count | trace_count | checkpoint_count 
 ------------+------------+---------------+-----------------------+----------------+------------+---------------+-------------+-----------------+---------------+------------------+----------------+-------------+----------------+---------------+------------+-------------+-------------+------------------
- t          | archivist  | imperial      | guarded               | summarize_docs | completed  |          4096 |         128 |              72 |            77 |             4024 |             51 | t           | t              |             2 |          6 |          10 |          10 |                2
+ t          | archivist  | imperial      | guarded               | summarize_docs | completed  |          4096 |         128 |             217 |           107 |             3879 |             21 | t           | t              |             2 |          8 |          12 |          12 |                2
 (1 row)
 
 CREATE ROLE qx_observer LOGIN;
