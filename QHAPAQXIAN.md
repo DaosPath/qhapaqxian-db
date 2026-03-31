@@ -4,6 +4,7 @@ This file defines the first practical fork boundary for QhapaqXian DB.
 
 Implementation status note:
 - the canonical current-state ledger now lives in `STATUS.md`
+- the canonical documentation map now lives in `docs/README.md`
 - this file should describe fork boundary and governance, not duplicate the full stage ledger
 
 Product naming:
@@ -28,14 +29,4 @@ What this repository is not aiming for:
 - a middleware runtime that leaves the engine unchanged
 - a product marketed as PostgreSQL under another logo
 
-Current implementation boundary:
-- imported upstream tree
-- fork documentation and governance files
-- CI bootstrap for source build verification
-- QhapaqXian subsystem directory scaffold under `src/backend/qx` and `src/include/qx`
-
-Next implementation boundary:
-- parser and AST scaffolding
-- agent catalogs
-- runtime launcher/scheduler bootstrap
-- crash-safe vertical slice
+Implementation status is tracked in `STATUS.md`; the document tree is mapped in `docs/README.md`; this file should not duplicate the stage ledger.

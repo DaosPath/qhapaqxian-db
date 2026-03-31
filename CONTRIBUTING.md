@@ -6,7 +6,7 @@ QhapaqXian DB is a fork of PostgreSQL with engine-owned agentic subsystems. Cont
 
 ## Branching
 
-- use topic branches from `codex/bootstrap` or the current maintained integration branch;
+- use topic branches from `bootstrap` or the current maintained integration branch;
 - keep branch names under the `codex/` prefix for local Codex-driven work;
 - do not force-push shared integration branches.
 

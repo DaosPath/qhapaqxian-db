@@ -1,44 +1,29 @@
 QhapaqXian DB
 =============
 
-This repository is the bootstrap fork for QhapaqXian DB.
+Repository entrypoint for the QhapaqXian DB fork.
 
-Canonical current-state tracker:
-- `STATUS.md`
+Canonical docs, in order:
+- [STATUS.md](STATUS.md) - current implementation state and stage matrix
+- [docs/README.md](docs/README.md) - canonical documentation map
+- [QHAPAQXIAN.md](QHAPAQXIAN.md) - fork boundary, naming, and governance
+- [docs/qhapaqxian-architectural-blueprint.md](docs/qhapaqxian-architectural-blueprint.md) - target architecture and thesis
+- [docs/stage-template.md](docs/stage-template.md) - canonical stage README shape
+- [docs/stage-32/README.md](docs/stage-32/README.md) - latest landed stage-local contract
 
-Naming boundary:
-- brand: QhapaqXian
-- product: QhapaqXian DB
-- engine/core: QhapaqXian Engine
-- repository: qhapaqxian-db
+Stage docs worth checking early:
+- [docs/stage-2/README.md](docs/stage-2/README.md) - language contract and parser-readiness boundary
+- [docs/stage-4/README.md](docs/stage-4/README.md) - first-class engine catalogs for agent state
 
-Current bootstrap status:
+Short summary:
 - upstream base imported from PostgreSQL `REL_17_STABLE`
-- first fork branch: `bootstrap`
-- architecture seed stored in `docs/`
-- no global product rebrand of upstream binaries yet
-- Stage 3 agentic parser/AST/utility patches are in-tree
-- Stage 4 native agent/session/task catalogs are in-tree
-- Stage 5 single-node task/event/trace/checkpoint slice is in-tree
-- Stage 6 embedded runtime boundary is in-tree under `src/backend/qx`
-- Stage 7 resumable runtime semantics are in-tree with `pg_qx_attempt` and `RESUME TASK`
-- Stage 8 planner/executor boundary is in-tree with `QxAgentPlan` and `EXPLAIN AGENT`
-- Stage 9 semantic WAL/logical-message boundary is in-tree with persisted semantic `LSN`s and the `qhapaqxian_output` logical decoder
-- Stage 10 engine-owned memory storage and operator-facing `REMEMBER` / `FETCH MEMORY` / `SHOW TRACE` commands are in-tree
-- Stage 11 compatibility and operability surface is in-tree with `pg_stat_qx_*` system views and hardened regression coverage
-- Stage 12 security-isolation seed is in-tree with owner-filtered `pg_stat_qx_*` views and revoked raw catalog access for non-privileged roles
-- Stage 13 operational identities and planner-side budget snapshots are in-tree with native `pg_qx_identity`, session/task identity linkage, and budget admission checks
-- Stage 14 namespace policy, runtime tool authorization, and live budget metering are in-tree with native `pg_qx_namespace`, task-level authorization snapshots, and runtime consumption counters
-- Stage 15 explicit namespace-policy DDL, real tool registry, and historical-debt cleanup are in-tree with `CREATE/ALTER NAMESPACE POLICY`, `CREATE/ALTER TOOL`, `pg_qx_tool`-backed authorization/metering, and removal of implicit policy creation in `CREATE AGENT`
-- Stage 16 principal-backed external tool execution is in-tree with `CREATE/ALTER PRINCIPAL`, `pg_qx_principal`, out-of-process tool execution, and metering tied to external runner responses
-- Stage 17 stronger runtime sandbox enforcement is in-tree with OS-level launch profiles, minimal-environment principal execution, sealed runtime workdirs, and timeout/process limits enforced by the launcher
-- Stage 18 restricted-identity principal execution is in-tree with restricted-token launch for non-`builtin` principals on Windows and parent-observed launch receipts in runtime traces
-- Stage 19 provider-backed execution receipts are in-tree with `CREATE/ALTER PROVIDER`, `pg_qx_provider`, principal-to-provider binding, and runtime verification of provider identity, receipt schema, receipt nonce, and attestation evidence
-- Stage 20 brokered remote providers and HMAC-signed receipts are in-tree with `remote://` providers, provider-scoped receipt keys, signed receipt verification in runtime, and operator-visible receipt algorithm/signature evidence
-- Stage 21 asymmetric remote receipts are in-tree with provider-side `ed25519` verification, principal receipt signers, OpenSSL-backed runtime signature checks, and sealed Windows runner packaging that stages required runtime DLLs into `bindir`
-- Stage 22 brokered container and microVM principal classes are in-tree with `container://` / `microvm://` providers, principal runtime-class DDL, runtime/provider compatibility enforcement, and receipt payloads that carry verified principal-runtime identity
+- active fork branch is `bootstrap`
+- product identity is QhapaqXian DB, not PostgreSQL as a product name
+- staged implementation work is tracked in `STATUS.md`, not duplicated here
+- the documentation tree is mapped in `docs/README.md`
+- stage 2 language contract and stage 4 engine-catalog docs now exist to close the historical bootstrap-doc gap
 
-What this fork is:
+What this repository is:
 - a real fork target for an AgentDB
 - not a PostgreSQL extension
 - not a middleware-only orchestration layer
@@ -50,59 +35,4 @@ What stays intentionally close to upstream in this bootstrap:
 - test harnesses
 - core storage and replication behavior
 
-Immediate fork governance files:
-- `QHAPAQXIAN.md`
-- `docs/qhapaqxian-architectural-blueprint.md`
-- `docs/stage-2/README.md`
-- `docs/stage-3/README.md`
-- `docs/stage-5/README.md`
-- `docs/stage-6/README.md`
-- `docs/stage-7/README.md`
-- `docs/stage-8/README.md`
-- `docs/stage-9/README.md`
-- `docs/stage-10/README.md`
-- `docs/stage-11/README.md`
-- `docs/stage-12/README.md`
-- `docs/stage-13/README.md`
-- `docs/stage-14/README.md`
-- `docs/stage-15/README.md`
-- `docs/stage-16/README.md`
-- `docs/stage-17/README.md`
-- `docs/stage-18/README.md`
-- `docs/stage-19/README.md`
-- `docs/stage-20/README.md`
-- `docs/stage-21/README.md`
-- `docs/stage-22/README.md`
-- `docs/bootstrap-plan.md`
-- `docs/rebase-strategy.md`
-- `docs/patch-ledger.md`
-- `docs/adr/`
-
-Upstream note
--------------
-
-This tree still contains the PostgreSQL source distribution as its
-technical base. The product should be presented as QhapaqXian DB, while
-retaining clear attribution to the upstream PostgreSQL project.
-
-Original upstream summary
--------------------------
-
-This directory contains the source code distribution of the PostgreSQL
-database management system.
-
-PostgreSQL is an advanced object-relational database management system
-that supports an extended subset of the SQL standard, including
-transactions, foreign keys, subqueries, triggers, user-defined types
-and functions. This distribution also contains C language bindings.
-
-Copyright and license information can be found in the file COPYRIGHT.
-
-General documentation about this upstream version of PostgreSQL can be
-found at <https://www.postgresql.org/docs/17/>. In particular,
-information about building PostgreSQL from the source code can be found
-at <https://www.postgresql.org/docs/17/installation.html>.
-
-The latest upstream PostgreSQL releases can be obtained at
-<https://www.postgresql.org/download/>. For more information see
-<https://www.postgresql.org/>.
+For implementation details, use `STATUS.md` first. For fork naming and boundary questions, use `QHAPAQXIAN.md`.

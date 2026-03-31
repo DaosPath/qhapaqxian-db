@@ -8,6 +8,14 @@ Rules:
 - `QHAPAQXIAN.md` should stay as fork-boundary/governance context;
 - `docs/qhapaqxian-architectural-blueprint.md` remains the architecture seed and target design, not the current-state tracker.
 
+Documentation hierarchy:
+- `README.md` = entrypoint and quick orientation
+- `STATUS.md` = canonical current-state ledger
+- `docs/README.md` = canonical documentation map
+- `QHAPAQXIAN.md` = naming, fork boundary, and governance
+- `docs/qhapaqxian-architectural-blueprint.md` = target architecture thesis
+- `docs/stage-*/README.md` = stage-local landed contracts and notes
+
 Snapshot date:
 - `2026-03-30`
 
@@ -29,7 +37,7 @@ Status legend:
 | 1 upstream fork/build | yes | yes | yes | no | bootstrap packaging still thin; no release-grade distribution matrix |
 | 2 language contract | yes | spec | no | no | spec frozen, but stage exists as contract rather than executable feature |
 | 3 parser/AST/utility | yes | yes | yes | partial | agent surface still enters through utility path, not deep core execution |
-| 4 engine catalogs | partial | yes | yes | partial | no dedicated `docs/stage-4/`; catalogs still tracked through later docs/tests |
+| 4 engine catalogs | yes | yes | yes | partial | durable agent/session/task catalogs are in-tree, and the stage now has a dedicated doc; the remaining gap is a standalone runtime demo |
 | 5 vertical slice | yes | yes | yes | yes | still single-node and synthetic in shape compared to final runtime model |
 | 6 embedded runtime boundary | yes | yes | yes | yes | runtime is embedded, but not yet a full autonomous scheduler plane |
 | 7 checkpoints/resume | yes | yes | yes | yes | semantics are durable, but compensation/long-horizon recovery are still shallow |
@@ -48,8 +56,18 @@ Status legend:
 | 20 brokered remote/HMAC | yes | yes | yes | yes | shared-key receipt model remains weaker than asymmetric or hardware-rooted attestation |
 | 21 asymmetric receipts | yes | yes | yes | yes | signer material is still repo/bindir local; no certificate chain or hardware root |
 | 22 container/microVM runtime classes | yes | yes | yes | yes | `container://` and `microvm://` are brokered runtime classes, not real backend-launched containers/microVMs |
+| 23 attestation contracts | yes | yes | no | partial | attestation bundles are catalog-validated, but no runtime verifier or dedicated regression matrix exists yet |
+| 24 container backend scaffold | yes | yes | no | partial | request/response contracts exist, but `qx_runtime.c` does not launch a real container backend yet |
+| 25 microVM backend scaffold | yes | yes | no | partial | scaffold is broker-facing only; no real microVM launcher or provider integration yet |
+| 26 scheduler scaffold | yes | yes | no | no | queue/lease/heartbeat shapes compile, but no runtime wiring, worker loop, or durable scheduler store exists yet |
+| 27 recovery scanner scaffold | yes | partial | no | no | recovery scanner API and build wiring exist, but runtime/scheduler integration and test coverage are still pending |
+| 28 observability scaffold | yes | yes | no | partial | helpers exist, but no callers or system views are wired yet |
+| 29 capability-aware planner/executor | yes | partial | no | partial | structured capability decisions exist, but runtime handoff still uses existing contract strings |
+| 30 security/tool capability contract | yes | yes | no | partial | capability tags and ceilings flow through authorization, but policy compilation and OS-level enforcement are still separate concerns |
+| 31 semantic payload v2 | yes | yes | yes | yes | v2 payloads cover verified execution events, but the replication surface is still logical-message text rather than a deeper WAL family |
+| 32 catalog snapshot helper layer | yes | yes | no | no | shared lookup layer exists, but callers are only partially migrated and helper coverage is still indirect |
 
 Canonical next-gap summary:
 - strongest remaining platform gap: real container or microVM backends behind Stage 22 provider/runtime classes;
 - strongest observability gap: richer operator-facing status beyond the current system views and traces;
-- strongest documentation gap: older stage docs are additive history, while this file is now the single current-state ledger.
+- strongest documentation gap: older stage docs still vary in depth and shape; use `docs/stage-template.md` and `docs/README.md` as the cleanup baseline.

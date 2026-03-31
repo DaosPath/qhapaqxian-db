@@ -1,8 +1,13 @@
 # Rebase Strategy
 
+Scope:
+- This document is maintenance policy for rebasing, patch tagging, and intake control.
+- It is not a current-state ledger; use `STATUS.md` for landed implementation status.
+- It is not a target-design document; use `docs/qhapaqxian-architectural-blueprint.md` for architecture intent.
+
 Branching model:
 - upstream tracking branch: `upstream/REL_17_STABLE`
-- active fork bootstrap branch: `codex/bootstrap`
+- active fork bootstrap branch: `bootstrap`
 - future release branches: `qx/release/<version>`
 
 Rules:
