@@ -25,6 +25,9 @@ CATALOG(pg_qx_provider,9595,QxProviderRelationId)
 	text		qxproviderendpoint BKI_FORCE_NULL;
 	text		qxproviderreceiptalg BKI_FORCE_NULL;
 	text		qxproviderreceiptkey BKI_FORCE_NULL;
+	text		qxproviderattestationprofile BKI_FORCE_NULL;
+	text		qxproviderattestationversion BKI_FORCE_NULL;
+	text		qxproviderattestationpolicy BKI_FORCE_NULL;
 #endif
 } FormData_pg_qx_provider;
 

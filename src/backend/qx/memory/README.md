@@ -1,11 +1,12 @@
 # QhapaqXian Memory Layer
 
-Planned responsibility:
-- working memory coordination
-- episodic memory helpers
-- semantic memory integration
-- checkpoint payload shaping
+Role:
+- manage working, episodic, and semantic memory snapshots plus checkpoint
+  payload shaping.
 
-Bootstrap note:
-- storage stays on ordinary PostgreSQL relations first;
-- deeper storage or indexing changes require benchmark evidence.
+Current state:
+- memory data still lives on ordinary PostgreSQL relations and helper code.
+
+Integration debt:
+- deeper storage methods, specialized indexes, and benchmark-driven layout
+  changes are still deferred.

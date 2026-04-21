@@ -2694,6 +2694,9 @@ typedef struct CreateProviderStmt
 	char	   *endpoint_name;
 	char	   *receipt_alg;
 	char	   *receipt_key;
+	char	   *attestation_profile;
+	char	   *attestation_version;
+	char	   *attestation_policy;
 	bool		attestation_required;
 	ParseLoc	location;
 } CreateProviderStmt;
@@ -2712,6 +2715,12 @@ typedef struct AlterProviderStmt
 	bool		set_receipt_alg;
 	char	   *receipt_key;
 	bool		set_receipt_key;
+	char	   *attestation_profile;
+	bool		set_attestation_profile;
+	char	   *attestation_version;
+	bool		set_attestation_version;
+	char	   *attestation_policy;
+	bool		set_attestation_policy;
 	bool		attestation_required;
 	bool		set_attestation_required;
 	bool		enabled;
@@ -2730,6 +2739,9 @@ typedef struct CreatePrincipalStmt
 	char	   *sandbox_name;
 	char	   *runtime_class;
 	char	   *receipt_signer;
+	char	   *attestation_profile;
+	char	   *attestation_version;
+	char	   *attestation_policy;
 	bool		enabled;
 	ParseLoc	location;
 } CreatePrincipalStmt;
@@ -2750,6 +2762,12 @@ typedef struct AlterPrincipalStmt
 	bool		set_runtime;
 	char	   *receipt_signer;
 	bool		set_receipt_signer;
+	char	   *attestation_profile;
+	bool		set_attestation_profile;
+	char	   *attestation_version;
+	bool		set_attestation_version;
+	char	   *attestation_policy;
+	bool		set_attestation_policy;
 	bool		enabled;
 	bool		set_enabled;
 	ParseLoc	location;

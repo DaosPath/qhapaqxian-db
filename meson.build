@@ -3518,11 +3518,16 @@ foreach test_dir : tests
       dbname = t.get('dbname',
         fallback_dbname.format(test_dir['name']))
 
+      regress_bindir = ''
+      if host_system == 'windows'
+        regress_bindir = temp_install_bindir
+      endif
+
       test_command_base = [
         runner.full_path(),
         '--inputdir', t.get('inputdir', test_dir['sd']),
         '--expecteddir', t.get('expecteddir', test_dir['sd']),
-        '--bindir', '',
+        '--bindir', regress_bindir,
         '--dlpath', test_dir['bd'],
         '--max-concurrent-tests=20',
         '--dbname', dbname,

@@ -26,8 +26,8 @@ observations without rewriting the decoder model.
   execution-verified events without schema guessing;
 - it keeps the decoder honest by forwarding the original payload instead of
   inventing normalized fields;
-- it creates a stable replication boundary for later container, microVM, and
-  provider-backed execution work.
+- it creates a stable replication boundary for later container/microVM
+  hardening, provider supervision, and attestation work.
 
 ## Compatibility assumptions
 

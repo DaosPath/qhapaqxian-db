@@ -26,6 +26,9 @@ CATALOG(pg_qx_principal,9590,QxPrincipalRelationId)
 	text		qxprincipalprovider BKI_FORCE_NULL;
 	text		qxprincipalruntimeclass BKI_FORCE_NULL;
 	text		qxprincipalreceiptsigner BKI_FORCE_NULL;
+	text		qxprincipalattestationprofile BKI_FORCE_NULL;
+	text		qxprincipalattestationversion BKI_FORCE_NULL;
+	text		qxprincipalattestationpolicy BKI_FORCE_NULL;
 #endif
 } FormData_pg_qx_principal;
 

@@ -2,6 +2,10 @@
 
 Status: accepted
 
+Note:
+- This ADR records a historical bootstrap decision, not the current implementation status.
+- Use `STATUS.md` for landed state and stage docs for implementation details.
+
 Decision:
 - The bootstrap keeps upstream PostgreSQL binary names and operational layout.
 - The repository and product identity are branded as QhapaqXian DB.

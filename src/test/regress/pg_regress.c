@@ -2477,13 +2477,19 @@ regression_main(int argc, char *argv[],
 		 * Start the temp postmaster
 		 */
 		snprintf(buf, sizeof(buf),
-				 "\"%s%spostgres\" -D \"%s/data\" -F%s "
-				 "-c \"listen_addresses=%s\" -k \"%s\" "
-				 "> \"%s/log/postmaster.log\" 2>&1",
+				 "%s%s%spostgres%s -D \"%s/data\" -F%s -p %s "
+				 "-c \"listen_addresses=%s\"%s%s%s",
+				 bindir ? "\"" : "",
 				 bindir ? bindir : "",
 				 bindir ? "/" : "",
-				 temp_instance, debug ? " -d 5" : "",
-				 hostname ? hostname : "", sockdir ? sockdir : "",
+				 bindir ? "\"" : "",
+				 temp_instance, debug ? " -d 5" : "", portstr,
+				 hostname ? hostname : "",
+				 (sockdir != NULL && sockdir[0] != '\0') ? " -k \"" : "",
+				 (sockdir != NULL && sockdir[0] != '\0') ? sockdir : "",
+				 (sockdir != NULL && sockdir[0] != '\0') ? "\"" : "");
+		snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf),
+				 " > \"%s/log/postmaster.log\" 2>&1",
 				 outputdir);
 		postmaster_pid = spawn_process(buf);
 		if (postmaster_pid == INVALID_PID)

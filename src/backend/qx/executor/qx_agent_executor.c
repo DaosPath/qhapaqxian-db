@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * qx_agent_executor.c
- *	  Stage 8 agent executor boundary for QhapaqXian Engine
+ *	  Stage 29 capability-aware agent executor boundary for QhapaqXian Engine
  *
  * Copyright (c) 1996-2024, PostgreSQL Global Development Group
  *
@@ -14,9 +14,97 @@
 #include "qx/qx_agent_executor.h"
 #include "qx/qx_runtime.h"
 
+static bool qx_plan_runtime_binding_is_valid(const char *provider_kind,
+											 const char *principal_runtime_class);
+static void qx_validate_agent_plan_capabilities(const QxAgentPlan *plan);
+
+static bool
+qx_plan_runtime_binding_is_valid(const char *provider_kind,
+								 const char *principal_runtime_class)
+{
+	if (provider_kind == NULL || principal_runtime_class == NULL)
+		return false;
+
+	if ((strcmp(provider_kind, "loopback") == 0 ||
+		 strcmp(provider_kind, "remote") == 0) &&
+		strcmp(principal_runtime_class, "host") == 0)
+		return true;
+	if (strcmp(provider_kind, "container") == 0 &&
+		strcmp(principal_runtime_class, "container") == 0)
+		return true;
+	if (strcmp(provider_kind, "microvm") == 0 &&
+		strcmp(principal_runtime_class, "microvm") == 0)
+		return true;
+
+	return false;
+}
+
+static void
+qx_validate_agent_plan_capabilities(const QxAgentPlan *plan)
+{
+	ListCell   *lc;
+
+	if (plan == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("agent plan must not be null")));
+
+	if (plan->tool_decisions == NIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("agent plan does not contain capability decisions"),
+				 errdetail("Stage 29 requires the planner to populate structured tool decisions before execution.")));
+
+	if (plan->runtime_decision.execution_surface == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("agent plan does not contain a runtime execution surface"),
+				 errdetail("Stage 29 requires a planner-populated execution surface summary before execution.")));
+
+	foreach(lc, plan->tool_decisions)
+	{
+		QxAgentPlanToolDecision *decision = lfirst(lc);
+
+		if (decision == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("agent plan contains a null tool decision")));
+
+		if (!qx_plan_runtime_binding_is_valid(decision->provider_kind,
+											  decision->principal_runtime_class))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("tool \"%s\" has an invalid provider/runtime-class binding",
+							decision->tool_name != NULL ? decision->tool_name : "<unknown>"),
+					 errdetail("Provider kind \"%s\" is not compatible with principal runtime class \"%s\".",
+							   decision->provider_kind != NULL ? decision->provider_kind : "<null>",
+							   decision->principal_runtime_class != NULL ? decision->principal_runtime_class : "<null>")));
+
+		if (decision->tool_name == NULL || decision->handler_name == NULL ||
+			decision->principal_name == NULL || decision->provider_name == NULL ||
+			decision->provider_endpoint == NULL || decision->capability_class == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("tool decision for \"%s\" is incomplete",
+							decision->tool_name != NULL ? decision->tool_name : "<unknown>"),
+					 errdetail("The planner must record handler, principal, provider, provider endpoint, and capability class for Stage 29 execution.")));
+
+		if (decision->require_attestation &&
+			(decision->receipt_schema == NULL || decision->receipt_schema[0] == '\0' ||
+			 decision->receipt_alg == NULL || decision->receipt_alg[0] == '\0'))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("tool \"%s\" requires receipt attestation metadata",
+							decision->tool_name != NULL ? decision->tool_name : "<unknown>"),
+					 errdetail("Structured capability planning must preserve both receipt schema and algorithm for attested tools.")));
+	}
+}
+
 Oid
 QxExecuteAgentPlan(const QxAgentPlan *plan)
 {
+	qx_validate_agent_plan_capabilities(plan);
+
 	switch (plan->kind)
 	{
 		case QX_AGENT_PLAN_RUN_TASK:

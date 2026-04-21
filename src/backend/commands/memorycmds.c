@@ -12,24 +12,24 @@
 #include "postgres.h"
 
 #include "catalog/namespace.h"
-#include "catalog/pg_qx_agent.h"
 #include "catalog/pg_qx_session.h"
 #include "commands/memorycmds.h"
 #include "miscadmin.h"
+#include "qx/qx_catalog.h"
 #include "qx/qx_memory.h"
 #include "utils/acl.h"
-#include "utils/syscache.h"
 
-static HeapTuple qx_lookup_agent_tuple(const char *agent_name);
+static bool qx_lookup_agent_info(const char *agent_name,
+								 QxCatalogAgentInfo *agent);
 static Oid qx_extract_oid_literal(Node *expr, const char *subject,
 								  const char *detail, const char *hint);
 
-static HeapTuple
-qx_lookup_agent_tuple(const char *agent_name)
+static bool
+qx_lookup_agent_info(const char *agent_name, QxCatalogAgentInfo *agent)
 {
 	List	   *search_path;
 	ListCell   *lc;
-	HeapTuple	tup = NULL;
+	bool		found = false;
 
 	search_path = fetch_search_path(false);
 
@@ -37,16 +37,16 @@ qx_lookup_agent_tuple(const char *agent_name)
 	{
 		Oid			namespaceoid = lfirst_oid(lc);
 
-		tup = SearchSysCache2(QXAGENTNAMENSP,
-							  CStringGetDatum(agent_name),
-							  ObjectIdGetDatum(namespaceoid));
-		if (HeapTupleIsValid(tup))
+		if (QxCatalogLookupAgentByName(namespaceoid, agent_name, agent))
+		{
+			found = true;
 			break;
+		}
 	}
 
 	list_free(search_path);
 
-	return tup;
+	return found;
 }
 
 static Oid
@@ -82,8 +82,7 @@ void
 RememberMemoryCommand(RememberStmt *stmt)
 {
 	Oid			sessionoid;
-	HeapTuple	sessiontup;
-	Form_pg_qx_session sessionform;
+	QxCatalogSessionInfo session;
 	Oid			ownerid;
 	QxRememberRequest request;
 
@@ -93,35 +92,33 @@ RememberMemoryCommand(RememberStmt *stmt)
 		"Stage 10 persists agent memory in engine-owned storage, but session identifiers still require literal OID input on the utility path.",
 		"Pass a numeric session OID literal, or resolve the session OID in the client before invoking REMEMBER.");
 
-	sessiontup = SearchSysCache1(QXSESSIONOID, ObjectIdGetDatum(sessionoid));
-	if (!HeapTupleIsValid(sessiontup))
+	if (!QxCatalogLookupSessionByOid(sessionoid, &session))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("session %u does not exist", sessionoid)));
 
-	sessionform = (Form_pg_qx_session) GETSTRUCT(sessiontup);
 	ownerid = GetUserId();
 
-	if (sessionform->qxsessiondbid != MyDatabaseId)
+	if (session.dbid != MyDatabaseId)
 	{
-		ReleaseSysCache(sessiontup);
+		QxCatalogFreeSessionInfo(&session);
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("session %u belongs to a different database", sessionoid)));
 	}
 
-	if (sessionform->qxsessionstatus != QX_SESSION_STATUS_ACTIVE)
+	if (session.status != QX_SESSION_STATUS_ACTIVE)
 	{
-		ReleaseSysCache(sessiontup);
+		QxCatalogFreeSessionInfo(&session);
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("session %u is not active", sessionoid),
 				 errdetail("REMEMBER currently accepts active sessions only.")));
 	}
 
-	if (!has_privs_of_role(ownerid, sessionform->qxsessionowner))
+	if (!has_privs_of_role(ownerid, session.ownerid))
 	{
-		ReleaseSysCache(sessiontup);
+		QxCatalogFreeSessionInfo(&session);
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("permission denied to remember data in session %u",
@@ -131,7 +128,7 @@ RememberMemoryCommand(RememberStmt *stmt)
 
 	memset(&request, 0, sizeof(request));
 	request.sessionoid = sessionoid;
-	request.agentoid = sessionform->qxsessionagentid;
+	request.agentoid = session.agentoid;
 	request.ownerid = ownerid;
 	request.scope = stmt->scope;
 	request.memory_key = stmt->memory_key;
@@ -140,28 +137,25 @@ RememberMemoryCommand(RememberStmt *stmt)
 
 	(void) QxRememberSessionMemory(&request);
 
-	ReleaseSysCache(sessiontup);
+	QxCatalogFreeSessionInfo(&session);
 }
 
 void
 FetchMemoryCommand(FetchMemoryStmt *stmt, DestReceiver *dest)
 {
-	HeapTuple	agenttup;
-	Form_pg_qx_agent agentform;
+	QxCatalogAgentInfo agent;
 	Oid			ownerid;
 
-	agenttup = qx_lookup_agent_tuple(stmt->agent_name);
-	if (!HeapTupleIsValid(agenttup))
+	if (!qx_lookup_agent_info(stmt->agent_name, &agent))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("agent \"%s\" does not exist", stmt->agent_name)));
 
-	agentform = (Form_pg_qx_agent) GETSTRUCT(agenttup);
 	ownerid = GetUserId();
 
-	if (!has_privs_of_role(ownerid, agentform->qxagentowner))
+	if (!has_privs_of_role(ownerid, agent.ownerid))
 	{
-		ReleaseSysCache(agenttup);
+		QxCatalogFreeAgentInfo(&agent);
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("permission denied to fetch memory for agent \"%s\"",
@@ -169,10 +163,10 @@ FetchMemoryCommand(FetchMemoryStmt *stmt, DestReceiver *dest)
 				 errdetail("Only the agent owner or a member of that role may inspect engine-owned memory for the agent.")));
 	}
 
-	QxFetchMemoryRecords(agentform->oid, ownerid, stmt->scopes,
+	QxFetchMemoryRecords(agent.oid, ownerid, stmt->scopes,
 						 stmt->match_text, stmt->limit_count, dest);
 
-	ReleaseSysCache(agenttup);
+	QxCatalogFreeAgentInfo(&agent);
 }
 
 TupleDesc

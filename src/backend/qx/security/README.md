@@ -1,12 +1,12 @@
 # QhapaqXian Security Layer
 
-Planned responsibility:
-- agent principal mapping
-- namespace enforcement
-- tool ACL checks
-- session/task policy evaluation
-- audit helpers
+Role:
+- map SQL roles to agent principals, enforce namespaces, check tool ACLs, and
+  evaluate session/task policy.
 
-Bootstrap note:
-- early phases should map SQL roles to agent principals instead of inventing a
-  new authentication stack immediately.
+Current state:
+- security owns the current identity and tool authorization path.
+
+Integration debt:
+- caller migration to the new catalog helper layer is still incomplete;
+- remote provider trust and stronger isolation models remain iterative.

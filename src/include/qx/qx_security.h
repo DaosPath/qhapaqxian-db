@@ -30,6 +30,9 @@ typedef struct QxToolAuthorization
 	int32		tool_cost_units;
 	List	   *tool_oids;		/* list of Oid */
 	List	   *tool_contracts;	/* list of String */
+	List	   *tool_runtime_classes;	/* list of String */
+	List	   *tool_sandbox_ceilings;	/* list of String */
+	List	   *tool_capability_tags;	/* list of String */
 } QxToolAuthorization;
 
 extern Oid QxLookupPrincipal(Oid namespaceoid, const char *principal_name,

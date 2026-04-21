@@ -8,6 +8,6 @@ subdir = src/backend/qx
 top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
 
-SUBDIRS = planner executor replication runtime memory security
+SUBDIRS = catalog planner executor replication runtime recovery scheduler memory security observe
 
 include $(top_srcdir)/src/backend/common.mk

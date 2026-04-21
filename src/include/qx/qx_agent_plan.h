@@ -31,6 +31,34 @@ typedef struct QxAgentPlanStep
 	bool		retryable;
 } QxAgentPlanStep;
 
+typedef struct QxAgentPlanToolDecision
+{
+	char	   *tool_name;
+	char	   *handler_name;
+	char	   *tool_sandbox_name;
+	char	   *principal_name;
+	char	   *principal_runtime_class;
+	char	   *provider_name;
+	char	   *provider_kind;
+	char	   *provider_endpoint;
+	char	   *receipt_schema;
+	char	   *receipt_alg;
+	char	   *attestation_mode;
+	char	   *capability_class;
+	bool		require_attestation;
+} QxAgentPlanToolDecision;
+
+typedef struct QxAgentPlanRuntimeDecision
+{
+	char	   *execution_surface;
+	List	   *provider_kinds;	/* list of String */
+	List	   *principal_runtime_classes;	/* list of String */
+	List	   *capability_tags;	/* list of String */
+	bool		mixed_provider_kinds;
+	bool		mixed_principal_runtime_classes;
+	bool		any_attestation_required;
+} QxAgentPlanRuntimeDecision;
+
 typedef struct QxAgentPlan
 {
 	QxAgentPlanKind kind;
@@ -62,8 +90,10 @@ typedef struct QxAgentPlan
 	int32		estimated_tool_calls;
 	int32		authorized_tool_tokens;
 	int32		authorized_tool_cost;
+	QxAgentPlanRuntimeDecision runtime_decision;
 	List	   *authorized_tools;	/* list of String */
 	List	   *authorized_tool_oids;	/* list of Oid */
+	List	   *tool_decisions;	/* list of QxAgentPlanToolDecision */
 	List	   *steps;			/* list of QxAgentPlanStep */
 } QxAgentPlan;
 

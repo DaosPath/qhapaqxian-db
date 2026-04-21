@@ -18,8 +18,12 @@
 
 #if defined(_WIN32)
 #include <direct.h>
+#include <process.h>
+#include <windows.h>
 #define getcwd _getcwd
 #else
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #endif
 
@@ -41,6 +45,13 @@ typedef struct Request
 	char	provider[128];
 	char	provider_kind[64];
 	char	provider_endpoint[256];
+	char	docker_cli[260];
+	char	docker_host[260];
+	char	container_image[128];
+	char	qemu_cli[260];
+	char	microvm_kernel[260];
+	char	microvm_initrd[260];
+	char	microvm_accel[32];
 	char	receipt_schema[64];
 	char	receipt_alg[64];
 	char	receipt_nonce[256];
@@ -51,6 +62,7 @@ typedef struct Request
 	long	task_oid;
 	long	goal_length;
 	long	timeout_ms;
+	long	memory_kb;
 	long	process_limit;
 	int		input_present;
 	int		path_present;
@@ -66,11 +78,13 @@ parse_sandbox_environment(Request *request)
 {
 	const char *profile;
 	const char *timeout_ms;
+	const char *memory_kb;
 	const char *process_limit;
 	const char *path;
 
 	profile = getenv("QX_SANDBOX_PROFILE");
 	timeout_ms = getenv("QX_SANDBOX_TIMEOUT_MS");
+	memory_kb = getenv("QX_SANDBOX_MEMORY_KB");
 	process_limit = getenv("QX_SANDBOX_PROCESS_LIMIT");
 	path = getenv("PATH");
 
@@ -78,11 +92,330 @@ parse_sandbox_environment(Request *request)
 		snprintf(request->profile, sizeof(request->profile), "%s", profile);
 	if (timeout_ms != NULL)
 		request->timeout_ms = strtol(timeout_ms, NULL, 10);
+	if (memory_kb != NULL)
+		request->memory_kb = strtol(memory_kb, NULL, 10);
 	if (process_limit != NULL)
 		request->process_limit = strtol(process_limit, NULL, 10);
 	request->path_present = (path != NULL && path[0] != '\0');
 	if (getcwd(request->workdir, sizeof(request->workdir)) == NULL)
 		snprintf(request->workdir, sizeof(request->workdir), "%s", "<unknown>");
+}
+
+static const char *
+container_image_ref(void)
+{
+	const char *override = getenv("QX_CONTAINER_IMAGE");
+
+	if (override != NULL && override[0] != '\0')
+		return override;
+
+	return "alpine:3.20";
+}
+
+static const char *
+microvm_qemu_ref(void)
+{
+	const char *override = getenv("QX_MICROVM_QEMU");
+
+	if (override != NULL && override[0] != '\0')
+		return override;
+
+#if defined(_WIN32)
+	return "C:\\Program Files\\qemu\\qemu-system-x86_64.exe";
+#else
+	return "qemu-system-x86_64";
+#endif
+}
+
+static int
+file_contains_marker(const char *path, const char *marker)
+{
+	FILE	   *file;
+	char		buffer[1024];
+
+	if (path == NULL || path[0] == '\0' ||
+		marker == NULL || marker[0] == '\0')
+		return 0;
+
+	file = fopen(path, "r");
+	if (file == NULL)
+		return 0;
+
+	while (fgets(buffer, sizeof(buffer), file) != NULL)
+	{
+		if (strstr(buffer, marker) != NULL)
+		{
+			fclose(file);
+			return 1;
+		}
+	}
+
+	fclose(file);
+	return 0;
+}
+
+static int
+run_real_microvm_backend(const Request *request, char *detail, size_t detail_len)
+{
+	const char *qemu_cli;
+	const char *kernel;
+	const char *initrd;
+	const char *accel;
+	const char *workdir;
+	char		serial_path[512];
+	char		debug_path[512];
+	char		qemu_log_path[512];
+	char		command[2048];
+	long		memory_mb;
+	int			status;
+	FILE	   *debug;
+
+	qemu_cli = request->qemu_cli[0] != '\0' ?
+		request->qemu_cli : microvm_qemu_ref();
+	kernel = request->microvm_kernel[0] != '\0' ?
+		request->microvm_kernel : getenv("QX_MICROVM_KERNEL");
+	initrd = request->microvm_initrd[0] != '\0' ?
+		request->microvm_initrd : getenv("QX_MICROVM_INITRD");
+	accel = request->microvm_accel[0] != '\0' ?
+		request->microvm_accel : getenv("QX_MICROVM_ACCEL");
+	if (accel == NULL || accel[0] == '\0')
+		accel = "tcg";
+	if (kernel == NULL || kernel[0] == '\0' ||
+		initrd == NULL || initrd[0] == '\0')
+		return 0;
+
+	workdir = request->workdir[0] != '\0' &&
+		strcmp(request->workdir, "<unknown>") != 0 ? request->workdir : ".";
+	snprintf(serial_path, sizeof(serial_path),
+			 "%s%cqx-microvm-%ld-serial.log",
+			 workdir,
+#if defined(_WIN32)
+			 '\\',
+#else
+			 '/',
+#endif
+			 request->task_oid);
+	snprintf(debug_path, sizeof(debug_path),
+			 "%s%cqx-microvm-%ld-debug.log",
+			 workdir,
+#if defined(_WIN32)
+			 '\\',
+#else
+			 '/',
+#endif
+			 request->task_oid);
+	snprintf(qemu_log_path, sizeof(qemu_log_path),
+			 "%s%cqx-microvm-%ld-qemu.log",
+			 workdir,
+#if defined(_WIN32)
+			 '\\',
+#else
+			 '/',
+#endif
+			 request->task_oid);
+	remove(serial_path);
+	remove(debug_path);
+	remove(qemu_log_path);
+
+	memory_mb = 128;
+
+	snprintf(command, sizeof(command),
+			 "\"%s\" -M microvm -accel %s -cpu qemu64 -m %ld -nodefaults -no-user-config "
+			 "-nographic -serial file:\"%s\" -D \"%s\" -d guest_errors "
+			 "-no-reboot -kernel \"%s\" -initrd \"%s\" "
+			 "-append \"console=ttyS0 rdinit=/init reboot=t loglevel=7\"",
+			 qemu_cli,
+			 accel,
+			 memory_mb,
+			 serial_path,
+			 qemu_log_path,
+			 kernel,
+			 initrd);
+
+#if defined(_WIN32)
+	{
+		STARTUPINFOA si;
+		PROCESS_INFORMATION pi;
+		DWORD		exit_code = 0;
+		DWORD		qemu_timeout_ms;
+		BOOL		started;
+
+		ZeroMemory(&si, sizeof(si));
+		ZeroMemory(&pi, sizeof(pi));
+		si.cb = sizeof(si);
+		qemu_timeout_ms = request->timeout_ms > 0 ?
+			(DWORD) request->timeout_ms : 30000;
+		started = CreateProcessA(qemu_cli,
+								 command,
+								 NULL,
+								 NULL,
+								 FALSE,
+								 CREATE_NO_WINDOW,
+								 NULL,
+								 NULL,
+								 &si,
+								 &pi);
+		if (!started)
+		{
+			debug = fopen(debug_path, "w");
+			if (debug != NULL)
+			{
+				fprintf(debug, "CreateProcessA failed for %s (error=%lu)\n",
+						qemu_cli, GetLastError());
+				fclose(debug);
+			}
+			return 0;
+		}
+
+		if (WaitForSingleObject(pi.hProcess, qemu_timeout_ms) != WAIT_OBJECT_0)
+		{
+			debug = fopen(debug_path, "w");
+			if (debug != NULL)
+			{
+				fprintf(debug, "WaitForSingleObject timed out after %lu ms for %s\n",
+						(unsigned long) qemu_timeout_ms, qemu_cli);
+				fclose(debug);
+			}
+			TerminateProcess(pi.hProcess, 1);
+			CloseHandle(pi.hThread);
+			CloseHandle(pi.hProcess);
+			return 0;
+		}
+		if (!GetExitCodeProcess(pi.hProcess, &exit_code))
+		{
+			CloseHandle(pi.hThread);
+			CloseHandle(pi.hProcess);
+			return 0;
+		}
+		CloseHandle(pi.hThread);
+		CloseHandle(pi.hProcess);
+		status = (int) exit_code;
+	}
+#else
+	status = system(command);
+#endif
+	if (status != 0)
+	{
+		debug = fopen(debug_path, "w");
+		if (debug != NULL)
+		{
+			fprintf(debug, "qemu exited with status %d; log=%s\n",
+					status, qemu_log_path);
+			fclose(debug);
+		}
+		return 0;
+	}
+	if (!file_contains_marker(serial_path, "QX-MICROVM-BOOT-OK"))
+	{
+		debug = fopen(debug_path, "w");
+		if (debug != NULL)
+		{
+			fprintf(debug, "serial marker missing in %s\n", serial_path);
+			fclose(debug);
+		}
+		return 0;
+	}
+
+	snprintf(detail, detail_len,
+			 "tool %s via %s for %s phase on task %ld;backend_launch=qemu;microvm_accel=%s;microvm_kernel=%s",
+			 request->tool,
+			 request->principal,
+			 request->phase[0] != '\0' ? request->phase : "submit",
+			 request->task_oid,
+			 accel,
+			 kernel);
+	remove(serial_path);
+	remove(debug_path);
+	return 1;
+}
+
+static int
+run_real_container_backend(const Request *request, char *detail, size_t detail_len)
+{
+	const char *image;
+	const char *docker_cli;
+	char		pids_limit[32];
+	char		memory_limit[64];
+	char		command[1024];
+	int			status;
+
+	image = container_image_ref();
+	if (request->container_image[0] != '\0')
+		image = request->container_image;
+	docker_cli = request->docker_cli[0] != '\0' ?
+		request->docker_cli : "docker";
+	if (request->docker_host[0] != '\0')
+	{
+#if defined(_WIN32)
+		_putenv_s("DOCKER_HOST", request->docker_host);
+#else
+		setenv("DOCKER_HOST", request->docker_host, 1);
+#endif
+	}
+	snprintf(pids_limit, sizeof(pids_limit), "%ld",
+			 request->process_limit > 0 ? request->process_limit : 1);
+	snprintf(memory_limit, sizeof(memory_limit), "%ldk",
+			 request->memory_kb > 0 ? request->memory_kb : 65536);
+	snprintf(command, sizeof(command),
+			 "\"%s\" run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --pids-limit %s --memory %s %s true",
+			 docker_cli,
+			 pids_limit,
+			 memory_limit,
+			 image);
+
+#if defined(_WIN32)
+	{
+		STARTUPINFOA si;
+		PROCESS_INFORMATION pi;
+		DWORD		exit_code = 0;
+		BOOL		started;
+
+		ZeroMemory(&si, sizeof(si));
+		ZeroMemory(&pi, sizeof(pi));
+		si.cb = sizeof(si);
+		started = CreateProcessA(docker_cli,
+								 command,
+								 NULL,
+								 NULL,
+								 FALSE,
+								 CREATE_NO_WINDOW,
+								 NULL,
+								 NULL,
+								 &si,
+								 &pi);
+		if (!started)
+			return 0;
+
+		if (WaitForSingleObject(pi.hProcess, INFINITE) != WAIT_OBJECT_0)
+		{
+			CloseHandle(pi.hThread);
+			CloseHandle(pi.hProcess);
+			return 0;
+		}
+		if (!GetExitCodeProcess(pi.hProcess, &exit_code))
+		{
+			CloseHandle(pi.hThread);
+			CloseHandle(pi.hProcess);
+			return 0;
+		}
+		CloseHandle(pi.hThread);
+		CloseHandle(pi.hProcess);
+		status = (int) exit_code;
+	}
+#else
+	status = system(command);
+#endif
+	if (status != 0)
+		return 0;
+
+	snprintf(detail, detail_len,
+			 "tool %s via %s for %s phase on task %ld;backend_launch=docker;container_image=%s",
+			 request->tool,
+			 request->principal,
+			 request->phase[0] != '\0' ? request->phase : "submit",
+			 request->task_oid,
+			 image);
+	return 1;
 }
 
 static const char *
@@ -337,6 +670,20 @@ parse_request(const char *path, Request *request)
 			snprintf(request->provider_kind, sizeof(request->provider_kind), "%s", value);
 		else if (strcmp(key, "PROVIDER_ENDPOINT") == 0)
 			snprintf(request->provider_endpoint, sizeof(request->provider_endpoint), "%s", value);
+		else if (strcmp(key, "DOCKER_CLI") == 0)
+			snprintf(request->docker_cli, sizeof(request->docker_cli), "%s", value);
+		else if (strcmp(key, "DOCKER_HOST") == 0)
+			snprintf(request->docker_host, sizeof(request->docker_host), "%s", value);
+		else if (strcmp(key, "CONTAINER_IMAGE") == 0)
+			snprintf(request->container_image, sizeof(request->container_image), "%s", value);
+		else if (strcmp(key, "QEMU_CLI") == 0)
+			snprintf(request->qemu_cli, sizeof(request->qemu_cli), "%s", value);
+		else if (strcmp(key, "MICROVM_KERNEL") == 0)
+			snprintf(request->microvm_kernel, sizeof(request->microvm_kernel), "%s", value);
+		else if (strcmp(key, "MICROVM_INITRD") == 0)
+			snprintf(request->microvm_initrd, sizeof(request->microvm_initrd), "%s", value);
+		else if (strcmp(key, "MICROVM_ACCEL") == 0)
+			snprintf(request->microvm_accel, sizeof(request->microvm_accel), "%s", value);
 		else if (strcmp(key, "RECEIPT_SCHEMA") == 0)
 			snprintf(request->receipt_schema, sizeof(request->receipt_schema), "%s", value);
 		else if (strcmp(key, "RECEIPT_ALG") == 0)
@@ -425,11 +772,32 @@ main(int argc, char **argv)
 	receipt_schema = request.receipt_schema[0] != '\0' ? request.receipt_schema : "qx.receipt.v1";
 	receipt_alg = request.receipt_alg[0] != '\0' ? request.receipt_alg : "hmac-sha256";
 	attestation_mode = receipt_attestation_mode(&request);
-	snprintf(detail, sizeof(detail), "tool %s via %s for %s phase on task %ld",
-			 request.tool,
-			 request.principal,
-			 request.phase[0] != '\0' ? request.phase : "submit",
-			 request.task_oid);
+	if (strcmp(request.provider_kind, "microvm") == 0 &&
+		strcmp(request.principal_runtime, "microvm") == 0)
+	{
+		if (!run_real_microvm_backend(&request, detail, sizeof(detail)))
+		{
+			fprintf(stderr, "could not execute real qemu microvm backend\n");
+			return 1;
+		}
+	}
+	else if (strcmp(request.provider_kind, "container") == 0 &&
+		strcmp(request.principal_runtime, "container") == 0)
+	{
+		if (!run_real_container_backend(&request, detail, sizeof(detail)))
+		{
+			fprintf(stderr, "could not execute real docker container backend\n");
+			return 1;
+		}
+	}
+	else
+	{
+		snprintf(detail, sizeof(detail), "tool %s via %s for %s phase on task %ld",
+				 request.tool,
+				 request.principal,
+				 request.phase[0] != '\0' ? request.phase : "submit",
+				 request.task_oid);
+	}
 	build_receipt_payload(payload, sizeof(payload), &request, environment_mode,
 						  workdir_name, attestation_mode, receipt_schema,
 						  receipt_alg, tokens, cost, detail);

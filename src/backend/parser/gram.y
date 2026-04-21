@@ -222,7 +222,7 @@ static int qx_parse_memory_scope(char *scope, int location,
 %}
 
 %pure-parser
-%expect 0
+%expect 2
 %name-prefix="base_yy"
 %locations
 
@@ -369,16 +369,28 @@ static int qx_parse_memory_scope(char *scope, int location,
 				qx_opt_provider_kind qx_opt_provider_endpoint
 				qx_opt_provider_receipt_alg
 				qx_opt_provider_receipt_key
+				qx_opt_provider_attestation_profile
+				qx_opt_provider_attestation_version
+				qx_opt_provider_attestation_policy
 				qx_opt_principal_runtime qx_opt_principal_signer
+				qx_opt_principal_attestation_profile
+				qx_opt_principal_attestation_version
+				qx_opt_principal_attestation_policy
 				qx_opt_alter_principal_program
 				qx_opt_alter_principal_sandbox qx_opt_alter_principal_runtime
 				qx_opt_alter_principal_signer
+				qx_opt_alter_principal_attestation_profile
+				qx_opt_alter_principal_attestation_version
+				qx_opt_alter_principal_attestation_policy
 				qx_opt_tool_policy qx_opt_alter_tool_handler
 				qx_opt_alter_tool_sandbox qx_opt_alter_tool_principal
 				qx_opt_alter_tool_policy
 				qx_opt_alter_provider_kind qx_opt_alter_provider_endpoint
 				qx_opt_alter_provider_receipt_alg
 				qx_opt_alter_provider_receipt_key
+				qx_opt_alter_provider_attestation_profile
+				qx_opt_alter_provider_attestation_version
+				qx_opt_alter_provider_attestation_policy
 %type <list>	qx_opt_agent_tools qx_opt_agent_budget
 				qx_opt_memory_scopes qx_memory_scope_list
 				qx_opt_memory_tags qx_memory_tag_list
@@ -2083,6 +2095,9 @@ AlterNamespacePolicyStmt:
 CreateProviderStmt:
 			CREATE PROVIDER qualified_name KIND Sconst ENDPOINT Sconst
 			qx_opt_provider_receipt_alg qx_opt_provider_receipt_key
+			qx_opt_provider_attestation_profile
+			qx_opt_provider_attestation_version
+			qx_opt_provider_attestation_policy
 			qx_opt_provider_attestation
 				{
 					CreateProviderStmt *n = makeNode(CreateProviderStmt);
@@ -2092,7 +2107,10 @@ CreateProviderStmt:
 					n->endpoint_name = $7;
 					n->receipt_alg = $8;
 					n->receipt_key = $9;
-					n->attestation_required = ($10 != 0);
+					n->attestation_profile = $10;
+					n->attestation_version = $11;
+					n->attestation_policy = $12;
+					n->attestation_required = ($13 != 0);
 					n->location = @1;
 					$$ = (Node *) n;
 				}
@@ -2104,6 +2122,9 @@ AlterProviderStmt:
 			qx_opt_alter_provider_endpoint
 			qx_opt_alter_provider_receipt_alg
 			qx_opt_alter_provider_receipt_key
+			qx_opt_alter_provider_attestation_profile
+			qx_opt_alter_provider_attestation_version
+			qx_opt_alter_provider_attestation_policy
 			qx_opt_alter_provider_attestation
 			qx_opt_alter_provider_enabled
 				{
@@ -2118,10 +2139,16 @@ AlterProviderStmt:
 					n->set_receipt_alg = ($6 != NULL);
 					n->receipt_key = $7;
 					n->set_receipt_key = ($7 != NULL);
-					n->attestation_required = ($8 > 0);
-					n->set_attestation_required = ($8 >= 0);
-					n->enabled = ($9 > 0);
-					n->set_enabled = ($9 >= 0);
+					n->attestation_profile = $8;
+					n->set_attestation_profile = ($8 != NULL);
+					n->attestation_version = $9;
+					n->set_attestation_version = ($9 != NULL);
+					n->attestation_policy = $10;
+					n->set_attestation_policy = ($10 != NULL);
+					n->attestation_required = ($11 > 0);
+					n->set_attestation_required = ($11 >= 0);
+					n->enabled = ($12 > 0);
+					n->set_enabled = ($12 >= 0);
 					n->location = @1;
 					$$ = (Node *) n;
 				}
@@ -2130,6 +2157,9 @@ AlterProviderStmt:
 CreatePrincipalStmt:
 			CREATE PRINCIPAL qualified_name PROGRAM Sconst SANDBOX Sconst
 			qx_opt_principal_runtime qx_principal_provider qx_opt_principal_signer
+			qx_opt_principal_attestation_profile
+			qx_opt_principal_attestation_version
+			qx_opt_principal_attestation_policy
 				{
 					CreatePrincipalStmt *n = makeNode(CreatePrincipalStmt);
 
@@ -2139,6 +2169,9 @@ CreatePrincipalStmt:
 					n->runtime_class = $8;
 					n->provider_name = $9;
 					n->receipt_signer = $10;
+					n->attestation_profile = $11;
+					n->attestation_version = $12;
+					n->attestation_policy = $13;
 					n->enabled = true;
 					n->location = @1;
 					$$ = (Node *) n;
@@ -2152,6 +2185,9 @@ AlterPrincipalStmt:
 			qx_opt_alter_principal_sandbox
 			qx_opt_alter_principal_runtime
 			qx_opt_alter_principal_signer
+			qx_opt_alter_principal_attestation_profile
+			qx_opt_alter_principal_attestation_version
+			qx_opt_alter_principal_attestation_policy
 			qx_opt_alter_principal_enabled
 				{
 					AlterPrincipalStmt *n = makeNode(AlterPrincipalStmt);
@@ -2167,8 +2203,14 @@ AlterPrincipalStmt:
 					n->set_runtime = ($7 != NULL);
 					n->receipt_signer = $8;
 					n->set_receipt_signer = ($8 != NULL);
-					n->enabled = ($9 > 0);
-					n->set_enabled = ($9 >= 0);
+					n->attestation_profile = $9;
+					n->set_attestation_profile = ($9 != NULL);
+					n->attestation_version = $10;
+					n->set_attestation_version = ($10 != NULL);
+					n->attestation_policy = $11;
+					n->set_attestation_policy = ($11 != NULL);
+					n->enabled = ($12 > 0);
+					n->set_enabled = ($12 >= 0);
 					n->location = @1;
 					$$ = (Node *) n;
 				}
@@ -2300,6 +2342,21 @@ qx_opt_provider_receipt_key:
 			| /* EMPTY */							{ $$ = NULL; }
 		;
 
+qx_opt_provider_attestation_profile:
+			ATTESTATION PROFILE Sconst			{ $$ = $3; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
+qx_opt_provider_attestation_version:
+			VERSION_P Sconst					{ $$ = $2; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
+qx_opt_provider_attestation_policy:
+			POLICY name							{ $$ = $2; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
 qx_opt_alter_provider_receipt_alg:
 			USING Sconst						{ $$ = $2; }
 			| /* EMPTY */							{ $$ = NULL; }
@@ -2326,6 +2383,21 @@ qx_opt_alter_provider_receipt_key:
 			| /* EMPTY */							{ $$ = NULL; }
 		;
 
+qx_opt_alter_provider_attestation_profile:
+			ATTESTATION PROFILE Sconst			{ $$ = $3; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
+qx_opt_alter_provider_attestation_version:
+			VERSION_P Sconst					{ $$ = $2; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
+qx_opt_alter_provider_attestation_policy:
+			POLICY name							{ $$ = $2; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
 qx_opt_alter_provider_enabled:
 			ENABLE_P								{ $$ = 1; }
 			| DISABLE_P							{ $$ = 0; }
@@ -2337,6 +2409,21 @@ qx_opt_principal_signer:
 			| /* EMPTY */							{ $$ = NULL; }
 		;
 
+qx_opt_principal_attestation_profile:
+			ATTESTATION PROFILE Sconst			{ $$ = $3; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
+qx_opt_principal_attestation_version:
+			VERSION_P Sconst					{ $$ = $2; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
+qx_opt_principal_attestation_policy:
+			POLICY name							{ $$ = $2; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
 qx_opt_principal_runtime:
 			RUNTIME Sconst						{ $$ = $2; }
 			| /* EMPTY */							{ $$ = NULL; }
@@ -2344,6 +2431,21 @@ qx_opt_principal_runtime:
 
 qx_opt_alter_principal_signer:
 			SIGNER Sconst						{ $$ = $2; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
+qx_opt_alter_principal_attestation_profile:
+			ATTESTATION PROFILE Sconst			{ $$ = $3; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
+qx_opt_alter_principal_attestation_version:
+			VERSION_P Sconst					{ $$ = $2; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
+qx_opt_alter_principal_attestation_policy:
+			POLICY name							{ $$ = $2; }
 			| /* EMPTY */							{ $$ = NULL; }
 		;
 

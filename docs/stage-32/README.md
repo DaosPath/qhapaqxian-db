@@ -21,6 +21,39 @@ It is a consolidation step, not a new runtime feature by itself.
 - backend lookup/fill/free helpers under `src/backend/qx/catalog/`;
 - a single place for translating `syscache` and tuple reads into engine-owned C structs;
 - provider/principal merge logic so callers can observe the effective provider contract without open-coding repeated joins;
+- list snapshot builders for task, attempt, and checkpoint catalog rows,
+  filtered by database and owner;
+- the recovery scanner now consumes `qx_catalog` snapshots instead of
+  open-coding task/attempt/checkpoint table scans;
+- the agent planner now resolves RUN TASK and RESUME TASK catalog state
+  through `qx_catalog` snapshots instead of direct syscache/tuple reads;
+- security read helpers and namespace tool authorization now consume
+  `qx_catalog` snapshots for namespace policies, principals, providers, and
+  tool/provider/principal contract metadata;
+- security operational identity lookup and registered-tool validation now also
+  consume `qx_catalog` snapshots instead of open-coding syscache walks across
+  identity, tool, principal, and provider rows;
+- runtime receipt-key lookup, submit-time agent name lookup, attempt sequence
+  lookup, budget validation, and RESUME TASK task/checkpoint reads now consume
+  `qx_catalog` snapshots;
+- recovery task/attempt summaries now also consult the durable scheduler
+  queue/lease ledgers before requesting runtime requeue/fence hooks, so
+  startup/failover scans stay idempotent once the autonomous supervisor has
+  already written the latest recovery evidence;
+- `SHOW TRACE` task authorization and memory command session/agent lookups now
+  consume `qx_catalog` snapshots before scanning or returning command data;
+- `SHOW TRACE` now also emits an operator-oriented `trace_summary` column built
+  through `qx_observe` so the observability scaffold is connected to a real
+  command surface instead of remaining helper-only;
+- `pg_stat_qx_providers`, `pg_stat_qx_principals`, and
+  `pg_stat_qx_runtime_classes` now share the builtin
+  `pg_qx_trace_detail_value()` extractor so those observability views no longer
+  open-code raw `position('key=value;')` matching against trace contracts;
+- the microVM asset resolver now prefers the stable
+  `initramfs-qx-microvm.cpio.gz` before the legacy `microvm2` fallback;
+- the real microVM execution profile now uses the 60000 ms brokered timeout
+  floor end to end so Windows QEMU `microvm` with TCG can boot and shut down
+  cleanly without weakening host/container sandbox profiles;
 - build wiring so the catalog helper layer is part of the fork-owned `src/backend/qx` boundary.
 
 ## Why this exists
@@ -33,7 +66,13 @@ It is a consolidation step, not a new runtime feature by itself.
 
 - no new catalog objects were added in this stage;
 - no `syscache` definitions were changed in this stage;
-- no runtime, scheduler, or recovery flow was rewritten yet to depend exclusively on this helper layer;
+- recovery flow now depends on this helper layer for task, attempt, and
+  checkpoint snapshots;
+- planner flow now depends on this helper layer for session, agent, identity,
+  task, and checkpoint snapshots used by `EXPLAIN AGENT`;
+- runtime write/update paths, scheduler, broader observability consumers, and
+  remaining security DDL/write paths still have direct catalog access to
+  migrate where practical;
 - no dedicated regression schedule was added yet for the helper API itself.
 
 ## Why this stage matters
@@ -45,24 +84,82 @@ It is a consolidation step, not a new runtime feature by itself.
 
 ## Integration direction
 
-- security and runtime code should gradually stop open-coding catalog lookups and move onto `qx_catalog`;
-- recovery and scheduler code should use snapshot structs when they need a stable cross-subsystem view of task state;
+- remaining runtime write/update helpers should stay explicit about tuple
+  mutation, while pure reads should keep moving onto `qx_catalog`;
+- security DDL/write validation should migrate where it benefits from shared
+  snapshots without hiding catalog-update semantics;
+- scheduler code should use snapshot structs when it needs a stable
+  cross-subsystem view of task state;
 - observability code should use the same layer before new `pg_stat_qx_*` surfaces are expanded.
+- SQL-facing observability views should prefer shared trace-detail extraction
+  helpers over repeated ad-hoc contract parsing.
 
 ## Known gaps
 
 - this stage is mainly an internal maintainability improvement;
-- some callers still use direct catalog access and need migration in later
-  cleanup phases.
+- recovery, planner, security authorization/validation, and selected runtime
+  read paths are now migrated consumers;
+- runtime write/update paths, scheduler, broader observability consumers, and
+  security write/validation paths still use direct catalog access in places
+  and need migration in later cleanup phases.
 
 ## Validation
 
 - There is no dedicated unit-style coverage for the helper layer yet.
 - Validation remains indirect through build and higher-level integration.
+- Current migration validation:
+  `meson compile -C build-stage4-codex -j 2`.
+- Stage 32 also reran `meson test -C build-stage4-codex --suite postgresql:setup --print-errorlogs`,
+  which passed 3/3.
+- The downstream focused `qx_stage3_agentic` regression now also validates the
+  shared-observe/catalog consumers behind
+  `pg_qx_scheduler_worker_slot_count()`,
+  `pg_stat_qx_scheduler_retry_backoff`, and
+  `pg_stat_qx_scheduler_worker_balance` on real Docker/QEMU lanes.
+- `planner` and `recovery` were checked for remaining direct catalog reads;
+  no `SearchSysCache`, `ReleaseSysCache`, `HeapTuple`, `GETSTRUCT`,
+  `SysCacheGetAttr`, `table_open`, or `heap_getnext` references remain in
+  those two consumers.
+- `security` authorization/read helpers, operational identity lookup, and
+  registered-tool validation were migrated to `qx_catalog`; direct security
+  catalog access is now limited to write-time tuple insertion for identity
+  creation.
+- `runtime` now uses `qx_catalog` for pure resume/read metadata, budget
+  validation, and provider receipt-key reads. Remaining direct syscache access
+  in runtime is limited to tuple update helpers for task/attempt mutation.
+- `tracecmds` and `memorycmds` no longer open-code syscache task, session, or
+  agent authorization reads; `SHOW TRACE` still scans `pg_qx_trace` rows to
+  return trace output, but now also renders `trace_summary` through
+  `qx_observe`.
+- `pg_stat_qx_providers`, `pg_stat_qx_principals`, and
+  `pg_stat_qx_runtime_classes` now call `pg_qx_trace_detail_value()` instead of
+  repeating raw `position(...)` contract parsing inside each view.
+- Windows QEMU/TCG microVM execution is validated with the 60000 ms brokered
+  microVM timeout floor; an earlier child-side timeout could still kill the
+  wrapper even after a successful guest boot marker under real TCG.
+- the Windows launcher now skips `CREATE_SUSPENDED` for real
+  `container`/`microvm` backend launches when no sandbox job object is being
+  attached; this removed a reproducible false timeout where the exact saved
+  microVM resume request succeeded under direct replay but hung only through
+  the runtime launcher path.
+- Focused real `qx_stage3_agentic` validation was run with direct `pg_regress`
+  and no `parallel_schedule`, using Docker Desktop 29.3.1,
+  `QX_MICROVM_ACCEL=tcg`,
+  `QX_MICROVM_KERNEL=build-stage4-codex/microvm-assets/vmlinuz-virt`, and
+  `QX_MICROVM_INITRD=build-stage4-codex/microvm-assets/initramfs-qx-microvm.cpio.gz`;
+  it passed 1/1 with the real Docker container and QEMU microVM paths, plus
+  explicit assertions that post-reclaim startup/failover recovery leaves one
+  recovery queue row and one reclaimed lease row for the repaired checkpointed
+  attempt, and that a stale attempt with no durable checkpoint first fails
+  closed as a queued task with a `failed` attempt, zero checkpoints, one
+  `RETRY` queue row, and one reclaimed lease row, then later re-enters the real
+  submit path through autonomous retry intake, dispatches the `urgent` retry
+  before the competing `high` retry on durable trace order, and reaches a fresh
+  checkpoint.
 
 ## Next stage handoff
 
-- scheduler, runtime, recovery, and observability work should migrate their
-  open-coded catalog access onto `qx_catalog`;
+- scheduler, runtime, observability, and remaining security write
+  work should migrate practical open-coded read access onto `qx_catalog`;
 - future refactors should prefer expanding the snapshot layer instead of
   adding new scattered `syscache` helpers in each subsystem.

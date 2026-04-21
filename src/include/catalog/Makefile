@@ -95,6 +95,9 @@ CATALOG_HEADERS := \
 	pg_qx_event.h \
 	pg_qx_trace.h \
 	pg_qx_checkpoint.h \
+	pg_qx_scheduler_queue.h \
+	pg_qx_scheduler_lease.h \
+	pg_qx_scheduler_heartbeat.h \
 	pg_qx_memory.h
 
 GENERATED_HEADERS := $(CATALOG_HEADERS:%.h=%_d.h)

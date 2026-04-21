@@ -108,6 +108,7 @@
 #include "postmaster/postmaster.h"
 #include "postmaster/syslogger.h"
 #include "postmaster/walsummarizer.h"
+#include "qx/qx_runtime.h"
 #include "replication/logicallauncher.h"
 #include "replication/slotsync.h"
 #include "replication/walsender.h"
@@ -908,6 +909,7 @@ PostmasterMain(int argc, char *argv[])
 	 * before any modules had a chance to take the background worker slots.
 	 */
 	ApplyLauncherRegister();
+	QxRuntimeRegisterSchedulerBackgroundWorker();
 
 	/*
 	 * process any libraries that should be preloaded at postmaster start

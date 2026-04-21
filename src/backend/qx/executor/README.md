@@ -1,12 +1,12 @@
 # QhapaqXian Executor Layer
 
-Planned responsibility:
-- step execution context
-- tool call orchestration
-- budget debits
-- checkpoint safe points
-- context propagation for agent identity
+Role:
+- run task steps, orchestrate tool calls, debit budgets, and advance durable
+  checkpoints.
 
-Bootstrap note:
-- initial task execution can be driven from command handlers and runtime
-  workers before this layer gains deeper executor hooks.
+Current state:
+- executor boundary is in use for the current agent/task slice.
+
+Integration debt:
+- deeper planner/executor separation and richer plan recovery still need to be
+  completed.

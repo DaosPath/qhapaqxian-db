@@ -40,5 +40,8 @@ typedef struct QxRuntimeTaskRequest
 extern Oid QxRuntimeSubmitTask(const QxRuntimeTaskRequest *request);
 extern Oid QxRuntimeResumeTask(Oid taskoid, const char *checkpoint_label,
 							   Oid ownerid);
+extern void QxRuntimeRegisterSchedulerBackgroundWorker(void);
+extern void QxRuntimeSchedulerLauncherMain(Datum main_arg) pg_attribute_noreturn();
+extern void QxRuntimeSchedulerDatabaseWorkerMain(Datum main_arg) pg_attribute_noreturn();
 
 #endif							/* QX_RUNTIME_H */

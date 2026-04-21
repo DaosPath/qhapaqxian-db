@@ -24,6 +24,9 @@ typedef struct QhapaqXianOutputData
 	char	   *prefix;
 } QhapaqXianOutputData;
 
+static const char *const qx_schema_v1 = "\"schema\":\"stage9.semantic.v1\"";
+static const char *const qx_schema_v2 = "\"schema\":\"stage31.semantic.v2\"";
+
 static void qx_decode_startup(LogicalDecodingContext *ctx,
 							  OutputPluginOptions *opt, bool is_init);
 static void qx_decode_shutdown(LogicalDecodingContext *ctx);
@@ -47,6 +50,7 @@ static void qx_decode_stream_message(LogicalDecodingContext *ctx,
 									 ReorderBufferTXN *txn, XLogRecPtr lsn,
 									 bool transactional, const char *prefix,
 									 Size sz, const char *message);
+static void qx_validate_semantic_schema(const char *message, Size sz);
 static void qx_write_message(LogicalDecodingContext *ctx, const char *prefix,
 							 Size sz, const char *message);
 
@@ -174,10 +178,27 @@ qx_write_message(LogicalDecodingContext *ctx, const char *prefix,
 }
 
 static void
+qx_validate_semantic_schema(const char *message, Size sz)
+{
+	char	   *text;
+	bool		supported;
+
+	text = pnstrdup(message, sz);
+	supported = (strstr(text, qx_schema_v1) != NULL ||
+				 strstr(text, qx_schema_v2) != NULL);
+	if (!supported)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("unsupported QhapaqXian semantic schema in logical message")));
+	pfree(text);
+}
+
+static void
 qx_decode_message(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 				  XLogRecPtr lsn, bool transactional, const char *prefix,
 				  Size sz, const char *message)
 {
+	qx_validate_semantic_schema(message, sz);
 	qx_write_message(ctx, prefix, sz, message);
 	(void) txn;
 	(void) lsn;
@@ -189,6 +210,7 @@ qx_decode_stream_message(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 						 XLogRecPtr lsn, bool transactional, const char *prefix,
 						 Size sz, const char *message)
 {
+	qx_validate_semantic_schema(message, sz);
 	qx_write_message(ctx, prefix, sz, message);
 	(void) txn;
 	(void) lsn;

@@ -9,6 +9,7 @@
 
 #include "access/table.h"
 #include "access/tableam.h"
+#include "access/heapam.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
@@ -49,6 +50,9 @@ static void qx_validate_provider_receipt_alg(const char *receipt_alg,
 											 const char *command_name);
 static void qx_validate_provider_isolation_contract(const char *provider_kind,
 													const char *receipt_alg,
+													const char *attestation_profile,
+													const char *attestation_version,
+													const char *attestation_policy,
 													bool attestation_required,
 													const char *command_name);
 static void qx_validate_provider_endpoint(const char *provider_kind,
@@ -59,9 +63,24 @@ static void qx_validate_provider_receipt_key(const char *receipt_alg,
 											 const char *command_name);
 static char *qx_provider_receipt_alg_by_oid(Oid provideroid);
 static char *qx_provider_kind_by_oid(Oid provideroid);
+static char *qx_provider_attestation_profile_by_oid(Oid provideroid);
+static char *qx_provider_attestation_version_by_oid(Oid provideroid);
+static char *qx_provider_attestation_policy_by_oid(Oid provideroid);
 static void qx_validate_principal_receipt_signer(const char *receipt_signer,
 												 const char *command_name);
 static const char *qx_default_runtime_for_provider_kind(const char *provider_kind);
+static void qx_validate_attestation_metadata(const char *profile,
+											 const char *version,
+											 const char *policy,
+											 bool required,
+											 const char *command_name);
+static void qx_validate_attestation_binding_values(const char *provider_profile,
+												   const char *provider_version,
+												   const char *provider_policy,
+												   const char *principal_profile,
+												   const char *principal_version,
+												   const char *principal_policy,
+												   const char *command_name);
 static void qx_validate_principal_runtime_class(const char *runtime_class,
 												const char *command_name);
 static void qx_validate_principal_runtime_binding_values(const char *provider_kind,
@@ -69,15 +88,24 @@ static void qx_validate_principal_runtime_binding_values(const char *provider_ki
 														 const char *runtime_class,
 														 const char *sandbox_name,
 														 const char *receipt_signer,
+														 const char *attestation_profile,
+														 const char *attestation_version,
+														 const char *attestation_policy,
 														 const char *command_name);
 static void qx_validate_principal_runtime_binding(Oid provideroid,
 												  const char *runtime_class,
 												  const char *sandbox_name,
 												  const char *receipt_signer,
+												  const char *attestation_profile,
+												  const char *attestation_version,
+												  const char *attestation_policy,
 												  const char *command_name);
 static void qx_validate_provider_bound_principals(Oid provideroid,
 												  const char *provider_kind,
 												  const char *receipt_alg,
+												  const char *provider_profile,
+												  const char *provider_version,
+												  const char *provider_policy,
 												  const char *command_name);
 static void qx_validate_tool_sandbox(const char *sandbox_name);
 static int	qx_sandbox_rank(const char *sandbox_name);
@@ -219,6 +247,9 @@ qx_validate_provider_kind(const char *provider_kind, const char *command_name)
 static void
 qx_validate_provider_isolation_contract(const char *provider_kind,
 										 const char *receipt_alg,
+										 const char *attestation_profile,
+										 const char *attestation_version,
+										 const char *attestation_policy,
 										 bool attestation_required,
 										 const char *command_name)
 {
@@ -229,6 +260,13 @@ qx_validate_provider_isolation_contract(const char *provider_kind,
 		provider_kind : "loopback";
 	effective_alg = (receipt_alg != NULL && receipt_alg[0] != '\0') ?
 		receipt_alg : "hmac-sha256";
+
+	qx_validate_attestation_metadata(attestation_profile,
+									 attestation_version,
+									 attestation_policy,
+									 (strcmp(effective_kind, "container") == 0 ||
+									  strcmp(effective_kind, "microvm") == 0),
+									 command_name);
 
 	if (strcmp(effective_kind, "container") != 0 &&
 		strcmp(effective_kind, "microvm") != 0)
@@ -444,6 +482,60 @@ qx_provider_kind_by_oid(Oid provideroid)
 	return provider_kind;
 }
 
+static char *
+qx_provider_attestation_profile_by_oid(Oid provideroid)
+{
+	HeapTuple	providertup;
+	char	   *attestation_profile;
+
+	providertup = SearchSysCache1(QXPROVIDEROID, ObjectIdGetDatum(provideroid));
+	if (!HeapTupleIsValid(providertup))
+		elog(ERROR, "cache lookup failed for QhapaqXian provider %u", provideroid);
+
+	attestation_profile = qxpolicy_text_attr(providertup,
+											 Anum_pg_qx_provider_qxproviderattestationprofile,
+											 QXPROVIDEROID);
+	ReleaseSysCache(providertup);
+
+	return attestation_profile;
+}
+
+static char *
+qx_provider_attestation_version_by_oid(Oid provideroid)
+{
+	HeapTuple	providertup;
+	char	   *attestation_version;
+
+	providertup = SearchSysCache1(QXPROVIDEROID, ObjectIdGetDatum(provideroid));
+	if (!HeapTupleIsValid(providertup))
+		elog(ERROR, "cache lookup failed for QhapaqXian provider %u", provideroid);
+
+	attestation_version = qxpolicy_text_attr(providertup,
+											 Anum_pg_qx_provider_qxproviderattestationversion,
+											 QXPROVIDEROID);
+	ReleaseSysCache(providertup);
+
+	return attestation_version;
+}
+
+static char *
+qx_provider_attestation_policy_by_oid(Oid provideroid)
+{
+	HeapTuple	providertup;
+	char	   *attestation_policy;
+
+	providertup = SearchSysCache1(QXPROVIDEROID, ObjectIdGetDatum(provideroid));
+	if (!HeapTupleIsValid(providertup))
+		elog(ERROR, "cache lookup failed for QhapaqXian provider %u", provideroid);
+
+	attestation_policy = qxpolicy_text_attr(providertup,
+											Anum_pg_qx_provider_qxproviderattestationpolicy,
+											QXPROVIDEROID);
+	ReleaseSysCache(providertup);
+
+	return attestation_policy;
+}
+
 static const char *
 qx_default_runtime_for_provider_kind(const char *provider_kind)
 {
@@ -453,6 +545,93 @@ qx_default_runtime_for_provider_kind(const char *provider_kind)
 		return "microvm";
 
 	return "host";
+}
+
+static void
+qx_validate_attestation_text(const char *value,
+							 const char *field_name,
+							 const char *command_name)
+{
+	if (value == NULL || value[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("%s %s must not be empty", command_name, field_name)));
+
+	if (strchr(value, '\n') != NULL ||
+		strchr(value, '\r') != NULL ||
+		strchr(value, ';') != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("%s %s contains unsupported characters",
+						command_name, field_name),
+				 errdetail("Attestation metadata must be a single-line contract token.")));
+}
+
+static void
+qx_validate_attestation_metadata(const char *profile,
+								 const char *version,
+								 const char *policy,
+								 bool required,
+								 const char *command_name)
+{
+	bool		any_set;
+
+	any_set = (profile != NULL || version != NULL || policy != NULL);
+
+	if (any_set && (!profile || !version || !policy))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("%s attestation profile, version, and policy must be provided together",
+						command_name),
+				 errdetail("The attestation contract is stored as an atomic bundle.")));
+
+	if (required && !any_set)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("%s requires attestation profile, version, and policy",
+						command_name),
+				 errdetail("Container and microVM contracts need explicit attestation metadata.")));
+
+	if (profile != NULL)
+		qx_validate_attestation_text(profile, "attestation profile", command_name);
+	if (version != NULL)
+		qx_validate_attestation_text(version, "attestation version", command_name);
+	if (policy != NULL)
+		qx_validate_attestation_text(policy, "attestation policy", command_name);
+}
+
+static void
+qx_validate_attestation_binding_values(const char *provider_profile,
+									   const char *provider_version,
+									   const char *provider_policy,
+									   const char *principal_profile,
+									   const char *principal_version,
+									   const char *principal_policy,
+									   const char *command_name)
+{
+	bool		provider_has_attestation;
+
+	provider_has_attestation =
+		(provider_profile != NULL ||
+		 provider_version != NULL ||
+		 provider_policy != NULL);
+
+	if (!provider_has_attestation)
+		return;
+
+	if (!principal_profile || !principal_version || !principal_policy)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("%s attestation contract is incomplete", command_name),
+				 errdetail("Principals bound to providers with attestation metadata must carry matching profile, version, and policy values.")));
+
+	if (strcmp(provider_profile, principal_profile) != 0 ||
+		strcmp(provider_version, principal_version) != 0 ||
+		strcmp(provider_policy, principal_policy) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("%s attestation contract does not match provider", command_name),
+				 errdetail("Provider and principal attestation metadata must remain aligned for brokered container and microVM backends.")));
 }
 
 static void
@@ -496,6 +675,9 @@ qx_validate_principal_runtime_binding_values(const char *provider_kind,
 											  const char *runtime_class,
 											  const char *sandbox_name,
 											  const char *receipt_signer,
+											  const char *attestation_profile,
+											  const char *attestation_version,
+											  const char *attestation_policy,
 											  const char *command_name)
 {
 	const char *effective_runtime;
@@ -505,6 +687,11 @@ qx_validate_principal_runtime_binding_values(const char *provider_kind,
 	effective_runtime = (runtime_class != NULL && runtime_class[0] != '\0') ?
 		runtime_class : qx_default_runtime_for_provider_kind(provider_kind);
 	qx_validate_principal_runtime_class(effective_runtime, command_name);
+	qx_validate_attestation_metadata(attestation_profile,
+									 attestation_version,
+									 attestation_policy,
+									 (strcmp(effective_runtime, "host") != 0),
+									 command_name);
 
 	if (receipt_signer != NULL)
 		qx_validate_principal_receipt_signer(receipt_signer, command_name);
@@ -556,20 +743,54 @@ qx_validate_principal_runtime_binding(Oid provideroid,
 									  const char *runtime_class,
 									  const char *sandbox_name,
 									  const char *receipt_signer,
+									  const char *attestation_profile,
+									  const char *attestation_version,
+									  const char *attestation_policy,
 									  const char *command_name)
 {
 	char	   *provider_kind;
 	char	   *receipt_alg;
+	char	   *provider_profile;
+	char	   *provider_version;
+	char	   *provider_policy;
+	const char *effective_profile;
+	const char *effective_version;
+	const char *effective_policy;
 
 	provider_kind = qx_provider_kind_by_oid(provideroid);
 	receipt_alg = qx_provider_receipt_alg_by_oid(provideroid);
+	provider_profile = qx_provider_attestation_profile_by_oid(provideroid);
+	provider_version = qx_provider_attestation_version_by_oid(provideroid);
+	provider_policy = qx_provider_attestation_policy_by_oid(provideroid);
+	effective_profile = (attestation_profile != NULL) ? attestation_profile :
+		provider_profile;
+	effective_version = (attestation_version != NULL) ? attestation_version :
+		provider_version;
+	effective_policy = (attestation_policy != NULL) ? attestation_policy :
+		provider_policy;
 	qx_validate_principal_runtime_binding_values(provider_kind,
 												 receipt_alg,
 												 runtime_class,
 												 sandbox_name,
 												 receipt_signer,
+												 effective_profile,
+												 effective_version,
+												 effective_policy,
 												 command_name);
+	qx_validate_attestation_binding_values(provider_profile,
+										   provider_version,
+										   provider_policy,
+										   effective_profile,
+										   effective_version,
+										   effective_policy,
+										   command_name);
 
+	if (provider_profile != NULL)
+		pfree(provider_profile);
+	if (provider_version != NULL)
+		pfree(provider_version);
+	if (provider_policy != NULL)
+		pfree(provider_policy);
 	pfree(provider_kind);
 	pfree(receipt_alg);
 }
@@ -578,6 +799,9 @@ static void
 qx_validate_provider_bound_principals(Oid provideroid,
 									  const char *provider_kind,
 									  const char *receipt_alg,
+									  const char *provider_profile,
+									  const char *provider_version,
+									  const char *provider_policy,
 									  const char *command_name)
 {
 	Relation	rel;
@@ -593,6 +817,9 @@ qx_validate_provider_bound_principals(Oid provideroid,
 		char	   *sandbox_name;
 		char	   *runtime_class;
 		char	   *receipt_signer;
+		char	   *attestation_profile;
+		char	   *attestation_version;
+		char	   *attestation_policy;
 		char	   *scope;
 
 		if (principalform->qxprincipalproviderid != provideroid)
@@ -607,6 +834,15 @@ qx_validate_provider_bound_principals(Oid provideroid,
 		receipt_signer = qxpolicy_text_attr(tup,
 											Anum_pg_qx_principal_qxprincipalreceiptsigner,
 											QXPRINCIPALOID);
+		attestation_profile = qxpolicy_text_attr(tup,
+												 Anum_pg_qx_principal_qxprincipalattestationprofile,
+												 QXPRINCIPALOID);
+		attestation_version = qxpolicy_text_attr(tup,
+												 Anum_pg_qx_principal_qxprincipalattestationversion,
+												 QXPRINCIPALOID);
+		attestation_policy = qxpolicy_text_attr(tup,
+												Anum_pg_qx_principal_qxprincipalattestationpolicy,
+												QXPRINCIPALOID);
 		scope = psprintf("%s principal \"%s\"",
 						 command_name,
 						 NameStr(principalform->qxprincipalname));
@@ -615,7 +851,17 @@ qx_validate_provider_bound_principals(Oid provideroid,
 													 runtime_class,
 													 sandbox_name,
 													 receipt_signer,
+													 attestation_profile,
+													 attestation_version,
+													 attestation_policy,
 													 scope);
+		qx_validate_attestation_binding_values(provider_profile,
+											   provider_version,
+											   provider_policy,
+											   attestation_profile,
+											   attestation_version,
+											   attestation_policy,
+											   scope);
 		pfree(scope);
 		if (sandbox_name != NULL)
 			pfree(sandbox_name);
@@ -623,6 +869,12 @@ qx_validate_provider_bound_principals(Oid provideroid,
 			pfree(runtime_class);
 		if (receipt_signer != NULL)
 			pfree(receipt_signer);
+		if (attestation_profile != NULL)
+			pfree(attestation_profile);
+		if (attestation_version != NULL)
+			pfree(attestation_version);
+		if (attestation_policy != NULL)
+			pfree(attestation_policy);
 	}
 
 	table_endscan(scan);
@@ -1182,6 +1434,9 @@ CreateProviderCommand(CreateProviderStmt *stmt)
 									 "CREATE PROVIDER");
 	qx_validate_provider_isolation_contract(stmt->provider_kind,
 											 receipt_alg,
+											 stmt->attestation_profile,
+											 stmt->attestation_version,
+											 stmt->attestation_policy,
 											 stmt->attestation_required,
 											 "CREATE PROVIDER");
 
@@ -1224,6 +1479,15 @@ CreateProviderCommand(CreateProviderStmt *stmt)
 	qxpolicy_set_text(values, nulls,
 					  Anum_pg_qx_provider_qxproviderreceiptkey,
 					  stmt->receipt_key);
+	qxpolicy_set_text(values, nulls,
+					  Anum_pg_qx_provider_qxproviderattestationprofile,
+					  stmt->attestation_profile);
+	qxpolicy_set_text(values, nulls,
+					  Anum_pg_qx_provider_qxproviderattestationversion,
+					  stmt->attestation_version);
+	qxpolicy_set_text(values, nulls,
+					  Anum_pg_qx_provider_qxproviderattestationpolicy,
+					  stmt->attestation_policy);
 
 	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
 	CatalogTupleInsert(rel, tup);
@@ -1252,12 +1516,18 @@ AlterProviderCommand(AlterProviderStmt *stmt)
 	char	   *effective_endpoint = NULL;
 	char	   *effective_receipt_alg = NULL;
 	char	   *effective_receipt_key = NULL;
+	char	   *effective_attestation_profile = NULL;
+	char	   *effective_attestation_version = NULL;
+	char	   *effective_attestation_policy = NULL;
 	bool		effective_attestation_required;
 
 	if (!stmt->set_kind &&
 		!stmt->set_endpoint &&
 		!stmt->set_receipt_alg &&
 		!stmt->set_receipt_key &&
+		!stmt->set_attestation_profile &&
+		!stmt->set_attestation_version &&
+		!stmt->set_attestation_policy &&
 		!stmt->set_attestation_required &&
 		!stmt->set_enabled)
 		ereport(ERROR,
@@ -1287,6 +1557,18 @@ AlterProviderCommand(AlterProviderStmt *stmt)
 		qx_validate_provider_kind(stmt->provider_kind, "ALTER PROVIDER");
 	if (stmt->set_receipt_alg)
 		qx_validate_provider_receipt_alg(stmt->receipt_alg, "ALTER PROVIDER");
+	if (stmt->set_attestation_profile)
+		qx_validate_attestation_text(stmt->attestation_profile,
+									 "attestation profile",
+									 "ALTER PROVIDER");
+	if (stmt->set_attestation_version)
+		qx_validate_attestation_text(stmt->attestation_version,
+									 "attestation version",
+									 "ALTER PROVIDER");
+	if (stmt->set_attestation_policy)
+		qx_validate_attestation_text(stmt->attestation_policy,
+									 "attestation policy",
+									 "ALTER PROVIDER");
 	effective_kind = stmt->set_kind ? pstrdup(stmt->provider_kind) :
 		qxpolicy_text_attr(oldtup,
 						   Anum_pg_qx_provider_qxproviderkind,
@@ -1317,16 +1599,37 @@ AlterProviderCommand(AlterProviderStmt *stmt)
 		qx_validate_provider_receipt_key(effective_receipt_alg,
 										 effective_receipt_key,
 										 "ALTER PROVIDER");
+	effective_attestation_profile = stmt->set_attestation_profile ?
+		pstrdup(stmt->attestation_profile) :
+		qxpolicy_text_attr(oldtup,
+						   Anum_pg_qx_provider_qxproviderattestationprofile,
+						   QXPROVIDEROID);
+	effective_attestation_version = stmt->set_attestation_version ?
+		pstrdup(stmt->attestation_version) :
+		qxpolicy_text_attr(oldtup,
+						   Anum_pg_qx_provider_qxproviderattestationversion,
+						   QXPROVIDEROID);
+	effective_attestation_policy = stmt->set_attestation_policy ?
+		pstrdup(stmt->attestation_policy) :
+		qxpolicy_text_attr(oldtup,
+						   Anum_pg_qx_provider_qxproviderattestationpolicy,
+						   QXPROVIDEROID);
 	effective_attestation_required = stmt->set_attestation_required ?
 		stmt->attestation_required :
 		oldform->qxproviderattestationrequired;
 	qx_validate_provider_isolation_contract(effective_kind,
 											 effective_receipt_alg,
+											 effective_attestation_profile,
+											 effective_attestation_version,
+											 effective_attestation_policy,
 											 effective_attestation_required,
 											 "ALTER PROVIDER");
 	qx_validate_provider_bound_principals(oldform->oid,
 										  effective_kind,
 										  effective_receipt_alg,
+										  effective_attestation_profile,
+										  effective_attestation_version,
+										  effective_attestation_policy,
 										  "ALTER PROVIDER");
 
 	rel = table_open(QxProviderRelationId, RowExclusiveLock);
@@ -1362,6 +1665,27 @@ AlterProviderCommand(AlterProviderStmt *stmt)
 						  stmt->receipt_key);
 		replaces[Anum_pg_qx_provider_qxproviderreceiptkey - 1] = true;
 	}
+	if (stmt->set_attestation_profile)
+	{
+		qxpolicy_set_text(values, nulls,
+						  Anum_pg_qx_provider_qxproviderattestationprofile,
+						  stmt->attestation_profile);
+		replaces[Anum_pg_qx_provider_qxproviderattestationprofile - 1] = true;
+	}
+	if (stmt->set_attestation_version)
+	{
+		qxpolicy_set_text(values, nulls,
+						  Anum_pg_qx_provider_qxproviderattestationversion,
+						  stmt->attestation_version);
+		replaces[Anum_pg_qx_provider_qxproviderattestationversion - 1] = true;
+	}
+	if (stmt->set_attestation_policy)
+	{
+		qxpolicy_set_text(values, nulls,
+						  Anum_pg_qx_provider_qxproviderattestationpolicy,
+						  stmt->attestation_policy);
+		replaces[Anum_pg_qx_provider_qxproviderattestationpolicy - 1] = true;
+	}
 	if (stmt->set_attestation_required)
 	{
 		values[Anum_pg_qx_provider_qxproviderattestationrequired - 1] =
@@ -1388,6 +1712,12 @@ AlterProviderCommand(AlterProviderStmt *stmt)
 		pfree(effective_receipt_alg);
 	if (effective_receipt_key != NULL)
 		pfree(effective_receipt_key);
+	if (effective_attestation_profile != NULL)
+		pfree(effective_attestation_profile);
+	if (effective_attestation_version != NULL)
+		pfree(effective_attestation_version);
+	if (effective_attestation_policy != NULL)
+		pfree(effective_attestation_policy);
 
 	InvokeObjectPostAlterHook(QxProviderRelationId, oldform->oid, 0);
 	ReleaseSysCache(oldtup);
@@ -1407,6 +1737,12 @@ CreatePrincipalCommand(CreatePrincipalStmt *stmt)
 	AclResult	aclresult;
 	ObjectAddress myself;
 	char	   *effective_runtime_class;
+	char	   *provider_attestation_profile;
+	char	   *provider_attestation_version;
+	char	   *provider_attestation_policy;
+	char	   *effective_attestation_profile;
+	char	   *effective_attestation_version;
+	char	   *effective_attestation_policy;
 
 	namespaceoid = RangeVarGetCreationNamespace(stmt->principal_name);
 	ownerid = GetUserId();
@@ -1419,6 +1755,12 @@ CreatePrincipalCommand(CreatePrincipalStmt *stmt)
 	qx_validate_principal_program(stmt->program_name, "CREATE PRINCIPAL");
 	provideroid = qx_validate_principal_provider_binding(namespaceoid, ownerid,
 														 stmt->provider_name);
+	provider_attestation_profile =
+		qx_provider_attestation_profile_by_oid(provideroid);
+	provider_attestation_version =
+		qx_provider_attestation_version_by_oid(provideroid);
+	provider_attestation_policy =
+		qx_provider_attestation_policy_by_oid(provideroid);
 	if (stmt->runtime_class != NULL && stmt->runtime_class[0] != '\0')
 		effective_runtime_class = pstrdup(stmt->runtime_class);
 	else
@@ -1430,10 +1772,22 @@ CreatePrincipalCommand(CreatePrincipalStmt *stmt)
 			pstrdup(qx_default_runtime_for_provider_kind(provider_kind));
 		pfree(provider_kind);
 	}
+	effective_attestation_profile = (stmt->attestation_profile != NULL) ?
+		pstrdup(stmt->attestation_profile) :
+		provider_attestation_profile;
+	effective_attestation_version = (stmt->attestation_version != NULL) ?
+		pstrdup(stmt->attestation_version) :
+		provider_attestation_version;
+	effective_attestation_policy = (stmt->attestation_policy != NULL) ?
+		pstrdup(stmt->attestation_policy) :
+		provider_attestation_policy;
 	qx_validate_principal_runtime_binding(provideroid,
 										  effective_runtime_class,
 										  stmt->sandbox_name,
 										  stmt->receipt_signer,
+										  effective_attestation_profile,
+										  effective_attestation_version,
+										  effective_attestation_policy,
 										  "CREATE PRINCIPAL");
 
 	if (SearchSysCacheExists2(QXPRINCIPALNAMENSP,
@@ -1478,6 +1832,15 @@ CreatePrincipalCommand(CreatePrincipalStmt *stmt)
 	qxpolicy_set_text(values, nulls,
 					  Anum_pg_qx_principal_qxprincipalreceiptsigner,
 					  stmt->receipt_signer);
+	qxpolicy_set_text(values, nulls,
+					  Anum_pg_qx_principal_qxprincipalattestationprofile,
+					  effective_attestation_profile);
+	qxpolicy_set_text(values, nulls,
+					  Anum_pg_qx_principal_qxprincipalattestationversion,
+					  effective_attestation_version);
+	qxpolicy_set_text(values, nulls,
+					  Anum_pg_qx_principal_qxprincipalattestationpolicy,
+					  effective_attestation_policy);
 
 	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
 	CatalogTupleInsert(rel, tup);
@@ -1486,7 +1849,23 @@ CreatePrincipalCommand(CreatePrincipalStmt *stmt)
 
 	qx_record_principal_dependencies(principaloid, ownerid, namespaceoid,
 									 provideroid);
-	pfree(effective_runtime_class);
+	if (provider_attestation_profile != NULL)
+		pfree(provider_attestation_profile);
+	if (provider_attestation_version != NULL)
+		pfree(provider_attestation_version);
+	if (provider_attestation_policy != NULL)
+		pfree(provider_attestation_policy);
+	if (effective_runtime_class != NULL)
+		pfree(effective_runtime_class);
+	if (stmt->attestation_profile != NULL &&
+		effective_attestation_profile != stmt->attestation_profile)
+		pfree(effective_attestation_profile);
+	if (stmt->attestation_version != NULL &&
+		effective_attestation_version != stmt->attestation_version)
+		pfree(effective_attestation_version);
+	if (stmt->attestation_policy != NULL &&
+		effective_attestation_policy != stmt->attestation_policy)
+		pfree(effective_attestation_policy);
 	ObjectAddressSet(myself, QxPrincipalRelationId, principaloid);
 	recordDependencyOnCurrentExtension(&myself, false);
 	InvokeObjectPostCreateHook(QxPrincipalRelationId, principaloid, 0);
@@ -1509,12 +1888,21 @@ AlterPrincipalCommand(AlterPrincipalStmt *stmt)
 	char	   *effective_runtime_class = NULL;
 	char	   *effective_sandbox_name = NULL;
 	char	   *effective_receipt_signer = NULL;
+	char	   *effective_attestation_profile = NULL;
+	char	   *effective_attestation_version = NULL;
+	char	   *effective_attestation_policy = NULL;
+	char	   *provider_attestation_profile = NULL;
+	char	   *provider_attestation_version = NULL;
+	char	   *provider_attestation_policy = NULL;
 
 	if (!stmt->set_provider &&
 		!stmt->set_program &&
 		!stmt->set_sandbox &&
 		!stmt->set_runtime &&
 		!stmt->set_receipt_signer &&
+		!stmt->set_attestation_profile &&
+		!stmt->set_attestation_version &&
+		!stmt->set_attestation_policy &&
 		!stmt->set_enabled)
 		ereport(ERROR,
 				(errcode(ERRCODE_SYNTAX_ERROR),
@@ -1546,6 +1934,18 @@ AlterPrincipalCommand(AlterPrincipalStmt *stmt)
 		qx_validate_principal_program(stmt->program_name, "ALTER PRINCIPAL");
 	if (stmt->set_sandbox)
 		qx_validate_tool_sandbox(stmt->sandbox_name);
+	if (stmt->set_attestation_profile)
+		qx_validate_attestation_text(stmt->attestation_profile,
+									 "attestation profile",
+									 "ALTER PRINCIPAL");
+	if (stmt->set_attestation_version)
+		qx_validate_attestation_text(stmt->attestation_version,
+									 "attestation version",
+									 "ALTER PRINCIPAL");
+	if (stmt->set_attestation_policy)
+		qx_validate_attestation_text(stmt->attestation_policy,
+									 "attestation policy",
+									 "ALTER PRINCIPAL");
 	effective_provideroid = stmt->set_provider ? provideroid :
 		oldform->qxprincipalproviderid;
 	if (stmt->set_runtime)
@@ -1565,6 +1965,12 @@ AlterPrincipalCommand(AlterPrincipalStmt *stmt)
 			pstrdup(qx_default_runtime_for_provider_kind(provider_kind));
 		pfree(provider_kind);
 	}
+	provider_attestation_profile =
+		qx_provider_attestation_profile_by_oid(effective_provideroid);
+	provider_attestation_version =
+		qx_provider_attestation_version_by_oid(effective_provideroid);
+	provider_attestation_policy =
+		qx_provider_attestation_policy_by_oid(effective_provideroid);
 	effective_sandbox_name = stmt->set_sandbox ? pstrdup(stmt->sandbox_name) :
 		qxpolicy_text_attr(oldtup,
 						   Anum_pg_qx_principal_qxprincipalsandbox,
@@ -1573,10 +1979,34 @@ AlterPrincipalCommand(AlterPrincipalStmt *stmt)
 		qxpolicy_text_attr(oldtup,
 						   Anum_pg_qx_principal_qxprincipalreceiptsigner,
 						   QXPRINCIPALOID);
+	effective_attestation_profile = stmt->set_attestation_profile ?
+		pstrdup(stmt->attestation_profile) :
+		qxpolicy_text_attr(oldtup,
+						   Anum_pg_qx_principal_qxprincipalattestationprofile,
+						   QXPRINCIPALOID);
+	if (effective_attestation_profile == NULL)
+		effective_attestation_profile = provider_attestation_profile;
+	effective_attestation_version = stmt->set_attestation_version ?
+		pstrdup(stmt->attestation_version) :
+		qxpolicy_text_attr(oldtup,
+						   Anum_pg_qx_principal_qxprincipalattestationversion,
+						   QXPRINCIPALOID);
+	if (effective_attestation_version == NULL)
+		effective_attestation_version = provider_attestation_version;
+	effective_attestation_policy = stmt->set_attestation_policy ?
+		pstrdup(stmt->attestation_policy) :
+		qxpolicy_text_attr(oldtup,
+						   Anum_pg_qx_principal_qxprincipalattestationpolicy,
+						   QXPRINCIPALOID);
+	if (effective_attestation_policy == NULL)
+		effective_attestation_policy = provider_attestation_policy;
 	qx_validate_principal_runtime_binding(effective_provideroid,
 										  effective_runtime_class,
 										  effective_sandbox_name,
 										  effective_receipt_signer,
+										  effective_attestation_profile,
+										  effective_attestation_version,
+										  effective_attestation_policy,
 										  "ALTER PRINCIPAL");
 
 	rel = table_open(QxPrincipalRelationId, RowExclusiveLock);
@@ -1625,6 +2055,18 @@ AlterPrincipalCommand(AlterPrincipalStmt *stmt)
 						  stmt->receipt_signer);
 		replaces[Anum_pg_qx_principal_qxprincipalreceiptsigner - 1] = true;
 	}
+	qxpolicy_set_text(values, nulls,
+					  Anum_pg_qx_principal_qxprincipalattestationprofile,
+					  effective_attestation_profile);
+	replaces[Anum_pg_qx_principal_qxprincipalattestationprofile - 1] = true;
+	qxpolicy_set_text(values, nulls,
+					  Anum_pg_qx_principal_qxprincipalattestationversion,
+					  effective_attestation_version);
+	replaces[Anum_pg_qx_principal_qxprincipalattestationversion - 1] = true;
+	qxpolicy_set_text(values, nulls,
+					  Anum_pg_qx_principal_qxprincipalattestationpolicy,
+					  effective_attestation_policy);
+	replaces[Anum_pg_qx_principal_qxprincipalattestationpolicy - 1] = true;
 
 	if (stmt->set_enabled)
 	{
@@ -1644,6 +2086,21 @@ AlterPrincipalCommand(AlterPrincipalStmt *stmt)
 		pfree(effective_sandbox_name);
 	if (!stmt->set_receipt_signer && effective_receipt_signer != NULL)
 		pfree(effective_receipt_signer);
+	if (effective_attestation_profile != NULL &&
+		effective_attestation_profile != provider_attestation_profile)
+		pfree(effective_attestation_profile);
+	if (effective_attestation_version != NULL &&
+		effective_attestation_version != provider_attestation_version)
+		pfree(effective_attestation_version);
+	if (effective_attestation_policy != NULL &&
+		effective_attestation_policy != provider_attestation_policy)
+		pfree(effective_attestation_policy);
+	if (provider_attestation_profile != NULL)
+		pfree(provider_attestation_profile);
+	if (provider_attestation_version != NULL)
+		pfree(provider_attestation_version);
+	if (provider_attestation_policy != NULL)
+		pfree(provider_attestation_policy);
 
 	deleteDependencyRecordsForClass(QxPrincipalRelationId, oldform->oid,
 									QxProviderRelationId, DEPENDENCY_NORMAL);
@@ -1724,6 +2181,12 @@ CreateToolCommand(CreateToolStmt *stmt)
 					  stmt->handler_name);
 	qxpolicy_set_text(values, nulls, Anum_pg_qx_tool_qxtoolsandbox,
 					  stmt->sandbox_name);
+	qxpolicy_set_text(values, nulls, Anum_pg_qx_tool_qxtoolruntimeclass,
+					  NULL);
+	qxpolicy_set_text(values, nulls, Anum_pg_qx_tool_qxtoolsandboxceiling,
+					  NULL);
+	qxpolicy_set_text(values, nulls, Anum_pg_qx_tool_qxtoolcapabilitytags,
+					  NULL);
 	qxpolicy_set_text(values, nulls, Anum_pg_qx_tool_qxtoolprincipal,
 					  stmt->principal_name);
 	qxpolicy_set_text(values, nulls, Anum_pg_qx_tool_qxtoolpolicy,

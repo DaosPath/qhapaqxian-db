@@ -15,20 +15,20 @@
 #include "access/htup_details.h"
 #include "access/skey.h"
 #include "access/table.h"
-#include "catalog/pg_qx_task.h"
 #include "catalog/pg_qx_trace.h"
 #include "catalog/pg_type.h"
 #include "commands/tracecmds.h"
 #include "executor/executor.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
+#include "qx/qx_catalog.h"
+#include "qx/qx_observe.h"
 #include "tcop/tcopprot.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/pg_lsn.h"
 #include "utils/rel.h"
-#include "utils/syscache.h"
 
 static Oid qx_extract_oid_literal(Node *expr, const char *subject,
 								  const char *detail, const char *hint);
@@ -183,12 +183,48 @@ qx_replace_trace_numeric_value(const char *source, const char *key,
 }
 
 static char *
+qx_replace_trace_delimited_value(const char *source, const char *key,
+								 const char *replacement)
+{
+	const char *match;
+	const char *value_start;
+	const char *value_end;
+	StringInfoData rewritten;
+
+	if (source == NULL || key == NULL || replacement == NULL)
+		return NULL;
+
+	match = strstr(source, key);
+	if (match == NULL)
+		return pstrdup(source);
+
+	value_start = match + strlen(key);
+	value_end = value_start;
+	while (*value_end != '\0' && *value_end != ';')
+		value_end++;
+
+	if (value_end == value_start)
+		return pstrdup(source);
+
+	initStringInfo(&rewritten);
+	appendBinaryStringInfo(&rewritten, source, match - source);
+	appendStringInfoString(&rewritten, key);
+	appendStringInfoString(&rewritten, replacement);
+	appendStringInfoString(&rewritten, value_end);
+
+	return rewritten.data;
+}
+
+static char *
 qx_normalize_trace_detail(const char *detail, Oid taskoid)
 {
 	char	   *task_fragment;
 	char	   *task_equals_fragment;
 	char	   *normalized;
 	char	   *rewritten;
+	char	   *microvm_accel;
+	char	   *microvm_kernel;
+	char	   *restricted_identity;
 	char	   *final_detail;
 
 	if (detail == NULL)
@@ -199,11 +235,23 @@ qx_normalize_trace_detail(const char *detail, Oid taskoid)
 	normalized = qx_replace_trace_fragment(detail, task_fragment, "task <task>");
 	rewritten = qx_replace_trace_fragment(normalized, task_equals_fragment,
 										  "task=<task>");
-	final_detail = qx_replace_trace_numeric_value(rewritten, "wall_ms=", "<ms>");
+	microvm_accel = qx_replace_trace_delimited_value(rewritten,
+													 "microvm_accel=",
+													 "<accel>");
+	microvm_kernel = qx_replace_trace_delimited_value(microvm_accel,
+													  "microvm_kernel=",
+													  "<kernel>");
+	restricted_identity = qx_replace_trace_delimited_value(microvm_kernel,
+														   "restricted_identity=",
+														   "<identity>");
+	final_detail = qx_replace_trace_numeric_value(restricted_identity, "wall_ms=", "<ms>");
 	pfree(task_fragment);
 	pfree(task_equals_fragment);
 	pfree(normalized);
 	pfree(rewritten);
+	pfree(microvm_accel);
+	pfree(microvm_kernel);
+	pfree(restricted_identity);
 
 	return final_detail;
 }
@@ -213,16 +261,18 @@ ShowTraceResultDesc(void)
 {
 	TupleDesc	tupdesc;
 
-	tupdesc = CreateTemplateTupleDesc(5);
+	tupdesc = CreateTemplateTupleDesc(6);
 	TupleDescInitEntry(tupdesc, (AttrNumber) 1, "trace_state",
 					   TEXTOID, -1, 0);
 	TupleDescInitEntry(tupdesc, (AttrNumber) 2, "trace_name",
 					   TEXTOID, -1, 0);
 	TupleDescInitEntry(tupdesc, (AttrNumber) 3, "trace_detail",
 					   TEXTOID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 4, "has_step",
+	TupleDescInitEntry(tupdesc, (AttrNumber) 4, "trace_summary",
+					   TEXTOID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 5, "has_step",
 					   BOOLOID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 5, "has_semantic_lsn",
+	TupleDescInitEntry(tupdesc, (AttrNumber) 6, "has_semantic_lsn",
 					   BOOLOID, -1, 0);
 
 	return tupdesc;
@@ -232,8 +282,7 @@ void
 ShowTraceCommand(ShowTraceStmt *stmt, DestReceiver *dest)
 {
 	Oid			taskoid;
-	HeapTuple	tasktup;
-	Form_pg_qx_task taskform;
+	QxCatalogTaskInfo task;
 	Relation	rel;
 	ScanKeyData scankey[1];
 	SysScanDesc scan;
@@ -247,16 +296,14 @@ ShowTraceCommand(ShowTraceStmt *stmt, DestReceiver *dest)
 		"Stage 10 exposes engine-owned trace rows directly, but task identifiers still require literal OID input on the utility path.",
 		"Pass a numeric task OID literal, or resolve the task OID in the client before invoking SHOW TRACE.");
 
-	tasktup = SearchSysCache1(QXTASKOID, ObjectIdGetDatum(taskoid));
-	if (!HeapTupleIsValid(tasktup))
+	if (!QxCatalogLookupTaskByOid(taskoid, &task))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("task %u does not exist", taskoid)));
 
-	taskform = (Form_pg_qx_task) GETSTRUCT(tasktup);
-	if (!has_privs_of_role(GetUserId(), taskform->qxtaskowner))
+	if (!has_privs_of_role(GetUserId(), task.ownerid))
 	{
-		ReleaseSysCache(tasktup);
+		QxCatalogFreeTaskInfo(&task);
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("permission denied to inspect trace for task %u", taskoid),
@@ -275,11 +322,12 @@ ShowTraceCommand(ShowTraceStmt *stmt, DestReceiver *dest)
 	while ((tup = systable_getnext(scan)) != NULL)
 	{
 		Form_pg_qx_trace form = (Form_pg_qx_trace) GETSTRUCT(tup);
-		Datum		values[5];
-		bool		nulls[5];
+		Datum		values[6];
+		bool		nulls[6];
 		char	   *name;
 		char	   *detail;
 		char	   *normalized_detail;
+		char	   *summary;
 
 		if (form->qxtracedbid != MyDatabaseId)
 			continue;
@@ -289,6 +337,7 @@ ShowTraceCommand(ShowTraceStmt *stmt, DestReceiver *dest)
 		detail = qx_get_trace_text_attr(RelationGetDescr(rel), tup,
 										Anum_pg_qx_trace_qxtracedetail);
 		normalized_detail = qx_normalize_trace_detail(detail, taskoid);
+		summary = QxObserveSummarizeTraceDetail(name, normalized_detail);
 
 		memset(values, 0, sizeof(values));
 		memset(nulls, false, sizeof(nulls));
@@ -302,8 +351,12 @@ ShowTraceCommand(ShowTraceStmt *stmt, DestReceiver *dest)
 			values[2] = CStringGetTextDatum(normalized_detail);
 		else
 			nulls[2] = true;
-		values[3] = BoolGetDatum(OidIsValid(form->qxtracestepid));
-		values[4] = BoolGetDatum(form->qxtracelsn != InvalidXLogRecPtr);
+		if (summary != NULL)
+			values[3] = CStringGetTextDatum(summary);
+		else
+			nulls[3] = true;
+		values[4] = BoolGetDatum(OidIsValid(form->qxtracestepid));
+		values[5] = BoolGetDatum(form->qxtracelsn != InvalidXLogRecPtr);
 
 		do_tup_output(tstate, values, nulls);
 		emitted++;
@@ -314,6 +367,8 @@ ShowTraceCommand(ShowTraceStmt *stmt, DestReceiver *dest)
 			pfree(detail);
 		if (normalized_detail != NULL)
 			pfree(normalized_detail);
+		if (summary != NULL)
+			pfree(summary);
 
 		if (emitted >= stmt->limit_count)
 			break;
@@ -322,5 +377,5 @@ ShowTraceCommand(ShowTraceStmt *stmt, DestReceiver *dest)
 	end_tup_output(tstate);
 	systable_endscan(scan);
 	table_close(rel, AccessShareLock);
-	ReleaseSysCache(tasktup);
+	QxCatalogFreeTaskInfo(&task);
 }

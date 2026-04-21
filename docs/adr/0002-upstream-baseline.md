@@ -2,6 +2,10 @@
 
 Status: accepted
 
+Note:
+- This ADR records a historical bootstrap decision, not the current implementation status.
+- Use `STATUS.md` for landed state and stage docs for implementation details.
+
 Decision:
 - The bootstrap fork starts from PostgreSQL `REL_17_STABLE`.
 

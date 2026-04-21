@@ -1,9 +1,12 @@
--- QhapaqXian DB Stage 22 brokered container/microvm principal slice
+-- QhapaqXian DB integrated runtime slice with real backend evidence
 
 CREATE PROVIDER public.loopback_provider
   KIND 'loopback'
   ENDPOINT 'local://qhapaqxian-tool-runner'
   RECEIPT KEY 'loopback-stage20-key'
+  ATTESTATION PROFILE 'loopback.local'
+  VERSION 'v1'
+  POLICY loopback_attest
   ATTESTATION ENABLE;
 
 CREATE PROVIDER public.container_provider
@@ -13,6 +16,9 @@ CREATE PROVIDER public.container_provider
   RECEIPT KEY $$-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEATQR0xvmOgsHyUp6bWkQ7xlKHg40piOubNdB+Ew80TOs=
 -----END PUBLIC KEY-----$$
+  ATTESTATION PROFILE 'container.broker'
+  VERSION 'v1'
+  POLICY container_attest
   ATTESTATION ENABLE;
 
 CREATE PROVIDER public.microvm_provider
@@ -22,11 +28,17 @@ CREATE PROVIDER public.microvm_provider
   RECEIPT KEY $$-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEATQR0xvmOgsHyUp6bWkQ7xlKHg40piOubNdB+Ew80TOs=
 -----END PUBLIC KEY-----$$
+  ATTESTATION PROFILE 'microvm.broker'
+  VERSION 'v1'
+  POLICY microvm_attest
   ATTESTATION ENABLE;
 
 ALTER PROVIDER public.loopback_provider
   ENDPOINT 'local://qhapaqxian-tool-runner'
   RECEIPT KEY 'loopback-stage20-key'
+  ATTESTATION PROFILE 'loopback.local'
+  VERSION 'v1'
+  POLICY loopback_attest
   ATTESTATION ENABLE
   ENABLE;
 
@@ -34,27 +46,39 @@ CREATE PRINCIPAL public.search_runner
   PROGRAM 'qhapaqxian-tool-runner'
   SANDBOX 'restricted'
   RUNTIME 'host'
-  PROVIDER public.loopback_provider;
+  PROVIDER public.loopback_provider
+  ATTESTATION PROFILE 'loopback.local'
+  VERSION 'v1'
+  POLICY loopback_attest;
 
 CREATE PRINCIPAL public.extract_runner
   PROGRAM 'qhapaqxian-tool-runner'
   SANDBOX 'isolated'
   RUNTIME 'container'
   PROVIDER public.container_provider
-  SIGNER 'qx_remote_ed25519_private.pem';
+  SIGNER 'qx_remote_ed25519_private.pem'
+  ATTESTATION PROFILE 'container.broker'
+  VERSION 'v1'
+  POLICY container_attest;
 
 CREATE PRINCIPAL public.summarize_runner
   PROGRAM 'qhapaqxian-tool-runner'
   SANDBOX 'isolated'
   RUNTIME 'microvm'
   PROVIDER public.microvm_provider
-  SIGNER 'qx_remote_ed25519_private.pem';
+  SIGNER 'qx_remote_ed25519_private.pem'
+  ATTESTATION PROFILE 'microvm.broker'
+  VERSION 'v1'
+  POLICY microvm_attest;
 
 ALTER PRINCIPAL public.search_runner
   PROVIDER public.loopback_provider
   PROGRAM 'qhapaqxian-tool-runner'
   SANDBOX 'restricted'
-  RUNTIME 'host';
+  RUNTIME 'host'
+  ATTESTATION PROFILE 'loopback.local'
+  VERSION 'v1'
+  POLICY loopback_attest;
 
 CREATE TOOL public.extract
   HANDLER 'builtin.extract'
@@ -294,6 +318,8 @@ SELECT qxcheckpointlabel::text AS checkpoint_label,
 FROM pg_qx_checkpoint
 ORDER BY oid;
 
+\c -
+
 EXPLAIN AGENT RESUME TASK :qx_task_oid FROM CHECKPOINT 'stage8.after_capture';
 
 RESUME TASK :qx_task_oid FROM CHECKPOINT 'stage8.after_capture';
@@ -429,6 +455,133 @@ FROM pg_qx_trace
 WHERE qxtracename IN ('runtime.external_submit', 'runtime.external_resume')
 ORDER BY oid;
 
+CREATE AGENT extractor
+  IDENTITY imperial
+  MODEL 'openai:gpt-5.4-mini'
+  TOOLS (extract)
+  POLICY guarded
+  BUDGET (tokens 1024, cost 128);
+
+START SESSION FOR AGENT extractor
+  WITH CONTEXT jsonb_build_object('mission', 'extract');
+
+SELECT oid AS qx_container_session_oid
+FROM pg_qx_session
+WHERE qxsessionagentid = (SELECT oid FROM pg_qx_agent WHERE qxagentname = 'extractor')
+ORDER BY oid DESC
+LIMIT 1
+\gset
+
+RUN TASK extract_docs IN SESSION :qx_container_session_oid
+  GOAL 'extract docs'
+  INPUT jsonb_build_object('topic', 'archive')
+  PRIORITY high;
+
+SELECT oid AS qx_container_task_oid
+FROM pg_qx_task
+WHERE qxtaskagentid = (SELECT oid FROM pg_qx_agent WHERE qxagentname = 'extractor')
+ORDER BY oid DESC
+LIMIT 1
+\gset
+
+SELECT qxtaskname::text AS task_name,
+       qxtaskstate AS state,
+       qxtaskconsumedtokens > 0 AS charged_tokens,
+       qxtaskconsumedcost > 0 AS charged_cost,
+       qxtasklastattemptid <> 0 AS has_attempt,
+       qxtasklastcheckpointid <> 0 AS has_checkpoint
+FROM pg_qx_task
+WHERE oid = :qx_container_task_oid;
+
+SELECT qxtracename::text AS trace_name,
+       qxtracedetail LIKE '%effective_sandbox=isolated%' AS expected_sandbox,
+       qxtracedetail LIKE '%principal=extract_runner%' AS expected_principal,
+       qxtracedetail LIKE '%principal_runtime=container%' AS expected_principal_runtime,
+       qxtracedetail LIKE '%provider=container_provider%' AS expected_provider,
+       qxtracedetail LIKE '%provider_kind=container%' AS expected_provider_kind,
+       qxtracedetail LIKE '%receipt_alg=ed25519%' AS expected_receipt_alg,
+       qxtracedetail LIKE '%receipt_sig=verified%' AS has_receipt_sig,
+       qxtracedetail LIKE '%attestation=container_receipt_verified%' AS expected_attestation
+FROM pg_qx_trace
+WHERE qxtracetaskid = :qx_container_task_oid
+  AND qxtracename = 'runtime.external_submit';
+
+SELECT pg_qx_test_start_recovery_attempt(:qx_container_task_oid) AS qx_container_recovery_attempt_oid
+\gset
+
+SELECT qxtaskstate AS task_state,
+       qxtasklastattemptid = :qx_container_recovery_attempt_oid AS helper_attempt_recorded,
+       qxtasklastcheckpointid <> 0 AS still_has_checkpoint
+FROM pg_qx_task
+WHERE oid = :qx_container_task_oid;
+
+SELECT qxattemptseqno AS seqno,
+       qxattemptstate AS state,
+       qxattemptresumecheckpointid <> 0 AS resumes_from_checkpoint,
+       qxattemptstrategy::text AS strategy
+FROM pg_qx_attempt
+WHERE oid = :qx_container_recovery_attempt_oid;
+
+SELECT pg_sleep(12);
+
+SELECT EXISTS (
+         SELECT 1
+         FROM pg_stat_qx_scheduler_ledger_heartbeats
+         WHERE task_oid = :qx_container_task_oid
+           AND attempt_seqno = 2
+           AND receipt_mode = 'scheduler-renew'
+       ) AS saw_scheduler_renew,
+       EXISTS (
+         SELECT 1
+         FROM pg_stat_qx_scheduler_ledger_heartbeats
+         WHERE task_oid = :qx_container_task_oid
+           AND attempt_seqno = 2
+           AND receipt_mode = 'scheduler-reclaim'
+       ) AS saw_scheduler_reclaim,
+       EXISTS (
+         SELECT 1
+         FROM pg_qx_task
+         WHERE oid = :qx_container_task_oid
+           AND qxtaskstate = 'k'
+       ) AS task_checkpointed,
+       EXISTS (
+         SELECT 1
+         FROM pg_qx_attempt
+         WHERE oid = :qx_container_recovery_attempt_oid
+           AND qxattemptstate = 'k'
+       ) AS attempt_checkpointed;
+
+SELECT qxtaskstate AS task_state_after_supervision,
+       qxtasklastattemptid = :qx_container_recovery_attempt_oid AS reclaimed_attempt_recorded,
+       qxtasklastcheckpointid <> 0 AS still_has_checkpoint
+FROM pg_qx_task
+WHERE oid = :qx_container_task_oid;
+
+SELECT qxattemptseqno AS seqno,
+       qxattemptstate AS state,
+       qxattemptresumecheckpointid <> 0 AS resumes_from_checkpoint,
+       qxattemptstrategy::text AS strategy
+FROM pg_qx_attempt
+WHERE oid = :qx_container_recovery_attempt_oid;
+
+\c -
+
+SELECT pg_qx_test_run_startup_recovery() AS recovery_report;
+
+SELECT pg_qx_test_run_failover_rebuild() AS recovery_report;
+
+SELECT count(*) AS recovery_queue_rows
+FROM pg_stat_qx_scheduler_ledger_queues
+WHERE task_oid = :qx_container_task_oid
+  AND attempt_seqno = 2
+  AND queue_kind = 2;
+
+SELECT count(*) AS reclaimed_lease_rows
+FROM pg_stat_qx_scheduler_ledger_leases
+WHERE task_oid = :qx_container_task_oid
+  AND attempt_seqno = 2
+  AND lease_state = 4;
+
 CREATE AGENT tiny_budget
   IDENTITY sentinel
   MODEL 'openai:gpt-5.4-mini'
@@ -448,6 +601,52 @@ LIMIT 1
 RUN TASK budget_probe IN SESSION :qx_tiny_session_oid
   GOAL 'should exceed budget'
   INPUT jsonb_build_object('topic', 'over budget');
+
+SELECT task_oid = :qx_container_task_oid AS task_match,
+       attempt_seqno,
+       queue_name::text AS queue_name,
+       queue_kind,
+       priority::text AS priority,
+       runtime_class::text AS runtime_class,
+       provider_name::text AS provider_name,
+       provider_kind::text AS provider_kind,
+       runnable_count,
+       leased_count,
+       blocked_count,
+       retry_count
+FROM pg_stat_qx_scheduler_ledger_queues
+WHERE task_oid = :qx_container_task_oid
+ORDER BY attempt_seqno, queue_kind, retry_count;
+
+SELECT task_oid = :qx_container_task_oid AS task_match,
+       attempt_seqno,
+       worker_name::text AS worker_name,
+       queue_name::text AS queue_name,
+       runtime_class::text AS runtime_class,
+       provider_name::text AS provider_name,
+       provider_kind::text AS provider_kind,
+       lease_state,
+       renewal_count,
+       needs_recovery,
+       lease_expired
+FROM pg_stat_qx_scheduler_ledger_leases
+WHERE task_oid = :qx_container_task_oid
+ORDER BY attempt_seqno, lease_state, renewal_count, worker_name, provider_name;
+
+SELECT task_oid = :qx_container_task_oid AS task_match,
+       attempt_seqno,
+       worker_name::text AS worker_name,
+       queue_name::text AS queue_name,
+       runtime_class::text AS runtime_class,
+       provider_kind::text AS provider_kind,
+       receipt_mode::text AS receipt_mode,
+       heartbeat_state,
+       lag_ms,
+       stale,
+       needs_attention AND stale AS needs_attention
+FROM pg_stat_qx_scheduler_ledger_heartbeats
+WHERE task_oid = :qx_container_task_oid
+ORDER BY attempt_seqno, receipt_mode, worker_name, provider_kind;
 
 SELECT agent_name::text AS agent_name,
        namespace_policy_name::text AS namespace_policy_name,
@@ -489,9 +688,372 @@ SELECT task_oid = :qx_task_oid AS task_match,
        step_count,
        event_count,
        trace_count,
-       checkpoint_count
+       checkpoint_count,
+       scheduler_queue::text AS scheduler_queue,
+       scheduler_runtime::text AS scheduler_runtime,
+       scheduler_provider::text AS scheduler_provider,
+       scheduler_worker::text AS scheduler_worker,
+       scheduler_retry::text AS scheduler_retry
 FROM pg_stat_qx_tasks
 ORDER BY task_oid;
+
+SELECT queue_name::text AS queue_name,
+       namespace_policy_name::text AS namespace_policy_name,
+       queue_kind,
+       priority_weight,
+       runtime_class::text AS runtime_class,
+       provider_name::text AS provider_name,
+       provider_kind::text AS provider_kind,
+       task_count,
+       queued_task_count,
+       running_task_count,
+       checkpointed_task_count,
+       completed_task_count,
+       retrying_task_count,
+       max_retries,
+       heartbeat_interval_ms,
+       lease_ttl_ms
+FROM pg_stat_qx_scheduler_queues
+ORDER BY queue_name;
+
+SELECT worker_name::text AS worker_name,
+       runtime_class::text AS runtime_class,
+       provider_name::text AS provider_name,
+       provider_kind::text AS provider_kind,
+       dispatched_task_count,
+       queue_count,
+       running_task_count,
+       checkpointed_task_count,
+       completed_task_count,
+       retrying_task_count,
+       expired_lease_count,
+       stale_heartbeat_count,
+       lease_state,
+       heartbeat_state
+FROM pg_stat_qx_scheduler_workers
+ORDER BY worker_name, runtime_class, provider_name;
+
+SELECT task_oid = :qx_task_oid AS task_match,
+       attempt_seqno,
+       queue_name::text AS queue_name,
+       queue_kind,
+       priority::text AS priority,
+       runtime_class::text AS runtime_class,
+       provider_name::text AS provider_name,
+       provider_kind::text AS provider_kind,
+       runnable_count,
+       leased_count,
+       blocked_count,
+       retry_count
+FROM pg_stat_qx_scheduler_ledger_queues
+ORDER BY attempt_seqno, queue_name, queue_kind, retry_count, runtime_class, provider_name;
+
+SELECT task_oid = :qx_task_oid AS task_match,
+       attempt_seqno,
+       worker_name::text AS worker_name,
+       queue_name::text AS queue_name,
+       runtime_class::text AS runtime_class,
+       provider_name::text AS provider_name,
+       provider_kind::text AS provider_kind,
+       lease_state,
+       renewal_count,
+       needs_recovery,
+       lease_expired
+FROM pg_stat_qx_scheduler_ledger_leases
+ORDER BY attempt_seqno, lease_state, renewal_count, worker_name, provider_name;
+
+SELECT task_oid = :qx_task_oid AS task_match,
+       attempt_seqno,
+       worker_name::text AS worker_name,
+       queue_name::text AS queue_name,
+       runtime_class::text AS runtime_class,
+       provider_kind::text AS provider_kind,
+       receipt_mode::text AS receipt_mode,
+       heartbeat_state,
+       lag_ms,
+       stale,
+       needs_attention AND stale AS needs_attention
+FROM pg_stat_qx_scheduler_ledger_heartbeats
+ORDER BY attempt_seqno, receipt_mode, worker_name, provider_kind;
+
+SELECT provider_name::text AS provider_name,
+       provider_kind::text AS provider_kind,
+       principal_count,
+       task_count,
+       submit_count,
+       resume_count,
+       verified_receipt_count
+FROM pg_stat_qx_providers
+ORDER BY provider_name;
+
+SELECT principal_name::text AS principal_name,
+       provider_name::text AS provider_name,
+       provider_kind::text AS provider_kind,
+       runtime_class::text AS runtime_class,
+       sandbox_name::text AS sandbox_name,
+       has_signer,
+       task_count,
+       submit_count,
+       resume_count,
+       verified_receipt_count
+FROM pg_stat_qx_principals
+ORDER BY principal_name;
+
+SELECT runtime_class::text AS runtime_class,
+       principal_count,
+       provider_count,
+       task_count,
+       submit_count,
+       resume_count,
+       verified_receipt_count
+FROM pg_stat_qx_runtime_classes
+ORDER BY runtime_class;
+
+SELECT pg_qx_test_start_uncheckpointed_task(:qx_container_session_oid) AS qx_stale_task_oid \gset
+
+SELECT qxtaskname,
+       qxtaskstate,
+       qxtasklastcheckpointid = 0 AS has_no_checkpoint,
+       qxtasklastattemptid <> 0 AS has_attempt
+FROM pg_qx_task
+WHERE oid = :qx_stale_task_oid;
+
+SELECT qxattemptseqno,
+       qxattemptstate,
+       qxattemptresumecheckpointid = 0 AS starts_fresh,
+       qxattemptstrategy
+FROM pg_qx_attempt
+WHERE qxattempttaskid = :qx_stale_task_oid
+ORDER BY qxattemptseqno;
+
+SELECT pg_sleep(12);
+
+SELECT qxtaskstate,
+       qxtasklastcheckpointid = 0 AS has_no_checkpoint,
+       EXISTS (
+         SELECT 1
+         FROM pg_qx_attempt
+         WHERE qxattempttaskid = :qx_stale_task_oid
+           AND qxattemptstate = 'f'
+       ) AS has_failed_attempt,
+       EXISTS (
+         SELECT 1
+         FROM pg_stat_qx_scheduler_ledger_heartbeats
+         WHERE task_oid = :qx_stale_task_oid
+           AND receipt_mode = 'scheduler-renew'
+       ) AS saw_scheduler_renew,
+       EXISTS (
+         SELECT 1
+         FROM pg_stat_qx_scheduler_ledger_heartbeats
+         WHERE task_oid = :qx_stale_task_oid
+           AND receipt_mode = 'scheduler-reclaim'
+       ) AS saw_scheduler_reclaim
+FROM pg_qx_task
+WHERE oid = :qx_stale_task_oid;
+
+SELECT count(*) AS checkpoint_rows
+FROM pg_qx_checkpoint
+WHERE qxcheckpointtaskid = :qx_stale_task_oid;
+
+SELECT count(*) AS retry_queue_rows
+FROM pg_stat_qx_scheduler_ledger_queues
+WHERE task_oid = :qx_stale_task_oid
+  AND queue_kind = 1;
+
+SELECT count(*) AS reclaimed_lease_rows
+FROM pg_stat_qx_scheduler_ledger_leases
+WHERE task_oid = :qx_stale_task_oid
+  AND lease_state = 4;
+
+SELECT pg_qx_scheduler_worker_slot_count() = 2 AS slot_count_is_two;
+
+SELECT task_oid = :qx_stale_task_oid AS task_match,
+       owner_slot BETWEEN 1 AND slot_count AS owner_slot_valid,
+       slot_count = 2 AS slot_count_is_two,
+       retry_count = 1 AS retry_count_is_one,
+       priority::text = 'high' AS is_high_priority,
+       retry_delay_ms >= 3000 AS backoff_applied,
+       remaining_backoff_ms >= 0 AS remaining_nonnegative
+FROM pg_stat_qx_scheduler_retry_backoff
+WHERE task_oid = :qx_stale_task_oid;
+
+SELECT EXISTS (
+         SELECT 1
+         FROM pg_stat_qx_scheduler_ledger_leases
+         WHERE task_oid = :qx_stale_task_oid
+           AND worker_name LIKE 'qhapaqxian scheduler db % slot %/%'
+       ) AS saw_slotted_scheduler_worker;
+
+SELECT pg_sleep(6);
+
+SELECT qxtaskstate,
+       qxtasklastcheckpointid <> 0 AS has_checkpoint,
+       EXISTS (
+         SELECT 1
+         FROM pg_qx_attempt
+         WHERE qxattempttaskid = :qx_stale_task_oid
+           AND qxattemptseqno = 2
+           AND qxattemptstate = 'k'
+           AND qxattemptstrategy = 'retry'
+       ) AS retry_attempt_checkpointed,
+       EXISTS (
+         SELECT 1
+         FROM pg_qx_trace
+         WHERE qxtracetaskid = :qx_stale_task_oid
+           AND qxtracename = 'runtime.retry_dispatch'
+       ) AS saw_retry_dispatch,
+       EXISTS (
+         SELECT 1
+         FROM pg_qx_trace
+         WHERE qxtracetaskid = :qx_stale_task_oid
+           AND qxtracename = 'runtime.external_submit'
+       ) AS saw_retry_submit
+FROM pg_qx_task
+WHERE oid = :qx_stale_task_oid;
+
+SELECT qxattemptseqno,
+       qxattemptstate,
+       qxattemptresumecheckpointid = 0 AS starts_fresh,
+       qxattemptstrategy
+FROM pg_qx_attempt
+WHERE qxattempttaskid = :qx_stale_task_oid
+ORDER BY qxattemptseqno;
+
+SELECT count(*) AS retry_queue_rows_after_retry
+FROM pg_stat_qx_scheduler_ledger_queues
+WHERE task_oid = :qx_stale_task_oid
+  AND queue_kind = 1;
+
+SELECT count(*) AS released_retry_lease_rows
+FROM pg_stat_qx_scheduler_ledger_leases
+WHERE task_oid = :qx_stale_task_oid
+  AND attempt_seqno = 2
+  AND lease_state = 3;
+
+SELECT count(*) AS scheduler_release_retry_rows
+FROM pg_stat_qx_scheduler_ledger_heartbeats
+WHERE task_oid = :qx_stale_task_oid
+  AND attempt_seqno = 2
+  AND receipt_mode = 'scheduler-release';
+
+SELECT queue_name::text AS queue_name,
+       runtime_class::text AS runtime_class,
+       provider_name::text AS provider_name,
+       provider_kind::text AS provider_kind,
+       checkpointed_task_count > 0 AS has_checkpointed_tasks,
+       renew_event_count > 0 AS saw_renew_activity,
+       reclaim_event_count > 0 AS saw_reclaim_activity,
+       release_event_count > 0 AS saw_release_activity,
+       retry_queue_snapshot_count > 0 AS saw_retry_history,
+       released_lease_snapshot_count > 0 AS saw_released_leases,
+       reclaimed_lease_snapshot_count > 0 AS saw_reclaimed_leases,
+       max_lease_renewal_count > 0 AS saw_renewal_depth
+FROM pg_stat_qx_scheduler_activity
+WHERE queue_name = 'guarded:high:extractor'
+  AND runtime_class = 'container'
+  AND provider_name = 'container_provider';
+
+SELECT count(*) = 2 AS saw_two_slots,
+       min(owner_slot) = 1 AS has_slot_one,
+       max(owner_slot) = 2 AS has_slot_two,
+       max(slot_count) = 2 AS slot_count_is_two,
+       bool_and(worker_name LIKE 'qhapaqxian scheduler db % slot %/%') AS names_ok,
+       sum(owned_task_count) >= 1 AS saw_owned_tasks
+FROM pg_stat_qx_scheduler_worker_balance
+WHERE queue_name = 'guarded:high:extractor'
+  AND runtime_class = 'container'
+  AND provider_name = 'container_provider';
+
+SELECT pg_qx_test_start_uncheckpointed_task_priority(:qx_container_session_oid, 'high') AS qx_fair_high_task_oid \gset
+SELECT pg_qx_test_start_uncheckpointed_task_priority(:qx_container_session_oid, 'urgent') AS qx_fair_urgent_task_oid \gset
+
+SELECT qxtaskpriority::text AS high_priority
+FROM pg_qx_task
+WHERE oid = :qx_fair_high_task_oid;
+
+SELECT qxtaskpriority::text AS urgent_priority
+FROM pg_qx_task
+WHERE oid = :qx_fair_urgent_task_oid;
+
+SELECT pg_sleep(12);
+
+SELECT (SELECT qxtaskstate
+        FROM pg_qx_task
+        WHERE oid = :qx_fair_high_task_oid) AS high_state,
+       (SELECT qxtaskstate
+        FROM pg_qx_task
+        WHERE oid = :qx_fair_urgent_task_oid) AS urgent_state,
+       EXISTS (
+         SELECT 1
+         FROM pg_qx_attempt
+         WHERE qxattempttaskid = :qx_fair_high_task_oid
+           AND qxattemptstate = 'f'
+       ) AS high_failed,
+       EXISTS (
+         SELECT 1
+         FROM pg_qx_attempt
+         WHERE qxattempttaskid = :qx_fair_urgent_task_oid
+           AND qxattemptstate = 'f'
+       ) AS urgent_failed;
+
+SELECT pg_sleep(6);
+
+SELECT (SELECT qxtaskstate
+        FROM pg_qx_task
+        WHERE oid = :qx_fair_high_task_oid) AS high_state,
+       (SELECT qxtaskstate
+        FROM pg_qx_task
+        WHERE oid = :qx_fair_urgent_task_oid) AS urgent_state,
+       EXISTS (
+         SELECT 1
+         FROM pg_qx_attempt
+         WHERE qxattempttaskid = :qx_fair_high_task_oid
+          AND qxattemptseqno = 2
+       ) AS high_retried,
+       EXISTS (
+         SELECT 1
+         FROM pg_qx_attempt
+         WHERE qxattempttaskid = :qx_fair_urgent_task_oid
+          AND qxattemptseqno = 2
+       ) AS urgent_retried,
+       EXISTS (
+         SELECT 1
+         FROM pg_qx_trace
+         WHERE qxtracetaskid = :qx_fair_high_task_oid
+          AND qxtracename = 'runtime.retry_dispatch'
+       ) AS high_retry_dispatch,
+       EXISTS (
+         SELECT 1
+         FROM pg_qx_trace
+         WHERE qxtracetaskid = :qx_fair_urgent_task_oid
+          AND qxtracename = 'runtime.retry_dispatch'
+       ) AS urgent_retry_dispatch,
+       COALESCE(
+         (SELECT min(oid)
+          FROM pg_qx_trace
+          WHERE qxtracetaskid = :qx_fair_urgent_task_oid
+            AND qxtracename = 'runtime.retry_dispatch') <
+         (SELECT min(oid)
+          FROM pg_qx_trace
+          WHERE qxtracetaskid = :qx_fair_high_task_oid
+            AND qxtracename = 'runtime.retry_dispatch'),
+         false
+       ) AS urgent_dispatched_first;
+
+SELECT 'high'::text AS task_bucket,
+       qxattemptseqno,
+       qxattemptstate,
+       qxattemptstrategy::text AS qxattemptstrategy
+FROM pg_qx_attempt
+WHERE qxattempttaskid = :qx_fair_high_task_oid
+UNION ALL
+SELECT 'urgent'::text AS task_bucket,
+       qxattemptseqno,
+       qxattemptstate,
+       qxattemptstrategy::text AS qxattemptstrategy
+FROM pg_qx_attempt
+WHERE qxattempttaskid = :qx_fair_urgent_task_oid
+ORDER BY task_bucket, qxattemptseqno;
 
 CREATE ROLE qx_observer LOGIN;
 
@@ -507,6 +1069,33 @@ FROM pg_stat_qx_sessions;
 
 SELECT count(*) AS visible_tasks
 FROM pg_stat_qx_tasks;
+
+SELECT count(*) AS visible_scheduler_queues
+FROM pg_stat_qx_scheduler_queues;
+
+SELECT count(*) AS visible_scheduler_workers
+FROM pg_stat_qx_scheduler_workers;
+
+SELECT count(*) AS visible_scheduler_activity
+FROM pg_stat_qx_scheduler_activity;
+
+SELECT count(*) AS visible_scheduler_ledger_queues
+FROM pg_stat_qx_scheduler_ledger_queues;
+
+SELECT count(*) AS visible_scheduler_ledger_leases
+FROM pg_stat_qx_scheduler_ledger_leases;
+
+SELECT count(*) AS visible_scheduler_ledger_heartbeats
+FROM pg_stat_qx_scheduler_ledger_heartbeats;
+
+SELECT count(*) AS visible_providers
+FROM pg_stat_qx_providers;
+
+SELECT count(*) AS visible_principals
+FROM pg_stat_qx_principals;
+
+SELECT count(*) AS visible_runtime_classes
+FROM pg_stat_qx_runtime_classes;
 
 SELECT has_table_privilege(current_user, 'pg_qx_memory', 'SELECT') AS can_select_memory;
 

@@ -25,6 +25,9 @@ CATALOG(pg_qx_tool,9585,QxToolRelationId)
 #ifdef CATALOG_VARLEN
 	text		qxtoolhandler BKI_FORCE_NULL;
 	text		qxtoolsandbox BKI_FORCE_NULL;
+	text		qxtoolruntimeclass BKI_FORCE_NULL;
+	text		qxtoolsandboxceiling BKI_FORCE_NULL;
+	text		qxtoolcapabilitytags BKI_FORCE_NULL;
 	text		qxtoolprincipal BKI_FORCE_NULL;
 	text		qxtoolpolicy BKI_FORCE_NULL;
 #endif

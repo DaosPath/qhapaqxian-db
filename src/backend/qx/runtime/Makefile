@@ -9,6 +9,8 @@ top_builddir = ../../../..
 include $(top_builddir)/src/Makefile.global
 
 OBJS = \
-	qx_runtime.o
+	qx_runtime.o \
+	qx_container_backend.o \
+	qx_microvm_backend.o
 
 include $(top_srcdir)/src/backend/common.mk

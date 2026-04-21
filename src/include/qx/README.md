@@ -1,16 +1,13 @@
-# QhapaqXian Engine Public Backend Headers
+# QhapaqXian Public Backend Headers
 
-This directory is reserved for fork-owned headers shared across backend
-subsystems.
+This tree holds fork-owned headers shared across backend subsystems. Keep these
+headers small, stable, and focused on cross-module data contracts.
 
-Expected future headers:
-- runtime state
-- scheduler APIs
-- recovery primitives
-- budget and policy structs
-- explain/tracing structs
+Current public surfaces:
+- catalog snapshots and lookup/free APIs
+- runtime, scheduler, recovery, and observability structs as they land
+- policy, budget, and identity contracts shared by security and runtime
 
-Bootstrap note:
-- parser node definitions and catalog bootstrap definitions still belong in
-  standard PostgreSQL include locations until their upstream integration points
-  are introduced.
+Boundary rule:
+- parser node definitions and catalog bootstrap definitions stay in the normal
+  PostgreSQL include paths until the fork adds a true upstream replacement.

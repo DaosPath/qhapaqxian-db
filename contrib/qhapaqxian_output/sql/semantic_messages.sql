@@ -6,6 +6,9 @@ CREATE PROVIDER public.loopback_provider
   KIND 'loopback'
   ENDPOINT 'local://qhapaqxian-tool-runner'
   RECEIPT KEY 'loopback-stage20-key'
+  ATTESTATION PROFILE 'loopback.local'
+  VERSION 'v1'
+  POLICY loopback_attest
   ATTESTATION ENABLE;
 
 CREATE PROVIDER public.container_provider
@@ -15,6 +18,9 @@ CREATE PROVIDER public.container_provider
   RECEIPT KEY $$-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEATQR0xvmOgsHyUp6bWkQ7xlKHg40piOubNdB+Ew80TOs=
 -----END PUBLIC KEY-----$$
+  ATTESTATION PROFILE 'container.broker'
+  VERSION 'v1'
+  POLICY container_attest
   ATTESTATION ENABLE;
 
 CREATE PROVIDER public.microvm_provider
@@ -24,27 +30,39 @@ CREATE PROVIDER public.microvm_provider
   RECEIPT KEY $$-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEATQR0xvmOgsHyUp6bWkQ7xlKHg40piOubNdB+Ew80TOs=
 -----END PUBLIC KEY-----$$
+  ATTESTATION PROFILE 'microvm.broker'
+  VERSION 'v1'
+  POLICY microvm_attest
   ATTESTATION ENABLE;
 
 CREATE PRINCIPAL public.search_runner
   PROGRAM 'qhapaqxian-tool-runner'
   SANDBOX 'restricted'
   RUNTIME 'host'
-  PROVIDER public.loopback_provider;
+  PROVIDER public.loopback_provider
+  ATTESTATION PROFILE 'loopback.local'
+  VERSION 'v1'
+  POLICY loopback_attest;
 
 CREATE PRINCIPAL public.extract_runner
   PROGRAM 'qhapaqxian-tool-runner'
   SANDBOX 'isolated'
   RUNTIME 'container'
   PROVIDER public.container_provider
-  SIGNER 'qx_remote_ed25519_private.pem';
+  SIGNER 'qx_remote_ed25519_private.pem'
+  ATTESTATION PROFILE 'container.broker'
+  VERSION 'v1'
+  POLICY container_attest;
 
 CREATE PRINCIPAL public.summarize_runner
   PROGRAM 'qhapaqxian-tool-runner'
   SANDBOX 'isolated'
   RUNTIME 'microvm'
   PROVIDER public.microvm_provider
-  SIGNER 'qx_remote_ed25519_private.pem';
+  SIGNER 'qx_remote_ed25519_private.pem'
+  ATTESTATION PROFILE 'microvm.broker'
+  VERSION 'v1'
+  POLICY microvm_attest;
 
 CREATE TOOL public.search
   HANDLER 'builtin.search'
@@ -107,7 +125,17 @@ WITH decoded AS (
   FROM pg_logical_slot_peek_changes('qx_semantic_slot', NULL, NULL)
 )
 SELECT count(*) AS total_messages,
-       count(*) FILTER (WHERE msg->>'schema' = 'stage9.semantic.v1') AS schema_v1_messages
+       count(*) FILTER (WHERE msg->>'schema' = 'stage9.semantic.v1') AS schema_v1_messages,
+       count(*) FILTER (WHERE msg->>'schema' = 'stage31.semantic.v2') AS schema_v2_messages
+FROM decoded;
+
+WITH decoded AS (
+  SELECT data::jsonb AS msg
+  FROM pg_logical_slot_peek_changes('qx_semantic_slot', NULL, NULL)
+)
+SELECT count(*) FILTER (WHERE msg->>'schema' = 'stage31.semantic.v2' AND msg ? 'provider_kind') AS v2_provider_kind_messages,
+       count(*) FILTER (WHERE msg->>'schema' = 'stage31.semantic.v2' AND msg ? 'principal_runtime') AS v2_principal_runtime_messages,
+       count(*) FILTER (WHERE msg->>'schema' = 'stage31.semantic.v2' AND msg ? 'restricted_identity') AS v2_restricted_identity_messages
 FROM decoded;
 
 WITH decoded AS (
@@ -126,7 +154,21 @@ FROM (
   FROM pg_logical_slot_peek_changes('qx_semantic_slot', NULL, NULL)
 ) decoded
 WHERE msg->>'record_kind' = 'event'
-ORDER BY event_kind;
+ORDER BY CASE msg->>'kind'
+           WHEN 'SESSION_STARTED' THEN 1
+           WHEN 'TASK_CHECKPOINTED' THEN 2
+           WHEN 'TASK_COMPLETED' THEN 3
+           WHEN 'TASK_DISPATCHED' THEN 4
+           WHEN 'TASK_INPUT_CAPTURED' THEN 5
+           WHEN 'TASK_QUEUED' THEN 6
+           WHEN 'TASK_READY_FOR_RESUME' THEN 7
+           WHEN 'TASK_RESUME_DISPATCHED' THEN 8
+           WHEN 'TASK_RESUMED' THEN 9
+           WHEN 'TASK_TOOL_EXECUTED' THEN 10
+           WHEN 'TASK_TOOLS_AUTHORIZED' THEN 11
+           ELSE 99
+         END,
+         event_kind;
 
 WITH decoded AS (
   SELECT data::jsonb AS msg

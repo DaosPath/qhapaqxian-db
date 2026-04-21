@@ -19,6 +19,7 @@
 #include "port/atomics.h"
 #include "postmaster/bgworker_internals.h"
 #include "postmaster/postmaster.h"
+#include "qx/qx_runtime.h"
 #include "replication/logicallauncher.h"
 #include "replication/logicalworker.h"
 #include "storage/ipc.h"
@@ -132,6 +133,12 @@ static const struct
 	},
 	{
 		"TablesyncWorkerMain", TablesyncWorkerMain
+	},
+	{
+		"QxRuntimeSchedulerLauncherMain", QxRuntimeSchedulerLauncherMain
+	},
+	{
+		"QxRuntimeSchedulerDatabaseWorkerMain", QxRuntimeSchedulerDatabaseWorkerMain
 	}
 };
 

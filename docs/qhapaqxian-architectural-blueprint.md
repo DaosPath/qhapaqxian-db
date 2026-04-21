@@ -1,10 +1,13 @@
 # QhapaqXian DB - Architectural Blueprint v0
 
-Status: initial architecture seed for an empty repository on 2026-03-26.
+Role: target-design seed and architectural thesis for the fork.
+
+Status: historical architecture seed for an empty repository on 2026-03-26.
 
 Current-state note:
-- this blueprint is the architecture seed and target-design document;
-- the canonical repository implementation status now lives in `STATUS.md`.
+- this blueprint is design intent, not a live implementation ledger;
+- use `STATUS.md` for the canonical repository implementation status;
+- use `docs/adr/*.md` for decision history and `docs/rebase-strategy.md` for maintenance policy.
 
 Explicit inferences:
 - This repository is currently empty, so this document defines the first engineering baseline rather than describing existing code.
@@ -15,9 +18,13 @@ Required thesis:
 > QhapaqXian DB exists because a real AgentDB needs agents, memory, tasks, execution, recovery, and observability to be engine primitives, not only an external layer over SQL.
 
 Throughout this document:
-- `MVP del fork` = the narrowest implementation that still justifies a fork.
-- `Arquitectura objetivo` = the intended durable design.
+- `MVP del fork` = the narrowest implementation plan that still justifies a fork.
+- `Arquitectura objetivo` = the intended durable design, regardless of what is already landed.
 - `Deuda tecnica aceptada` = shortcuts allowed while the fork is still validating product shape.
+
+Reading rule:
+- if a paragraph sounds like a shipped capability, treat it as target design unless `STATUS.md` says it is landed;
+- if a statement is meant to describe current code, this blueprint should point to the stage docs or `STATUS.md` instead of asserting state directly.
 
 ## 1. Manifiesto tecnico del fork
 

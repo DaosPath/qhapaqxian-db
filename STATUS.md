@@ -17,13 +17,27 @@ Documentation hierarchy:
 - `docs/stage-*/README.md` = stage-local landed contracts and notes
 
 Snapshot date:
-- `2026-03-30`
+- `2026-04-20`
 
 Last validated test sweep:
-- `meson test -C build-stage4 --no-rebuild --suite postgresql:setup --print-errorlogs`
-- `meson test -C build-stage4 --no-rebuild --suite postgresql:qhapaqxian_output --print-errorlogs`
-- `meson test -C build-stage4 --no-rebuild --suite postgresql:regress --print-errorlogs`
-- result: `setup` OK, `qhapaqxian_output` OK (`1 subtests passed`), `regress` OK (`225 subtests passed`)
+- Windows: `meson compile -C build-stage4-codex -j 2`
+- Windows: `meson test -C build-stage4-codex --suite postgresql:setup --print-errorlogs`
+- Windows: `meson test -C build-stage4-codex --suite postgresql:qhapaqxian_output --print-errorlogs`
+- Windows: focused `qx_stage3_agentic` regression with Docker real, QEMU
+  `microvm`/`tcg`, autonomous scheduler launcher/database bgworkers,
+  durable lease renewal, checkpoint-backed reclaim repair, idempotent
+  startup/failover recovery, failover rebuild coverage, retry-priority
+  fairness assertions (`urgent` retry dispatch before `high` on the durable
+  trace order), deterministic multi-worker slot ownership, priority-aware
+  retry backoff, worker-balance visibility, and
+  `pg_stat_qx_scheduler_activity` observability assertions
+- WSL Ubuntu 24.04: direct QEMU/KVM boot marker `QX-MICROVM-BOOT-OK`
+- WSL Ubuntu 24.04: runner smoke with `microvm_accel=kvm`
+- WSL Ubuntu 24.04: `meson compile -C build-kvm -j 4`
+- WSL Ubuntu 24.04: `meson test -C build-kvm --suite postgresql:setup --print-errorlogs`
+- WSL Ubuntu 24.04: `QX_MICROVM_ACCEL=kvm meson test -C build-kvm --suite postgresql:qhapaqxian_output --print-errorlogs`
+- WSL Ubuntu 24.04: focused `qx_stage3_agentic` regression with microVM KVM and Docker real
+- result: Windows setup/output OK; WSL setup/output OK; focused real-backend regressions OK
 
 Status legend:
 - `yes` = present and wired
@@ -44,30 +58,30 @@ Status legend:
 | 8 planner/executor boundary | yes | yes | yes | yes | `AgentPlan` is real, but still narrower than a full agent-aware optimizer |
 | 9 semantic WAL/decoder | yes | yes | yes | yes | logical-message boundary exists; no dedicated WAL record family or downstream subscription control |
 | 10 memory/trace surface | yes | yes | yes | yes | memory still lives on ordinary catalogs/storage; no deeper AM/vector specialization |
-| 11 operability surface | yes | yes | yes | partial | system views exist, but no dedicated stats collector or richer operator dashboard |
+| 11 operability surface | yes | yes | yes | partial | system views now include scheduler queue/worker/activity rollups plus retry-backoff and worker-balance visibility, but there is still no dedicated stats collector or broader operator dashboard |
 | 12 security seed | yes | yes | yes | partial | owner filtering/revocation landed, but not full namespace isolation |
 | 13 identity snapshots | yes | yes | yes | yes | identity is durable, but policy evaluation still snapshots rather than fully dynamic |
 | 14 namespace policy/runtime metering | yes | yes | yes | yes | metering is engine-owned; not yet reconciled with external provider billing truth |
-| 15 policy/tool DDL cleanup | yes | yes | yes | yes | tool model is real, but provider-backed execution remains brokered |
+| 15 policy/tool DDL cleanup | yes | yes | yes | yes | tool model is real; later stages supersede the original broker-only execution boundary |
 | 16 principal-backed execution | yes | yes | yes | yes | external tool execution is real, but still via shipped runner rather than dedicated remote plane |
-| 17 stronger sandboxing | yes | yes | yes | yes | OS-level launch controls exist; no container or microVM isolation yet |
+| 17 stronger sandboxing | yes | yes | yes | yes | OS-level launch controls exist; later stages add container/microVM runtime classes and real Docker/QEMU launch paths |
 | 18 restricted-identity launch | yes | yes | yes | yes | restricted-identity evidence is strongest on Windows; cross-platform parity is weaker |
 | 19 provider receipts | yes | yes | yes | yes | provider receipts exist, but provider trust is still local/brokered rather than independently attested |
 | 20 brokered remote/HMAC | yes | yes | yes | yes | shared-key receipt model remains weaker than asymmetric or hardware-rooted attestation |
 | 21 asymmetric receipts | yes | yes | yes | yes | signer material is still repo/bindir local; no certificate chain or hardware root |
-| 22 container/microVM runtime classes | yes | yes | yes | yes | `container://` and `microvm://` are brokered runtime classes, not real backend-launched containers/microVMs |
-| 23 attestation contracts | yes | yes | no | partial | attestation bundles are catalog-validated, but no runtime verifier or dedicated regression matrix exists yet |
-| 24 container backend scaffold | yes | yes | no | partial | request/response contracts exist, but `qx_runtime.c` does not launch a real container backend yet |
-| 25 microVM backend scaffold | yes | yes | no | partial | scaffold is broker-facing only; no real microVM launcher or provider integration yet |
-| 26 scheduler scaffold | yes | yes | no | no | queue/lease/heartbeat shapes compile, but no runtime wiring, worker loop, or durable scheduler store exists yet |
-| 27 recovery scanner scaffold | yes | partial | no | no | recovery scanner API and build wiring exist, but runtime/scheduler integration and test coverage are still pending |
-| 28 observability scaffold | yes | yes | no | partial | helpers exist, but no callers or system views are wired yet |
+| 22 container/microVM runtime classes | yes | yes | yes | yes | runtime classes now have real Docker and QEMU launch paths; deeper OCI policy and VM lifecycle ownership remain future work |
+| 23 attestation contracts | yes | yes | partial | partial | attestation bundles are consumed by real backend paths; stronger provenance roots and broader contract matrices remain future work |
+| 24 container backend scaffold | yes | yes | partial | yes | Docker launch is wired and validated; cgroup/seccomp/image-policy ownership remains future work |
+| 25 microVM backend scaffold | yes | yes | partial | yes | QEMU `microvm` launch is wired and validated with Windows TCG and WSL KVM; VM lifecycle supervision and KVM CI remain future work |
+| 26 scheduler scaffold | yes | yes | yes | partial | durable queue/lease/heartbeat catalogs, release snapshots, autonomous launcher/database bgworkers, deterministic two-slot per-database ownership, lease renewal, reclaim snapshots, checkpoint-backed task/attempt repair, non-checkpoint stale-attempt fail-closed retry repair (`failed` attempt + durable `RETRY` queue + queued backoff), autonomous retry intake that now ranks eligible retry candidates by priority/eligibility order before re-running real submit work, priority-aware exponential retry backoff with deterministic jitter, failover rebuild snapshots, and ledger-backed queue/worker/activity/backoff/balance views now exist, but dynamic slot scaling and a dedicated scheduler stats plane remain future work |
+| 27 recovery scanner scaffold | yes | yes | yes | partial | startup recovery, failover rebuild, and the autonomous scheduler supervisor now drive real scheduler requeue/reclaim writes, repeated scans suppress duplicate recovery queue/reclaimed-lease evidence when the latest durable scheduler ledger already reflects the repair, and stale no-checkpoint attempts now fail closed into queued retry state before a later autonomous retry dispatch; deeper semantic replay, adaptive retry/dead-letter policy, and broader supervision policy remain future work |
+| 28 observability scaffold | yes | yes | partial | partial | `qx_observe` now backs `SHOW TRACE` summaries, the scheduler durable ledger plus `pg_stat_qx_scheduler_activity`, `pg_stat_qx_scheduler_retry_backoff`, and `pg_stat_qx_scheduler_worker_balance` exist, and focused `qx_stage3_agentic` covers renew/reclaim/release/retry aggregation plus slot/backoff/balance assertions, but there is still no dedicated stats collector or standalone observability test suite |
 | 29 capability-aware planner/executor | yes | partial | no | partial | structured capability decisions exist, but runtime handoff still uses existing contract strings |
 | 30 security/tool capability contract | yes | yes | no | partial | capability tags and ceilings flow through authorization, but policy compilation and OS-level enforcement are still separate concerns |
 | 31 semantic payload v2 | yes | yes | yes | yes | v2 payloads cover verified execution events, but the replication surface is still logical-message text rather than a deeper WAL family |
-| 32 catalog snapshot helper layer | yes | yes | no | no | shared lookup layer exists, but callers are only partially migrated and helper coverage is still indirect |
+| 32 catalog snapshot helper layer | yes | yes | partial | partial | recovery, planner, security authorization/validation, selected runtime reads plus budget validation, command authorization reads, and the main `pg_stat_qx_*` contract extractors now consume shared helpers through `qx_catalog`/`qx_observe`; runtime write paths, scheduler, and broader observability aggregation still need migration and helper coverage remains indirect |
 
 Canonical next-gap summary:
-- strongest remaining platform gap: real container or microVM backends behind Stage 22 provider/runtime classes;
-- strongest observability gap: richer operator-facing status beyond the current system views and traces;
+- strongest remaining platform gap: hardening real Docker/QEMU backends into owned OCI policy, VM lifecycle supervision, and self-hosted KVM CI coverage;
+- strongest observability gap: turn the current ledger-backed queue/worker/activity/backoff/balance SQL rollups into a dedicated stats collector/dashboard with stronger historical/SLO accounting;
 - strongest documentation gap: older stage docs still vary in depth and shape; use `docs/stage-template.md` and `docs/README.md` as the cleanup baseline.

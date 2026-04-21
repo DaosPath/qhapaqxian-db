@@ -1,19 +1,20 @@
-# QhapaqXian Engine Backend Scaffold
+# QhapaqXian Backend Subsystems
 
-This directory is reserved for fork-owned backend subsystems that should remain
-as isolated from upstream churn as practical.
+This tree owns fork-specific backend code. Keep subsystem boundaries narrow and
+prefer helper layers under `src/backend/qx/` before widening upstream edits.
 
-Planned children:
-- `catalog/`
-- `runtime/`
-- `scheduler/`
-- `recovery/`
-- `memory/`
-- `planner/`
-- `executor/`
-- `security/`
-- `observe/`
+Subsystem map:
+- `catalog/`: snapshot helpers over fork-owned catalogs; partial but real
+- `security/`: identity, namespace, tool, and budget enforcement
+- `runtime/`: embedded task runtime and external launch boundary
+- `planner/`: `AgentPlan` shaping and cost model hooks
+- `executor/`: step execution and tool orchestration
+- `memory/`: working, episodic, and semantic memory helpers
+- `scheduler/`: admission and worker assignment
+- `recovery/`: restart scan and orphan/task repair
+- `observe/`: trace, explain, and status surfaces
 
-Bootstrap rule:
-- prefer adding new fork behavior here before editing broad upstream files;
-- touch upstream core only where parser, catalogs, runtime lifecycle, or recovery semantics require it.
+Rule of thumb:
+- add fork behavior here first;
+- touch upstream core only when parser, catalogs, runtime lifecycle, or
+  recovery semantics must change.

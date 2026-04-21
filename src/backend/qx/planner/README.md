@@ -1,11 +1,13 @@
 # QhapaqXian Planner Layer
 
-Planned responsibility:
-- `AgentPlan` construction
-- agent-specific costing
-- semantic retrieval planning
-- branch/retry/replan graph logic
+Role:
+- construct `AgentPlan` objects, cost agent steps, and decide retry / branch /
+  replan shape.
 
-Bootstrap note:
-- the bootstrap fork does not pretend this planner exists yet;
-- utility-path execution comes first, planner integration comes later.
+Current state:
+- planner boundary exists and feeds the current task execution path.
+
+Integration debt:
+- cost and branching logic are still narrower than the target agent-aware
+  optimizer;
+- some execution contracts still arrive from utility and security snapshots.

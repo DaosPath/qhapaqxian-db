@@ -14,30 +14,38 @@ The contract now carries:
 - `sandbox ceiling` for each tool, so a namespace policy can reject a tool whose execution profile exceeds the ceiling declared by the binding.
 - `capability tags` for each tool, so future policy logic can filter by semantic capabilities instead of raw names only.
 
-The current implementation is future-safe by design:
+The implementation is future-safe by design:
 
 - catalog rows can store explicit tool contract fields when present;
 - helper code derives sensible defaults when the fields are absent;
 - authorization code validates the derived contract before building the runtime-facing authorization payload.
 
-## What is intentionally deferred
+## What was intentionally deferred at landing time
 
-This stage does not claim real OS-level enforcement.
+This stage did not claim real OS-level enforcement by itself.
 
-What is still missing:
-- no container or microVM broker is launched from the backend;
+What was still missing at landing time:
+- container and microVM backend launch was outside this stage's landing scope;
 - no kernel-level sandbox policy is enforced by the database server itself;
 - no remote attestation pipeline is validated end to end inside the repo;
 - no policy compiler rewrites capability tags into a formal rule engine yet.
 
 So Stage 30 is a contract hardening step, not the final enforcement layer.
 
+Post-stage integration note:
+- the runtime can now launch real Docker and QEMU backend paths for
+  `container://` and `microvm://` providers;
+- capability tags, runtime class, and sandbox ceiling remain the policy inputs
+  that future OCI, VM lifecycle, and attestation hardening should consume;
+- the remaining gap is deeper enforcement and provenance, not absence of a
+  real backend launch path.
+
 ## Why this stage matters
 
 - it lets planner, executor, runtime, and security code talk about tool risk
   in a shared vocabulary instead of one-off strings;
-- it makes later container, microVM, and attestation stages enforceable
-  without redesigning tool rows again;
+- it makes container, microVM, and attestation stages enforceable without
+  redesigning tool rows again;
 - it narrows future policy work to enforcement and compilation instead of
   catalog-shape churn.
 

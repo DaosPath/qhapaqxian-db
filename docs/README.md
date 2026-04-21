@@ -30,6 +30,7 @@ Recommended reading paths:
   - [adr/0002-upstream-baseline.md](./adr/0002-upstream-baseline.md)
   - [adr/0003-branding-boundary.md](./adr/0003-branding-boundary.md)
   - [adr/0004-catversion-policy.md](./adr/0004-catversion-policy.md)
+  - [adr/0005-real-runtime-backends.md](./adr/0005-real-runtime-backends.md)
 - Stage history and implementation phases:
   - [stage-template.md](./stage-template.md)
   - [stage-2/README.md](./stage-2/README.md)
@@ -41,6 +42,8 @@ Recommended reading paths:
 - Operations and maintenance:
   - [bootstrap-plan.md](./bootstrap-plan.md)
   - [patch-ledger.md](./patch-ledger.md)
+  - [real-runtime-backends.md](./real-runtime-backends.md)
+  - [runtime-troubleshooting.md](./runtime-troubleshooting.md)
   - [rebase-strategy.md](./rebase-strategy.md)
   - [release-bootstrap.md](./release-bootstrap.md)
   - [release-policy.md](./release-policy.md)

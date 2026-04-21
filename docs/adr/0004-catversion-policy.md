@@ -2,6 +2,10 @@
 
 Status: accepted
 
+Note:
+- This ADR records a bootstrap policy decision, not the current implementation status.
+- Use `STATUS.md` for landed state and stage docs for implementation details.
+
 Decision:
 - Do not change `src/include/catalog/catversion.h` during bootstrap-only branding,
   CI, docs, or scaffold work.

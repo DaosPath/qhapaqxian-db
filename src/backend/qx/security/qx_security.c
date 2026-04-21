@@ -21,10 +21,13 @@
 #include "catalog/pg_qx_principal.h"
 #include "catalog/pg_qx_tool.h"
 #include "commands/defrem.h"
+#include <ctype.h>
+#include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/readfuncs.h"
 #include "nodes/value.h"
+#include "qx/qx_catalog.h"
 #include "qx/qx_security.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
@@ -36,11 +39,19 @@ static void qx_security_set_text(Datum *values, bool *nulls, AttrNumber attnum,
 								 const char *value);
 static void qx_security_set_nodetree(Datum *values, bool *nulls,
 									 AttrNumber attnum, const void *node);
-static char *qx_security_text_attr(HeapTuple tup, AttrNumber attnum,
-								   int cacheid);
 static bool qx_tool_name_in_list(List *tools, const char *tool_name);
 static int	qx_sandbox_rank(const char *sandbox_name);
 static const char *qx_default_runtime_for_provider_kind(const char *provider_kind);
+static char *qx_join_string_list(List *values, const char *separator);
+static List *qx_split_capability_tags(const char *serialized);
+static List *qx_default_capability_tags(const char *tool_name,
+									   const char *handler_name,
+									   const char *tool_sandbox,
+									   const char *tool_sandbox_ceiling,
+									   const char *principal_runtime,
+									   const char *provider_kind,
+									   const char *provider_attestation,
+									   const char *receipt_alg);
 static void qx_validate_principal_runtime_binding(const char *principal_name,
 												  const char *provider_kind,
 												  const char *runtime_class,
@@ -48,9 +59,15 @@ static void qx_validate_principal_runtime_binding(const char *principal_name,
 												  const char *receipt_signer,
 												  const char *receipt_alg,
 												  const char *context_name);
-static char *qx_tool_contract_for_tuples(HeapTuple tooltup,
-										 HeapTuple principaltup,
-										 HeapTuple providertup);
+static char *qx_tool_runtime_class_from_info(const QxCatalogToolInfo *tool);
+static char *qx_tool_sandbox_ceiling_from_info(const QxCatalogToolInfo *tool);
+static char *qx_tool_capability_tags_from_info(const QxCatalogToolInfo *tool,
+											   const char *tool_runtime_class,
+											   const char *tool_sandbox_ceiling);
+static char *qx_tool_contract_for_info(const QxCatalogToolInfo *tool,
+									   const char *tool_runtime_class,
+									   const char *tool_sandbox_ceiling,
+									   const char *tool_capability_tags);
 
 static void
 qx_security_set_text(Datum *values, bool *nulls, AttrNumber attnum,
@@ -85,16 +102,118 @@ qx_security_set_nodetree(Datum *values, bool *nulls, AttrNumber attnum,
 }
 
 static char *
-qx_security_text_attr(HeapTuple tup, AttrNumber attnum, int cacheid)
+qx_join_string_list(List *values, const char *separator)
 {
-	bool		isnull;
-	Datum		datum;
+	StringInfoData buf;
+	ListCell   *lc;
+	bool		first = true;
 
-	datum = SysCacheGetAttr(cacheid, tup, attnum, &isnull);
-	if (isnull)
-		return NULL;
+	initStringInfo(&buf);
+	foreach(lc, values)
+	{
+		Node	   *node = lfirst(lc);
 
-	return TextDatumGetCString(datum);
+		if (!IsA(node, String))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("capability tag list contains a non-string entry")));
+
+		if (!first)
+			appendStringInfoString(&buf, separator);
+
+		appendStringInfoString(&buf, strVal(node));
+		first = false;
+	}
+
+	return buf.data;
+}
+
+static List *
+qx_split_capability_tags(const char *serialized)
+{
+	List	   *tags = NIL;
+	char	   *copy;
+	char	   *cursor;
+
+	if (serialized == NULL || serialized[0] == '\0')
+		return NIL;
+
+	copy = pstrdup(serialized);
+	cursor = copy;
+	while (cursor != NULL && *cursor != '\0')
+	{
+		char	   *separator;
+		char	   *tag;
+
+		separator = strchr(cursor, '|');
+		if (separator != NULL)
+			*separator = '\0';
+
+		tag = cursor;
+		while (*tag != '\0' && isspace((unsigned char) *tag))
+			tag++;
+		if (*tag != '\0')
+		{
+			char	   *end = tag + strlen(tag);
+
+			while (end > tag && isspace((unsigned char) *(end - 1)))
+				*(--end) = '\0';
+
+			tags = lappend(tags, makeString(pstrdup(tag)));
+		}
+
+		if (separator == NULL)
+			break;
+
+		cursor = separator + 1;
+	}
+
+	pfree(copy);
+	return tags;
+}
+
+static List *
+qx_default_capability_tags(const char *tool_name,
+						   const char *handler_name,
+						   const char *tool_sandbox,
+						   const char *tool_sandbox_ceiling,
+						   const char *principal_runtime,
+						   const char *provider_kind,
+						   const char *provider_attestation,
+						   const char *receipt_alg)
+{
+	List	   *tags = NIL;
+	const char *effective_tool = (tool_name != NULL && tool_name[0] != '\0') ?
+		tool_name : "<unknown>";
+	const char *effective_handler = (handler_name != NULL && handler_name[0] != '\0') ?
+		handler_name : "<none>";
+	const char *effective_sandbox = (tool_sandbox != NULL && tool_sandbox[0] != '\0') ?
+		tool_sandbox : "builtin";
+	const char *effective_ceiling = (tool_sandbox_ceiling != NULL &&
+									 tool_sandbox_ceiling[0] != '\0') ?
+		tool_sandbox_ceiling : effective_sandbox;
+	const char *effective_runtime = (principal_runtime != NULL &&
+									 principal_runtime[0] != '\0') ?
+		principal_runtime : "host";
+	const char *effective_provider = (provider_kind != NULL &&
+									  provider_kind[0] != '\0') ?
+		provider_kind : "loopback";
+	const char *effective_attestation = (provider_attestation != NULL &&
+										 provider_attestation[0] != '\0') ?
+		provider_attestation : "optional";
+	const char *effective_alg = (receipt_alg != NULL && receipt_alg[0] != '\0') ?
+		receipt_alg : "hmac-sha256";
+
+	tags = lappend(tags, makeString(psprintf("tool:%s", effective_tool)));
+	tags = lappend(tags, makeString(psprintf("handler:%s", effective_handler)));
+	tags = lappend(tags, makeString(psprintf("sandbox:%s", effective_sandbox)));
+	tags = lappend(tags, makeString(psprintf("sandbox_ceiling:%s", effective_ceiling)));
+	tags = lappend(tags, makeString(psprintf("runtime:%s", effective_runtime)));
+	tags = lappend(tags, makeString(psprintf("provider_kind:%s", effective_provider)));
+	tags = lappend(tags, makeString(psprintf("attestation:%s", effective_attestation)));
+	tags = lappend(tags, makeString(psprintf("receipt_alg:%s", effective_alg)));
+
+	return tags;
 }
 
 static bool
@@ -216,97 +335,87 @@ qx_validate_principal_runtime_binding(const char *principal_name,
 }
 
 static char *
-qx_tool_contract_for_tuples(HeapTuple tooltup, HeapTuple principaltup,
-							HeapTuple providertup)
+qx_tool_runtime_class_from_info(const QxCatalogToolInfo *tool)
 {
-	Form_pg_qx_tool toolform = (Form_pg_qx_tool) GETSTRUCT(tooltup);
-	Form_pg_qx_principal principalform = (Form_pg_qx_principal) GETSTRUCT(principaltup);
-	Form_pg_qx_provider providerform = (Form_pg_qx_provider) GETSTRUCT(providertup);
-	char	   *handler_name;
-	char	   *tool_sandbox;
-	char	   *principal_sandbox;
-	char	   *principal_runtime;
-	char	   *principal_program;
-	char	   *principal_receipt_signer;
-	char	   *provider_oid;
-	char	   *provider_kind;
-	char	   *provider_endpoint;
-	char	   *provider_receipt_alg;
-	char	   *contract;
+	if (tool->runtime_class != NULL && tool->runtime_class[0] != '\0')
+		return pstrdup(tool->runtime_class);
+	if (tool->principal_runtime_class != NULL &&
+		tool->principal_runtime_class[0] != '\0')
+		return pstrdup(tool->principal_runtime_class);
 
-	handler_name = qx_security_text_attr(tooltup,
-										 Anum_pg_qx_tool_qxtoolhandler,
-										 QXTOOLOID);
-	tool_sandbox = qx_security_text_attr(tooltup,
-										 Anum_pg_qx_tool_qxtoolsandbox,
-										 QXTOOLOID);
-	principal_sandbox = qx_security_text_attr(principaltup,
-											  Anum_pg_qx_principal_qxprincipalsandbox,
-											  QXPRINCIPALOID);
-	principal_runtime = qx_security_text_attr(principaltup,
-											  Anum_pg_qx_principal_qxprincipalruntimeclass,
-											  QXPRINCIPALOID);
-	principal_program = qx_security_text_attr(principaltup,
-											  Anum_pg_qx_principal_qxprincipalprogram,
-											  QXPRINCIPALOID);
-	principal_receipt_signer = qx_security_text_attr(principaltup,
-													 Anum_pg_qx_principal_qxprincipalreceiptsigner,
-													 QXPRINCIPALOID);
-	provider_oid = psprintf("%u", providerform->oid);
-	provider_kind = qx_security_text_attr(providertup,
-										  Anum_pg_qx_provider_qxproviderkind,
-										  QXPROVIDEROID);
-	provider_endpoint = qx_security_text_attr(providertup,
-											  Anum_pg_qx_provider_qxproviderendpoint,
-											  QXPROVIDEROID);
-	provider_receipt_alg = qx_security_text_attr(providertup,
-												 Anum_pg_qx_provider_qxproviderreceiptalg,
-												 QXPROVIDEROID);
-	if (principal_runtime == NULL || principal_runtime[0] == '\0')
+	return pstrdup(qx_default_runtime_for_provider_kind(tool->provider_kind));
+}
+
+static char *
+qx_tool_sandbox_ceiling_from_info(const QxCatalogToolInfo *tool)
+{
+	if (tool->sandbox_ceiling != NULL && tool->sandbox_ceiling[0] != '\0')
+		return pstrdup(tool->sandbox_ceiling);
+	if (tool->principal_sandbox != NULL && tool->principal_sandbox[0] != '\0')
+		return pstrdup(tool->principal_sandbox);
+
+	return pstrdup("builtin");
+}
+
+static char *
+qx_tool_capability_tags_from_info(const QxCatalogToolInfo *tool,
+								  const char *tool_runtime_class,
+								  const char *tool_sandbox_ceiling)
+{
+	List	   *tags;
+
+	if (tool->capability_tags != NULL && tool->capability_tags[0] != '\0')
 	{
-		if (principal_runtime != NULL)
-			pfree(principal_runtime);
-		principal_runtime =
-			pstrdup(qx_default_runtime_for_provider_kind(provider_kind));
+		tags = qx_split_capability_tags(tool->capability_tags);
+		if (tags != NIL)
+			return qx_join_string_list(tags, "|");
 	}
 
-	contract = psprintf("tool=%s;handler=%s;tool_sandbox=%s;principal=%s;principal_sandbox=%s;principal_runtime=%s;program=%s;receipt_signer=%s;provider=%s;provider_oid=%s;provider_kind=%s;provider_endpoint=%s;provider_attestation=%s;receipt_schema=qx.receipt.v1;receipt_alg=%s",
-						NameStr(toolform->qxtoolname),
-						handler_name != NULL ? handler_name : "<none>",
-						tool_sandbox != NULL ? tool_sandbox : "builtin",
-						NameStr(principalform->qxprincipalname),
-						principal_sandbox != NULL ? principal_sandbox : "builtin",
-						principal_runtime != NULL ? principal_runtime : "host",
-						principal_program != NULL ? principal_program : "",
-						principal_receipt_signer != NULL ? principal_receipt_signer : "",
-						NameStr(providerform->qxprovidername),
+	tags = qx_default_capability_tags(tool->name,
+									  tool->handler,
+									  tool->sandbox,
+									  tool_sandbox_ceiling,
+									  tool_runtime_class,
+									  tool->provider_kind,
+									  tool->provider_attestation_required ?
+									  "required" : "optional",
+									  tool->provider_receipt_alg);
+
+	return qx_join_string_list(tags, "|");
+}
+
+static char *
+qx_tool_contract_for_info(const QxCatalogToolInfo *tool,
+						  const char *tool_runtime_class,
+						  const char *tool_sandbox_ceiling,
+						  const char *tool_capability_tags)
+{
+	char	   *provider_oid;
+	char	   *contract;
+
+	provider_oid = psprintf("%u", tool->provideroid);
+	contract = psprintf("tool=%s;handler=%s;tool_sandbox=%s;tool_sandbox_ceiling=%s;tool_capability_tags=%s;principal=%s;principal_sandbox=%s;principal_runtime=%s;program=%s;receipt_signer=%s;provider=%s;provider_oid=%s;provider_kind=%s;provider_endpoint=%s;provider_attestation=%s;receipt_schema=qx.receipt.v1;receipt_alg=%s",
+						tool->name != NULL ? tool->name : "<unknown>",
+						tool->handler != NULL ? tool->handler : "<none>",
+						tool->sandbox != NULL ? tool->sandbox : "builtin",
+						tool_sandbox_ceiling != NULL ? tool_sandbox_ceiling : "builtin",
+						tool_capability_tags != NULL ? tool_capability_tags : "",
+						tool->principal_name != NULL ? tool->principal_name : "<unknown>",
+						tool->principal_sandbox != NULL ? tool->principal_sandbox : "builtin",
+						tool_runtime_class != NULL ? tool_runtime_class : "host",
+						tool->principal_program != NULL ? tool->principal_program : "",
+						tool->principal_receipt_signer != NULL ?
+						tool->principal_receipt_signer : "",
+						tool->provider_name != NULL ? tool->provider_name : "<unknown>",
 						provider_oid,
-						provider_kind != NULL ? provider_kind : "loopback",
-						provider_endpoint != NULL ? provider_endpoint : "local://qhapaqxian-tool-runner",
-						providerform->qxproviderattestationrequired ? "required" : "optional",
-						provider_receipt_alg != NULL ? provider_receipt_alg : "hmac-sha256");
+						tool->provider_kind != NULL ? tool->provider_kind : "loopback",
+						tool->provider_endpoint != NULL ?
+						tool->provider_endpoint : "local://qhapaqxian-tool-runner",
+						tool->provider_attestation_required ? "required" : "optional",
+						tool->provider_receipt_alg != NULL ?
+						tool->provider_receipt_alg : "hmac-sha256");
 
-	if (handler_name != NULL)
-		pfree(handler_name);
-	if (tool_sandbox != NULL)
-		pfree(tool_sandbox);
-	if (principal_sandbox != NULL)
-		pfree(principal_sandbox);
-	if (principal_runtime != NULL)
-		pfree(principal_runtime);
-	if (principal_program != NULL)
-		pfree(principal_program);
-	if (principal_receipt_signer != NULL)
-		pfree(principal_receipt_signer);
-	if (provider_oid != NULL)
-		pfree(provider_oid);
-	if (provider_kind != NULL)
-		pfree(provider_kind);
-	if (provider_endpoint != NULL)
-		pfree(provider_endpoint);
-	if (provider_receipt_alg != NULL)
-		pfree(provider_receipt_alg);
-
+	pfree(provider_oid);
 	return contract;
 }
 
@@ -411,7 +520,7 @@ Oid
 QxLookupNamespacePolicy(Oid namespaceoid, const char *policy_name,
 						bool missing_ok)
 {
-	HeapTuple	policytup;
+	QxCatalogNamespacePolicyInfo policy;
 	Oid			policyoid;
 
 	if (policy_name == NULL || policy_name[0] == '\0')
@@ -419,10 +528,7 @@ QxLookupNamespacePolicy(Oid namespaceoid, const char *policy_name,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("namespace policy name must not be empty")));
 
-	policytup = SearchSysCache2(QXNAMESPACENAMENSP,
-								CStringGetDatum(policy_name),
-								ObjectIdGetDatum(namespaceoid));
-	if (!HeapTupleIsValid(policytup))
+	if (!QxCatalogLookupNamespacePolicyByName(namespaceoid, policy_name, &policy))
 	{
 		if (missing_ok)
 			return InvalidOid;
@@ -434,8 +540,8 @@ QxLookupNamespacePolicy(Oid namespaceoid, const char *policy_name,
 				 errdetail("Create the namespace policy before binding agents or tools to it.")));
 	}
 
-	policyoid = ((Form_pg_qx_namespace) GETSTRUCT(policytup))->oid;
-	ReleaseSysCache(policytup);
+	policyoid = policy.oid;
+	QxCatalogFreeNamespacePolicyInfo(&policy);
 
 	return policyoid;
 }
@@ -444,7 +550,7 @@ Oid
 QxLookupPrincipal(Oid namespaceoid, const char *principal_name,
 				  bool missing_ok)
 {
-	HeapTuple	principaltup;
+	QxCatalogPrincipalInfo principal;
 	Oid			principaloid;
 
 	if (principal_name == NULL || principal_name[0] == '\0')
@@ -452,10 +558,7 @@ QxLookupPrincipal(Oid namespaceoid, const char *principal_name,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("principal name must not be empty")));
 
-	principaltup = SearchSysCache2(QXPRINCIPALNAMENSP,
-								   CStringGetDatum(principal_name),
-								   ObjectIdGetDatum(namespaceoid));
-	if (!HeapTupleIsValid(principaltup))
+	if (!QxCatalogLookupPrincipalByName(namespaceoid, principal_name, &principal))
 	{
 		if (missing_ok)
 			return InvalidOid;
@@ -467,8 +570,8 @@ QxLookupPrincipal(Oid namespaceoid, const char *principal_name,
 				 errdetail("Create the principal before binding it to a tool.")));
 	}
 
-	principaloid = ((Form_pg_qx_principal) GETSTRUCT(principaltup))->oid;
-	ReleaseSysCache(principaltup);
+	principaloid = principal.oid;
+	QxCatalogFreePrincipalInfo(&principal);
 
 	return principaloid;
 }
@@ -477,7 +580,7 @@ Oid
 QxLookupProvider(Oid namespaceoid, const char *provider_name,
 				 bool missing_ok)
 {
-	HeapTuple	providertup;
+	QxCatalogProviderInfo provider;
 	Oid			provideroid;
 
 	if (provider_name == NULL || provider_name[0] == '\0')
@@ -485,10 +588,7 @@ QxLookupProvider(Oid namespaceoid, const char *provider_name,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("provider name must not be empty")));
 
-	providertup = SearchSysCache2(QXPROVIDERNAMENSP,
-								  CStringGetDatum(provider_name),
-								  ObjectIdGetDatum(namespaceoid));
-	if (!HeapTupleIsValid(providertup))
+	if (!QxCatalogLookupProviderByName(namespaceoid, provider_name, &provider))
 	{
 		if (missing_ok)
 			return InvalidOid;
@@ -500,8 +600,8 @@ QxLookupProvider(Oid namespaceoid, const char *provider_name,
 				 errdetail("Create the provider before binding it to a principal.")));
 	}
 
-	provideroid = ((Form_pg_qx_provider) GETSTRUCT(providertup))->oid;
-	ReleaseSysCache(providertup);
+	provideroid = provider.oid;
+	QxCatalogFreeProviderInfo(&provider);
 
 	return provideroid;
 }
@@ -511,7 +611,7 @@ QxEnsureOperationalIdentity(Oid namespaceoid, Oid ownerid,
 							const char *identity_name, Oid authrole,
 							const char *policy_name, List *budget_options)
 {
-	HeapTuple	existing;
+	QxCatalogIdentityInfo existing;
 	Relation	rel;
 	Datum		values[Natts_pg_qx_identity];
 	bool		nulls[Natts_pg_qx_identity];
@@ -524,16 +624,11 @@ QxEnsureOperationalIdentity(Oid namespaceoid, Oid ownerid,
 	resolved_name = (identity_name != NULL && identity_name[0] != '\0') ?
 		identity_name : "default";
 
-	existing = SearchSysCache2(QXIDENTITYNAMENSP,
-							   CStringGetDatum(resolved_name),
-							   ObjectIdGetDatum(namespaceoid));
-	if (HeapTupleIsValid(existing))
+	if (QxCatalogLookupIdentityByName(namespaceoid, resolved_name, &existing))
 	{
-		Form_pg_qx_identity identityform = (Form_pg_qx_identity) GETSTRUCT(existing);
-
-		if (!has_privs_of_role(ownerid, identityform->qxidentityowner))
+		if (!has_privs_of_role(ownerid, existing.ownerid))
 		{
-			ReleaseSysCache(existing);
+			QxCatalogFreeIdentityInfo(&existing);
 			ereport(ERROR,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 					 errmsg("permission denied to use identity \"%s\"",
@@ -541,8 +636,8 @@ QxEnsureOperationalIdentity(Oid namespaceoid, Oid ownerid,
 					 errdetail("Only the identity owner or a member of that role may bind the identity to an agent.")));
 		}
 
-		identityoid = identityform->oid;
-		ReleaseSysCache(existing);
+		identityoid = existing.oid;
+		QxCatalogFreeIdentityInfo(&existing);
 		return identityoid;
 	}
 
@@ -593,36 +688,25 @@ QxValidateRegisteredTools(Oid namespaceoid, List *tools, bool require_enabled)
 	foreach(lc, tools)
 	{
 		const char *tool_name = strVal(lfirst(lc));
-		HeapTuple	tooltup;
-		Form_pg_qx_tool toolform;
+		QxCatalogToolInfo tool;
 
-		tooltup = SearchSysCache2(QXTOOLNAMENSP,
-								  CStringGetDatum(tool_name),
-								  ObjectIdGetDatum(namespaceoid));
-		if (!HeapTupleIsValid(tooltup))
+		if (!QxCatalogLookupToolByName(namespaceoid, tool_name, &tool))
 			ereport(ERROR,
 					(errcode(ERRCODE_UNDEFINED_OBJECT),
 					 errmsg("tool \"%s\" is not registered in schema \"%s\"",
 							tool_name, get_namespace_name(namespaceoid)),
 					 errdetail("Register the tool with CREATE TOOL before referencing it from a namespace policy or agent.")));
 
-		toolform = (Form_pg_qx_tool) GETSTRUCT(tooltup);
 		if (require_enabled)
 		{
-			HeapTuple	principaltup;
-			HeapTuple	providertup;
-			char	   *tool_sandbox;
-			char	   *principal_sandbox;
+			char	   *tool_runtime_class;
+			char	   *tool_sandbox_ceiling;
+			char	   *tool_capability_tags;
 			char	   *principal_runtime;
-			char	   *principal_receipt_signer;
-			char	   *provider_kind;
-			char	   *provider_receipt_alg;
-			Form_pg_qx_principal principalform;
-			Form_pg_qx_provider providerform;
 
-			if (!toolform->qxtoolenabled)
+			if (!tool.enabled)
 			{
-				ReleaseSysCache(tooltup);
+				QxCatalogFreeToolInfo(&tool);
 				ereport(ERROR,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 						 errmsg("tool \"%s\" is disabled in schema \"%s\"",
@@ -630,149 +714,129 @@ QxValidateRegisteredTools(Oid namespaceoid, List *tools, bool require_enabled)
 						 errdetail("Enable the tool before binding it to an agent runtime.")));
 			}
 
-			if (!OidIsValid(toolform->qxtoolprincipalid))
+			if (!OidIsValid(tool.principaloid))
 			{
-				ReleaseSysCache(tooltup);
+				QxCatalogFreeToolInfo(&tool);
 				ereport(ERROR,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 						 errmsg("tool \"%s\" has no principal binding", tool_name),
 						 errdetail("Bind the tool to a namespace principal before enabling agent execution.")));
 			}
 
-			principaltup = SearchSysCache1(QXPRINCIPALOID,
-										   ObjectIdGetDatum(toolform->qxtoolprincipalid));
-			if (!HeapTupleIsValid(principaltup))
+			if (!tool.principal_enabled)
 			{
-				ReleaseSysCache(tooltup);
-				elog(ERROR, "cache lookup failed for QhapaqXian principal %u",
-					 toolform->qxtoolprincipalid);
-			}
-
-			principalform = (Form_pg_qx_principal) GETSTRUCT(principaltup);
-			if (!principalform->qxprincipalenabled)
-			{
-				ReleaseSysCache(principaltup);
-				ReleaseSysCache(tooltup);
+				QxCatalogFreeToolInfo(&tool);
 				ereport(ERROR,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 						 errmsg("principal for tool \"%s\" is disabled", tool_name),
 						 errdetail("Enable the principal before binding the tool to an agent runtime.")));
 			}
 
-			if (!OidIsValid(principalform->qxprincipalproviderid))
+			if (!OidIsValid(tool.provideroid))
 			{
-				ReleaseSysCache(principaltup);
-				ReleaseSysCache(tooltup);
+				QxCatalogFreeToolInfo(&tool);
 				ereport(ERROR,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 						 errmsg("principal for tool \"%s\" has no provider binding", tool_name),
 						 errdetail("Bind the principal to a provider before enabling agent execution.")));
 			}
 
-			providertup = SearchSysCache1(QXPROVIDEROID,
-										  ObjectIdGetDatum(principalform->qxprincipalproviderid));
-			if (!HeapTupleIsValid(providertup))
+			if (!tool.provider_enabled)
 			{
-				ReleaseSysCache(principaltup);
-				ReleaseSysCache(tooltup);
-				elog(ERROR, "cache lookup failed for QhapaqXian provider %u",
-					 principalform->qxprincipalproviderid);
-			}
-
-			providerform = (Form_pg_qx_provider) GETSTRUCT(providertup);
-			if (!providerform->qxproviderenabled)
-			{
-				ReleaseSysCache(providertup);
-				ReleaseSysCache(principaltup);
-				ReleaseSysCache(tooltup);
+				QxCatalogFreeToolInfo(&tool);
 				ereport(ERROR,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 						 errmsg("provider for tool \"%s\" is disabled", tool_name),
 						 errdetail("Enable the provider before binding the tool to an agent runtime.")));
 			}
 
-			tool_sandbox = qx_security_text_attr(tooltup,
-												 Anum_pg_qx_tool_qxtoolsandbox,
-												 QXTOOLOID);
-			principal_sandbox = qx_security_text_attr(principaltup,
-													  Anum_pg_qx_principal_qxprincipalsandbox,
-													  QXPRINCIPALOID);
-			principal_runtime = qx_security_text_attr(principaltup,
-													 Anum_pg_qx_principal_qxprincipalruntimeclass,
-													 QXPRINCIPALOID);
-			principal_receipt_signer = qx_security_text_attr(principaltup,
-															 Anum_pg_qx_principal_qxprincipalreceiptsigner,
-															 QXPRINCIPALOID);
-			provider_kind = qx_security_text_attr(providertup,
-												 Anum_pg_qx_provider_qxproviderkind,
-												 QXPROVIDEROID);
-			provider_receipt_alg = qx_security_text_attr(providertup,
-														 Anum_pg_qx_provider_qxproviderreceiptalg,
-														 QXPROVIDEROID);
-			if (qx_sandbox_rank(tool_sandbox) > qx_sandbox_rank(principal_sandbox))
+			tool_runtime_class = qx_tool_runtime_class_from_info(&tool);
+			tool_sandbox_ceiling = qx_tool_sandbox_ceiling_from_info(&tool);
+			tool_capability_tags = qx_tool_capability_tags_from_info(&tool,
+																	 tool_runtime_class,
+																	 tool_sandbox_ceiling);
+			principal_runtime = tool.principal_runtime_class != NULL &&
+				tool.principal_runtime_class[0] != '\0' ?
+				pstrdup(tool.principal_runtime_class) :
+				pstrdup(qx_default_runtime_for_provider_kind(tool.provider_kind));
+			if (principal_runtime == NULL || principal_runtime[0] == '\0')
 			{
-				if (tool_sandbox != NULL)
-					pfree(tool_sandbox);
-				if (principal_sandbox != NULL)
-					pfree(principal_sandbox);
 				if (principal_runtime != NULL)
 					pfree(principal_runtime);
-				if (principal_receipt_signer != NULL)
-					pfree(principal_receipt_signer);
-				if (provider_kind != NULL)
-					pfree(provider_kind);
-				if (provider_receipt_alg != NULL)
-					pfree(provider_receipt_alg);
-				ReleaseSysCache(providertup);
-				ReleaseSysCache(principaltup);
-				ReleaseSysCache(tooltup);
+				principal_runtime =
+					pstrdup(qx_default_runtime_for_provider_kind(tool.provider_kind));
+			}
+			if (qx_sandbox_rank(tool.sandbox) > qx_sandbox_rank(tool_sandbox_ceiling))
+			{
+				if (tool_runtime_class != NULL)
+					pfree(tool_runtime_class);
+				if (tool_sandbox_ceiling != NULL)
+					pfree(tool_sandbox_ceiling);
+				if (tool_capability_tags != NULL)
+					pfree(tool_capability_tags);
+				if (principal_runtime != NULL)
+					pfree(principal_runtime);
+				QxCatalogFreeToolInfo(&tool);
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("tool \"%s\" exceeds its principal sandbox ceiling",
-								tool_name)));
+						 errmsg("tool \"%s\" exceeds its declared sandbox ceiling",
+								tool_name),
+						 errdetail("Tool sandbox \"%s\" is stricter than ceiling \"%s\".",
+								   tool.sandbox != NULL ? tool.sandbox : "builtin",
+								   tool_sandbox_ceiling != NULL ? tool_sandbox_ceiling : "builtin")));
 			}
-			qx_validate_principal_runtime_binding(NameStr(principalform->qxprincipalname),
-												 provider_kind,
+			if (strcmp(tool_runtime_class, principal_runtime) != 0)
+			{
+				if (tool_runtime_class != NULL)
+					pfree(tool_runtime_class);
+				if (tool_sandbox_ceiling != NULL)
+					pfree(tool_sandbox_ceiling);
+				if (tool_capability_tags != NULL)
+					pfree(tool_capability_tags);
+				if (principal_runtime != NULL)
+					pfree(principal_runtime);
+				QxCatalogFreeToolInfo(&tool);
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("tool \"%s\" runtime class \"%s\" is incompatible with principal runtime \"%s\"",
+								tool_name,
+								   tool_runtime_class,
+								   principal_runtime != NULL ? principal_runtime : "host"),
+						 errdetail("Namespace authorization requires runtime-class alignment between the tool and the bound principal.")));
+			}
+			qx_validate_principal_runtime_binding(tool.principal_name,
+												 tool.provider_kind,
 												 principal_runtime,
-												 principal_sandbox,
-												 principal_receipt_signer,
-												 provider_receipt_alg,
+												 tool.principal_sandbox,
+												 tool.principal_receipt_signer,
+												 tool.provider_receipt_alg,
 												 "tool registration validation");
 
-			if (tool_sandbox != NULL)
-				pfree(tool_sandbox);
-			if (principal_sandbox != NULL)
-				pfree(principal_sandbox);
+			if (tool_runtime_class != NULL)
+				pfree(tool_runtime_class);
+			if (tool_sandbox_ceiling != NULL)
+				pfree(tool_sandbox_ceiling);
+			if (tool_capability_tags != NULL)
+				pfree(tool_capability_tags);
 			if (principal_runtime != NULL)
 				pfree(principal_runtime);
-			if (principal_receipt_signer != NULL)
-				pfree(principal_receipt_signer);
-			if (provider_kind != NULL)
-				pfree(provider_kind);
-			if (provider_receipt_alg != NULL)
-				pfree(provider_receipt_alg);
-			ReleaseSysCache(providertup);
-			ReleaseSysCache(principaltup);
 		}
 
-		ReleaseSysCache(tooltup);
+		QxCatalogFreeToolInfo(&tool);
 	}
 }
 
 char *
 QxIdentityNameById(Oid identityoid)
 {
-	HeapTuple	identitytup;
-	Form_pg_qx_identity identityform;
+	QxCatalogIdentityInfo identity;
 	char	   *name;
 
-	identitytup = SearchSysCache1(QXIDENTITYOID, ObjectIdGetDatum(identityoid));
-	if (!HeapTupleIsValid(identitytup))
+	if (!QxCatalogLookupIdentityByOid(identityoid, &identity))
 		elog(ERROR, "cache lookup failed for QhapaqXian identity %u", identityoid);
 
-	identityform = (Form_pg_qx_identity) GETSTRUCT(identitytup);
-	name = pstrdup(NameStr(identityform->qxidentityname));
-	ReleaseSysCache(identitytup);
+	name = pstrdup(identity.name);
+	QxCatalogFreeIdentityInfo(&identity);
 
 	return name;
 }
@@ -780,17 +844,14 @@ QxIdentityNameById(Oid identityoid)
 char *
 QxNamespacePolicyNameById(Oid policyoid)
 {
-	HeapTuple	policytup;
-	Form_pg_qx_namespace policyform;
+	QxCatalogNamespacePolicyInfo policy;
 	char	   *name;
 
-	policytup = SearchSysCache1(QXNAMESPACEOID, ObjectIdGetDatum(policyoid));
-	if (!HeapTupleIsValid(policytup))
+	if (!QxCatalogLookupNamespacePolicyByOid(policyoid, &policy))
 		elog(ERROR, "cache lookup failed for QhapaqXian namespace policy %u", policyoid);
 
-	policyform = (Form_pg_qx_namespace) GETSTRUCT(policytup);
-	name = pstrdup(NameStr(policyform->qxnamespacepolicyname));
-	ReleaseSysCache(policytup);
+	name = pstrdup(policy.name);
+	QxCatalogFreeNamespacePolicyInfo(&policy);
 
 	return name;
 }
@@ -800,25 +861,21 @@ QxAuthorizeToolsForNamespace(Oid namespacepolicyoid, Oid namespaceoid,
 							 Oid ownerid, List *tools,
 							 QxToolAuthorization *authz)
 {
-	HeapTuple	policytup;
-	Form_pg_qx_namespace policyform;
-	char	   *serialized_allowed_tools;
+	QxCatalogNamespacePolicyInfo policy;
 	List	   *allowed_tools;
 	ListCell   *lc;
 
 	memset(authz, 0, sizeof(*authz));
+	MemSet(&policy, 0, sizeof(policy));
 
-	policytup = SearchSysCache1(QXNAMESPACEOID, ObjectIdGetDatum(namespacepolicyoid));
-	if (!HeapTupleIsValid(policytup))
+	if (!QxCatalogLookupNamespacePolicyByOid(namespacepolicyoid, &policy))
 		elog(ERROR, "cache lookup failed for QhapaqXian namespace policy %u",
 			 namespacepolicyoid);
 
-	policyform = (Form_pg_qx_namespace) GETSTRUCT(policytup);
-
-	if (!has_privs_of_role(ownerid, policyform->qxnamespaceowner) &&
-		!has_privs_of_role(ownerid, policyform->qxnamespaceauthrole))
+	if (!has_privs_of_role(ownerid, policy.ownerid) &&
+		!has_privs_of_role(ownerid, policy.authrole))
 	{
-		ReleaseSysCache(policytup);
+		QxCatalogFreeNamespacePolicyInfo(&policy);
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("permission denied to authorize tools in schema \"%s\"",
@@ -826,39 +883,29 @@ QxAuthorizeToolsForNamespace(Oid namespacepolicyoid, Oid namespaceoid,
 				 errdetail("The caller must be able to assume the namespace policy owner or auth role.")));
 	}
 
-	serialized_allowed_tools = qx_security_text_attr(policytup,
-													 Anum_pg_qx_namespace_qxallowedtools,
-													 QXNAMESPACEOID);
-	allowed_tools = QxDeserializeToolList(serialized_allowed_tools);
+	allowed_tools = QxDeserializeToolList(policy.allowed_tools);
 
-	authz->namespace_policy_oid = policyform->oid;
-	authz->namespace_policy_name = pstrdup(NameStr(policyform->qxnamespacepolicyname));
-	authz->require_known_tools = policyform->qxrequireknowntools;
-	authz->enforce_budgets = policyform->qxenforcebudgets;
+	authz->namespace_policy_oid = policy.oid;
+	authz->namespace_policy_name = pstrdup(policy.name);
+	authz->require_known_tools = policy.require_known_tools;
+	authz->enforce_budgets = policy.enforce_budgets;
 
 	foreach(lc, tools)
 	{
 		const char *tool_name = strVal(lfirst(lc));
-		HeapTuple	tooltup;
-		HeapTuple	principaltup;
-		HeapTuple	providertup;
-		Form_pg_qx_tool toolform;
-		Form_pg_qx_principal principalform;
-		Form_pg_qx_provider providerform;
-		char	   *tool_sandbox;
-		char	   *principal_sandbox;
+		QxCatalogToolInfo tool;
+		char	   *tool_runtime_class;
+		char	   *tool_sandbox_ceiling;
+		char	   *tool_capability_tags;
 		char	   *principal_runtime;
-		char	   *principal_receipt_signer;
-		char	   *provider_kind;
-		char	   *provider_receipt_alg;
 		char	   *contract;
 
-		if (policyform->qxrequireknowntools &&
+		MemSet(&tool, 0, sizeof(tool));
+
+		if (policy.require_known_tools &&
 			!qx_tool_name_in_list(allowed_tools, tool_name))
 		{
-			if (serialized_allowed_tools != NULL)
-				pfree(serialized_allowed_tools);
-			ReleaseSysCache(policytup);
+			QxCatalogFreeNamespacePolicyInfo(&policy);
 			ereport(ERROR,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 					 errmsg("tool \"%s\" is not allowed by namespace policy \"%s\"",
@@ -868,166 +915,138 @@ QxAuthorizeToolsForNamespace(Oid namespacepolicyoid, Oid namespaceoid,
 					 errdetail("Register the tool in the namespace policy before executing the agent task.")));
 		}
 
-		tooltup = SearchSysCache2(QXTOOLNAMENSP,
-								  CStringGetDatum(tool_name),
-								  ObjectIdGetDatum(namespaceoid));
-		if (!HeapTupleIsValid(tooltup))
+		if (!QxCatalogLookupToolByName(namespaceoid, tool_name, &tool))
 		{
-			if (serialized_allowed_tools != NULL)
-				pfree(serialized_allowed_tools);
-			ReleaseSysCache(policytup);
+			QxCatalogFreeNamespacePolicyInfo(&policy);
 			ereport(ERROR,
 					(errcode(ERRCODE_UNDEFINED_OBJECT),
 					 errmsg("tool \"%s\" is not registered in schema \"%s\"",
 							tool_name, get_namespace_name(namespaceoid))));
 		}
 
-		toolform = (Form_pg_qx_tool) GETSTRUCT(tooltup);
-		if (!toolform->qxtoolenabled)
+		if (!tool.enabled)
 		{
-			ReleaseSysCache(tooltup);
-			if (serialized_allowed_tools != NULL)
-				pfree(serialized_allowed_tools);
-			ReleaseSysCache(policytup);
+			QxCatalogFreeToolInfo(&tool);
+			QxCatalogFreeNamespacePolicyInfo(&policy);
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("tool \"%s\" is disabled in schema \"%s\"",
 							tool_name, get_namespace_name(namespaceoid))));
 		}
 
-		if (!OidIsValid(toolform->qxtoolprincipalid))
+		if (!OidIsValid(tool.principaloid))
 		{
-			ReleaseSysCache(tooltup);
-			if (serialized_allowed_tools != NULL)
-				pfree(serialized_allowed_tools);
-			ReleaseSysCache(policytup);
+			QxCatalogFreeToolInfo(&tool);
+			QxCatalogFreeNamespacePolicyInfo(&policy);
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("tool \"%s\" has no principal binding", tool_name)));
 		}
 
-		principaltup = SearchSysCache1(QXPRINCIPALOID,
-									   ObjectIdGetDatum(toolform->qxtoolprincipalid));
-		if (!HeapTupleIsValid(principaltup))
+		if (!tool.principal_enabled)
 		{
-			ReleaseSysCache(tooltup);
-			elog(ERROR, "cache lookup failed for QhapaqXian principal %u",
-				 toolform->qxtoolprincipalid);
-		}
-
-		principalform = (Form_pg_qx_principal) GETSTRUCT(principaltup);
-		if (!principalform->qxprincipalenabled)
-		{
+			QxCatalogFreeToolInfo(&tool);
+			QxCatalogFreeNamespacePolicyInfo(&policy);
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("principal \"%s\" is disabled in schema \"%s\"",
-							NameStr(principalform->qxprincipalname),
+							tool.principal_name != NULL ?
+							tool.principal_name : "<unknown>",
 							get_namespace_name(namespaceoid))));
 		}
 
-		if (!OidIsValid(principalform->qxprincipalproviderid))
+		if (!OidIsValid(tool.provideroid))
+		{
+			QxCatalogFreeToolInfo(&tool);
+			QxCatalogFreeNamespacePolicyInfo(&policy);
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("principal \"%s\" has no provider binding",
-							NameStr(principalform->qxprincipalname))));
-
-		providertup = SearchSysCache1(QXPROVIDEROID,
-									  ObjectIdGetDatum(principalform->qxprincipalproviderid));
-		if (!HeapTupleIsValid(providertup))
-		{
-			ReleaseSysCache(principaltup);
-			ReleaseSysCache(tooltup);
-			elog(ERROR, "cache lookup failed for QhapaqXian provider %u",
-				 principalform->qxprincipalproviderid);
+							tool.principal_name != NULL ?
+							tool.principal_name : "<unknown>")));
 		}
 
-		providerform = (Form_pg_qx_provider) GETSTRUCT(providertup);
-		if (!providerform->qxproviderenabled)
+		if (!tool.provider_enabled)
 		{
-			ReleaseSysCache(providertup);
-			ReleaseSysCache(principaltup);
-			ReleaseSysCache(tooltup);
+			QxCatalogFreeToolInfo(&tool);
+			QxCatalogFreeNamespacePolicyInfo(&policy);
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("provider \"%s\" is disabled in schema \"%s\"",
-							NameStr(providerform->qxprovidername),
+							tool.provider_name != NULL ?
+							tool.provider_name : "<unknown>",
 							get_namespace_name(namespaceoid))));
 		}
 
-		tool_sandbox = qx_security_text_attr(tooltup,
-												 Anum_pg_qx_tool_qxtoolsandbox,
-												 QXTOOLOID);
-		principal_sandbox = qx_security_text_attr(principaltup,
-													  Anum_pg_qx_principal_qxprincipalsandbox,
-													  QXPRINCIPALOID);
-		principal_runtime = qx_security_text_attr(principaltup,
-												 Anum_pg_qx_principal_qxprincipalruntimeclass,
-												 QXPRINCIPALOID);
-		principal_receipt_signer = qx_security_text_attr(principaltup,
-														 Anum_pg_qx_principal_qxprincipalreceiptsigner,
-														 QXPRINCIPALOID);
-		provider_kind = qx_security_text_attr(providertup,
-											 Anum_pg_qx_provider_qxproviderkind,
-											 QXPROVIDEROID);
-		provider_receipt_alg = qx_security_text_attr(providertup,
-													 Anum_pg_qx_provider_qxproviderreceiptalg,
-													 QXPROVIDEROID);
-		if (qx_sandbox_rank(tool_sandbox) > qx_sandbox_rank(principal_sandbox))
+		tool_runtime_class = qx_tool_runtime_class_from_info(&tool);
+		tool_sandbox_ceiling = qx_tool_sandbox_ceiling_from_info(&tool);
+		tool_capability_tags = qx_tool_capability_tags_from_info(&tool,
+																 tool_runtime_class,
+																 tool_sandbox_ceiling);
+		principal_runtime = tool.principal_runtime_class != NULL &&
+			tool.principal_runtime_class[0] != '\0' ?
+			pstrdup(tool.principal_runtime_class) :
+			pstrdup(qx_default_runtime_for_provider_kind(tool.provider_kind));
+		if (principal_runtime == NULL || principal_runtime[0] == '\0')
 		{
-			if (tool_sandbox != NULL)
-				pfree(tool_sandbox);
-			if (principal_sandbox != NULL)
-				pfree(principal_sandbox);
 			if (principal_runtime != NULL)
 				pfree(principal_runtime);
-			if (principal_receipt_signer != NULL)
-				pfree(principal_receipt_signer);
-			if (provider_kind != NULL)
-				pfree(provider_kind);
-			if (provider_receipt_alg != NULL)
-				pfree(provider_receipt_alg);
-			ReleaseSysCache(providertup);
-			ReleaseSysCache(principaltup);
-			ReleaseSysCache(tooltup);
+			principal_runtime =
+				pstrdup(qx_default_runtime_for_provider_kind(tool.provider_kind));
+		}
+		if (qx_sandbox_rank(tool.sandbox) > qx_sandbox_rank(tool_sandbox_ceiling))
+		{
+			QxCatalogFreeToolInfo(&tool);
+			QxCatalogFreeNamespacePolicyInfo(&policy);
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("tool \"%s\" exceeds the sandbox ceiling of principal \"%s\"",
-							tool_name, NameStr(principalform->qxprincipalname))));
+					 errmsg("tool \"%s\" exceeds its declared sandbox ceiling",
+							tool_name),
+					 errdetail("Tool sandbox \"%s\" is stricter than ceiling \"%s\".",
+							   tool.sandbox != NULL ? tool.sandbox : "builtin",
+							   tool_sandbox_ceiling != NULL ? tool_sandbox_ceiling : "builtin")));
 		}
-		qx_validate_principal_runtime_binding(NameStr(principalform->qxprincipalname),
-											 provider_kind,
+		if (strcmp(tool_runtime_class, principal_runtime) != 0)
+		{
+			QxCatalogFreeToolInfo(&tool);
+			QxCatalogFreeNamespacePolicyInfo(&policy);
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("tool \"%s\" runtime class \"%s\" is incompatible with principal runtime \"%s\"",
+							tool_name,
+							tool_runtime_class,
+							principal_runtime != NULL ? principal_runtime : "host"),
+					 errdetail("Tool authorization requires runtime-class alignment before the contract is emitted.")));
+		}
+		qx_validate_principal_runtime_binding(tool.principal_name,
+											 tool.provider_kind,
 											 principal_runtime,
-											 principal_sandbox,
-											 principal_receipt_signer,
-											 provider_receipt_alg,
+											 tool.principal_sandbox,
+											 tool.principal_receipt_signer,
+											 tool.provider_receipt_alg,
 											 "namespace tool authorization");
 
-		if (tool_sandbox != NULL)
-			pfree(tool_sandbox);
-		if (principal_sandbox != NULL)
-			pfree(principal_sandbox);
-		if (principal_runtime != NULL)
-			pfree(principal_runtime);
-		if (principal_receipt_signer != NULL)
-			pfree(principal_receipt_signer);
-		if (provider_kind != NULL)
-			pfree(provider_kind);
-		if (provider_receipt_alg != NULL)
-			pfree(provider_receipt_alg);
-
-		contract = qx_tool_contract_for_tuples(tooltup, principaltup, providertup);
+		contract = qx_tool_contract_for_info(&tool,
+											 tool_runtime_class,
+											 tool_sandbox_ceiling,
+											 tool_capability_tags);
 		authz->tool_count += 1;
-		authz->tool_token_cost += toolform->qxtooltokencost;
-		authz->tool_cost_units += toolform->qxtoolcostunits;
-		authz->tool_oids = lappend_oid(authz->tool_oids, toolform->oid);
+		authz->tool_token_cost += tool.token_cost;
+		authz->tool_cost_units += tool.cost_units;
+		authz->tool_oids = lappend_oid(authz->tool_oids, tool.oid);
 		authz->tool_contracts = lappend(authz->tool_contracts,
 										makeString(contract));
-		ReleaseSysCache(providertup);
-		ReleaseSysCache(principaltup);
-		ReleaseSysCache(tooltup);
+		authz->tool_runtime_classes = lappend(authz->tool_runtime_classes,
+											 makeString(pstrdup(tool_runtime_class)));
+		authz->tool_sandbox_ceilings = lappend(authz->tool_sandbox_ceilings,
+											  makeString(pstrdup(tool_sandbox_ceiling)));
+		authz->tool_capability_tags = lappend(authz->tool_capability_tags,
+											  makeString(tool_capability_tags));
+		pfree(tool_runtime_class);
+		pfree(tool_sandbox_ceiling);
+		pfree(principal_runtime);
+		QxCatalogFreeToolInfo(&tool);
 	}
 
-	if (serialized_allowed_tools != NULL)
-		pfree(serialized_allowed_tools);
-	ReleaseSysCache(policytup);
+	QxCatalogFreeNamespacePolicyInfo(&policy);
 }

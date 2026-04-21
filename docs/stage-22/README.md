@@ -1,4 +1,4 @@
-# Stage 22: Brokered Container and MicroVM Principal Classes
+# Stage 22: Container and MicroVM Principal Classes
 
 Stage 22 adds explicit principal runtime classes to the fork and binds them to
 provider kinds that represent deeper execution planes than the Stage 20/21
@@ -38,15 +38,27 @@ Why this stage matters:
   all external principals as one generic brokered process;
 - it makes the container/microVM boundary visible in catalog state, DDL,
   planner authorization, receipts, and traces;
-- it prepares the fork for real container or microVM launchers without forcing
-  the backend to pretend it already owns those platform primitives today.
+- at landing time, it prepared the fork for real container or microVM launchers
+  without forcing the backend to pretend it already owned those platform
+  primitives.
 
-What this stage does not pretend to solve:
-- Stage 22 does not launch real containers or microVMs from the backend;
-- `container://` and `microvm://` remain brokered provider contracts backed by
-  the shipped runner, not direct kernel or hypervisor integrations;
-- OS-level isolation still comes from the existing launcher/sandbox layer, not
-  from a new container runtime embedded in PostgreSQL.
+What this stage did not pretend to solve at landing time:
+- Stage 22 introduced runtime classes before backend launch ownership;
+- `container://` and `microvm://` were initially brokered provider contracts
+  backed by the shipped runner, not direct kernel or hypervisor integrations;
+- OS-level isolation initially came from the existing launcher/sandbox layer,
+  not from a new container runtime embedded in PostgreSQL.
+
+Post-stage integration note:
+- a later integration pass connected these runtime classes to real backend
+  launch paths;
+- `container://` now has a Docker-backed path;
+- `microvm://` now has a QEMU `microvm` path with Windows `tcg` and WSL/Linux
+  `kvm` validation;
+- the historical Stage 22 caveat remains useful as a boundary marker: catalog
+  runtime classes came first, and backend ownership/hardening is still evolving.
+- operational setup and validation commands live in
+  `../real-runtime-backends.md`.
 
 Validation:
 - `meson test -C build-stage4 --no-rebuild --suite postgresql:setup --print-errorlogs`

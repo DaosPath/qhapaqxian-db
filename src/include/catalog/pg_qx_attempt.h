@@ -23,6 +23,7 @@
 #define QX_ATTEMPT_STATE_RUNNING 'r'
 #define QX_ATTEMPT_STATE_CHECKPOINTED 'k'
 #define QX_ATTEMPT_STATE_COMPLETED 'c'
+#define QX_ATTEMPT_STATE_FAILED 'f'
 
 /* ----------------
  *		pg_qx_attempt definition.  cpp turns this into

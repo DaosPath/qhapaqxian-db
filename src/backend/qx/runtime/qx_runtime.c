@@ -11,6 +11,7 @@
  */
 #include "postgres.h"
 
+#include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "access/xact.h"
@@ -19,6 +20,7 @@
 #include "catalog/indexing.h"
 #include "catalog/objectaccess.h"
 #include "catalog/objectaddress.h"
+#include "catalog/pg_database.h"
 #include "catalog/pg_qx_agent.h"
 #include "catalog/pg_qx_attempt.h"
 #include "catalog/pg_qx_checkpoint.h"
@@ -26,6 +28,9 @@
 #include "catalog/pg_qx_identity.h"
 #include "catalog/pg_qx_namespace.h"
 #include "catalog/pg_qx_provider.h"
+#include "catalog/pg_qx_scheduler_heartbeat.h"
+#include "catalog/pg_qx_scheduler_lease.h"
+#include "catalog/pg_qx_scheduler_queue.h"
 #include "catalog/pg_qx_session.h"
 #include "catalog/pg_qx_step.h"
 #include "catalog/pg_qx_task.h"
@@ -33,16 +38,33 @@
 #include "common/hmac.h"
 #include "common/openssl.h"
 #include "common/sha2.h"
+#include "fmgr.h"
 #include "lib/stringinfo.h"
+#include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "nodes/readfuncs.h"
 #include "nodes/value.h"
+#include "pgstat.h"
 #include "port.h"
+#include "postmaster/bgworker.h"
+#include "postmaster/interrupt.h"
+#include "qx_container_backend.h"
+#include "qx_microvm_backend.h"
+#include "qx/qx_catalog.h"
+#include "qx/qx_recovery.h"
 #include "qx/qx_runtime.h"
+#include "qx/qx_scheduler.h"
+#include "qx/qx_security.h"
 #include "qx/qx_semantic_log.h"
 #include "storage/fd.h"
+#include "storage/ipc.h"
+#include "storage/latch.h"
+#include "storage/proc.h"
+#include "tcop/tcopprot.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
+#include "utils/memutils.h"
 #include "utils/pg_lsn.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
@@ -73,17 +95,21 @@ typedef struct QxExternalToolResult
 	int32		cost_charge;
 	int32		timeout_ms;
 	int32		process_limit;
+	int32		wall_time_ms;
 	bool		path_present;
+	bool		restricted_identity;
 	char	   *detail;
 	char	   *tool_name;
 	char	   *principal_name;
 	char	   *principal_runtime;
 	char	   *provider_name;
 	char	   *provider_kind;
+	char	   *provider_endpoint;
 	char	   *sandbox_name;
 	char	   *profile_name;
 	char	   *environment_mode;
 	char	   *workdir_name;
+	char	   *launch_mode;
 	char	   *receipt_schema;
 	char	   *receipt_alg;
 	char	   *receipt_nonce;
@@ -108,13 +134,84 @@ typedef struct QxSandboxObservation
 	bool		restricted_identity;
 } QxSandboxObservation;
 
+typedef struct QxRuntimeRecoverySnapshot
+{
+	bool		valid;
+	Oid			databaseoid;
+	Oid			ownerid;
+	QxRecoveryReport report;
+} QxRuntimeRecoverySnapshot;
+
+typedef struct QxRuntimeRecoveryQueueMapEntry
+{
+	Oid			taskoid;
+	Oid			queueoid;
+} QxRuntimeRecoveryQueueMapEntry;
+
+typedef struct QxRuntimeRecoveryHooksContext
+{
+	Oid			ownerid;
+	Relation	queueledgerrel;
+	Relation	leaseledgerrel;
+	Relation	heartbeatledgerrel;
+	List	   *queue_entries;
+} QxRuntimeRecoveryHooksContext;
+
+typedef struct QxRuntimeSchedulerCycleStats
+{
+	int32		tasks_scanned;
+	int32		running_tasks;
+	int32		queued_retry_tasks;
+	int32		retry_ready_tasks;
+	int32		retry_waiting_tasks;
+	int32		ownership_skipped;
+	int32		leases_seen;
+	int32		leases_renewed;
+	int32		leases_reclaimed;
+	int32		leases_repaired;
+	int32		recovery_requeued;
+	int32		retry_dispatches;
+	int32		heartbeats_written;
+	int32		last_retry_backoff_ms;
+	int32		max_retry_backoff_ms;
+} QxRuntimeSchedulerCycleStats;
+
+typedef struct QxRuntimeSchedulerDbTarget
+{
+	Oid			dboid;
+	char	   *dbname;
+} QxRuntimeSchedulerDbTarget;
+
+typedef struct QxRuntimeSchedulerWorkerKey
+{
+	Oid			dboid;
+	int32		slot_index;
+	int32		slot_count;
+} QxRuntimeSchedulerWorkerKey;
+
+typedef struct QxRuntimeSchedulerDbWorker
+{
+	Oid			dboid;
+	char	   *dbname;
+	int32		slot_index;
+	int32		slot_count;
+	BackgroundWorkerHandle *handle;
+} QxRuntimeSchedulerDbWorker;
+
 static uint32 qx_runtime_temp_seq = 0;
+static QxRuntimeRecoverySnapshot qx_runtime_recovery_snapshot = {0};
 #define QX_RECEIPT_SIG_HEX_LEN	((PG_SHA256_DIGEST_LENGTH * 2) + 1)
 #define QX_ED25519_SIG_BYTES	64
 #define QX_ED25519_SIG_HEX_LEN	((QX_ED25519_SIG_BYTES * 2) + 1)
+#define QX_MICROVM_TIMEOUT_FLOOR_MS 60000
+#define QX_SCHEDULER_LAUNCHER_NAPTIME_MS 3000
+#define QX_SCHEDULER_WORKER_NAPTIME_MS 1000
+#define QX_SCHEDULER_DB_WORKER_SLOTS 2
 
-static char *qx_text_attr_from_syscache(HeapTuple tup, AttrNumber attnum,
-										int cacheid);
+#ifndef USECS_PER_MSEC
+#define USECS_PER_MSEC 1000
+#endif
+
 static char *qx_contract_value(const char *contract, const char *key);
 static char *qx_provider_receipt_key(Oid provideroid);
 static const char *qx_default_runtime_for_provider_kind(const char *provider_kind);
@@ -158,6 +255,8 @@ static void qx_runtime_temp_dir(char *path, size_t pathlen);
 static void qx_runtime_temp_path(char *path, size_t pathlen,
 								 const char *suffix);
 static void qx_write_text_file(const char *path, const char *contents);
+static void qx_resolve_docker_cli_path(char *resolved, size_t resolved_len);
+static const char *qx_default_docker_host(void);
 static void qx_resolve_principal_program_path(const char *program_name,
 											  char *resolved,
 											  size_t resolved_len);
@@ -169,9 +268,13 @@ static void qx_launch_principal_program(const char *program_path,
 										const char *runtime_dir,
 										const char *request_path,
 										const char *response_path,
+										bool preserve_host_identity,
 										QxSandboxObservation *observation);
 static void qx_read_external_result(const char *path,
 									QxExternalToolResult *result);
+static void qx_build_semantic_execution_metadata(
+		QxSemanticExecutionMetadata *metadata,
+		const QxExternalToolResult *result);
 static void qx_validate_external_result(const QxExternalToolResult *result,
 										const QxSandboxProfile *profile,
 										const char *phase,
@@ -194,9 +297,220 @@ static void qx_execute_tool_contract(const char *contract,
 									 const char *goal,
 									 bool input_present,
 									 QxExternalToolResult *result);
-static List *qx_fetch_task_authorized_contracts(HeapTuple tasktup);
-static char *qx_fetch_task_goal(HeapTuple tasktup);
-static bool qx_task_input_present(HeapTuple tasktup);
+static List *qx_parse_task_authorized_contracts(const char *serialized);
+static const char *qx_safe_runtime_text(const char *value);
+static const char *qx_bool_literal(bool value);
+static const char *qx_effective_priority_name(const char *priority);
+static char *qx_fetch_agent_name(Oid agentoid);
+static void qx_scheduler_apply_contract(QxSchedulerTaskEnvelope *envelope,
+										const char *contract);
+static void qx_scheduler_fill_envelope(QxSchedulerTaskEnvelope *envelope,
+									   Oid ownerid,
+									   Oid sessionoid,
+									   Oid agentoid,
+									   Oid identityoid,
+									   Oid namespace_policy_oid,
+									   Oid taskoid,
+									   Oid attemptoid,
+									   const char *task_name,
+									   const char *agent_name,
+									   const char *identity_name,
+									   const char *namespace_policy_name,
+									   const char *priority,
+									   const char *checkpoint_label,
+									   const char *resume_label,
+									   bool resumable,
+									   bool checkpointable,
+									   bool is_retry,
+									   int32 budget_tokens,
+									   int32 budget_cost,
+									   int32 estimated_tokens,
+									   int32 estimated_cost,
+									   int32 retry_count,
+									   const char *contract);
+static char *qx_scheduler_append_runtime_payload(
+		char *base_payload,
+		const QxSchedulerTaskEnvelope *envelope,
+		bool include_lease);
+extern bool QxSchedulerLeaseNeedsReclaim(const QxSchedulerLeaseSnapshot *lease,
+										 TimestampTz now);
+static char *qx_runtime_recovery_selected_contract(const QxCatalogTaskInfo *task,
+												   bool prefer_resume);
+static char *qx_runtime_recovery_checkpoint_label(Oid checkpointoid);
+static void qx_runtime_fill_recovery_scheduler_envelope(
+	QxSchedulerTaskEnvelope *envelope,
+	const QxCatalogTaskInfo *task,
+	Oid attemptoid,
+	int32 retry_count,
+	const char *checkpoint_label,
+	const char *resume_label,
+	bool resumable,
+	bool checkpointable,
+	bool is_retry,
+	const char *contract);
+static void qx_runtime_remember_recovery_queueoid(
+	QxRuntimeRecoveryHooksContext *context,
+	Oid taskoid,
+	Oid queueoid);
+static Oid qx_runtime_lookup_recovery_queueoid(
+	const QxRuntimeRecoveryHooksContext *context,
+	Oid taskoid);
+static Oid qx_insert_scheduler_queue(Relation rel,
+									 const QxSchedulerQueueSnapshot *snapshot);
+static Oid qx_insert_scheduler_lease(Relation rel,
+									 Oid queueoid,
+									 const QxSchedulerLeaseSnapshot *snapshot);
+static Oid qx_insert_scheduler_heartbeat(Relation rel,
+										 Oid leaseoid,
+										 const QxSchedulerHeartbeatSnapshot *snapshot);
+static char *qx_runtime_heap_text_attr(Relation rel, HeapTuple tup,
+									   AttrNumber attnum);
+static void qx_runtime_copy_scheduler_queue_snapshot(
+	Relation rel,
+	HeapTuple tup,
+	QxSchedulerQueueSnapshot *snapshot);
+static bool qx_runtime_latest_queue(
+	Relation queueledgerrel,
+	Oid taskoid,
+	Oid attemptoid,
+	QxSchedulerQueueSnapshot *snapshot);
+static bool qx_runtime_latest_lease(
+	Relation leaseledgerrel,
+	Oid taskoid,
+	Oid attemptoid,
+	QxSchedulerLeaseSnapshot *snapshot,
+	Oid *queueoid);
+static int32 qx_runtime_lease_ttl_ms(
+	const QxSchedulerLeaseSnapshot *snapshot);
+static int32 qx_runtime_scheduler_slot_count(void);
+static int32 qx_runtime_scheduler_owner_slot(Oid taskoid, int32 slot_count);
+static bool qx_runtime_scheduler_worker_owns_task(Oid taskoid,
+												  int32 slot_index,
+												  int32 slot_count);
+static int32 qx_runtime_retry_backoff_ms(const char *priority,
+										 int32 retry_count,
+										 int32 lease_ttl_ms,
+										 Oid taskoid);
+static void qx_runtime_set_heartbeat_receipt(
+	QxSchedulerHeartbeatSnapshot *heartbeat,
+	const char *receipt_mode);
+static void qx_runtime_free_scheduler_queue_snapshot(
+	QxSchedulerQueueSnapshot *snapshot);
+static void qx_runtime_free_scheduler_lease_snapshot(
+	QxSchedulerLeaseSnapshot *snapshot);
+static int16 qx_runtime_next_step_seqno(Relation steprel, Oid taskoid);
+static List *qx_runtime_scheduler_db_targets(void);
+static void qx_runtime_free_scheduler_db_targets(List *targets);
+static QxRuntimeSchedulerDbWorker *qx_runtime_find_scheduler_db_worker(
+	const List *workers,
+	Oid dboid,
+	int32 slot_index);
+static bool qx_runtime_launch_scheduler_db_worker(
+	Oid dboid,
+	const char *dbname,
+	int32 slot_index,
+	int32 slot_count,
+	BackgroundWorkerHandle **handle);
+static void qx_runtime_scheduler_heartbeat_wait(uint32 *wait_event,
+												const char *wait_name,
+												long timeout_ms);
+static Oid qx_runtime_test_start_uncheckpointed_task(Oid sessionoid,
+													 const char *priority);
+static void qx_runtime_run_scheduler_cycle(QxRuntimeSchedulerCycleStats *stats,
+										   int32 slot_index,
+										   int32 slot_count);
+static void qx_runtime_run_scheduler_retry_cycle(QxRuntimeSchedulerCycleStats *stats,
+												 int32 slot_index,
+												 int32 slot_count);
+static bool qx_runtime_reclaim_running_attempt(
+	Relation taskrel,
+	Relation attemptrel,
+	Relation queueledgerrel,
+	Relation leaseledgerrel,
+	Relation heartbeatledgerrel,
+	const QxCatalogTaskInfo *task,
+	const QxCatalogAttemptInfo *attempt,
+	const QxSchedulerLeaseSnapshot *lease_snapshot,
+	Oid queueoid,
+	const char *worker_name,
+	QxRuntimeSchedulerCycleStats *stats);
+static bool qx_runtime_dispatch_retry_task(
+	Relation taskrel,
+	Relation attemptrel,
+	Relation steprel,
+	Relation eventrel,
+	Relation tracerel,
+	Relation checkpointrel,
+	Relation queueledgerrel,
+	Relation leaseledgerrel,
+	Relation heartbeatledgerrel,
+	const QxCatalogTaskInfo *task,
+	const QxCatalogAttemptInfo *failed_attempt,
+	const QxSchedulerQueueSnapshot *retry_queue,
+	const char *worker_name,
+	QxRuntimeSchedulerCycleStats *stats);
+static bool qx_runtime_retry_candidate_better(
+	const QxCatalogTaskInfo *candidate_task,
+	const QxCatalogAttemptInfo *candidate_attempt,
+	const QxSchedulerQueueSnapshot *candidate_queue,
+	const QxCatalogTaskInfo *best_task,
+	const QxCatalogAttemptInfo *best_attempt,
+	const QxSchedulerQueueSnapshot *best_queue);
+static void qx_runtime_log_scheduler_cycle(const char *worker_name,
+										   const QxRuntimeSchedulerCycleStats *stats);
+static void qx_runtime_recovery_begin(const QxRecoveryReport *report,
+									  void *userdata);
+static void qx_runtime_recovery_requeue_task(
+	const QxRecoveryTaskSummary *summary,
+	void *userdata);
+static void qx_runtime_recovery_fence_attempt(
+	const QxRecoveryAttemptSummary *summary,
+	void *userdata);
+static void qx_runtime_recovery_finish(const QxRecoveryReport *report,
+									   void *userdata);
+static void qx_runtime_ensure_startup_recovery_scan(Oid ownerid);
+static char *qx_runtime_failover_recovery_payload(
+	char *base_payload,
+	const QxRecoveryReport *report);
+static char *qx_runtime_append_recovery_payload(char *base_payload);
+static bool qx_runtime_path_exists(const char *path);
+static bool qx_resolve_microvm_runtime_paths(char *kernel_path,
+											 size_t kernel_path_len,
+											 char *initrd_path,
+											 size_t initrd_path_len);
+static void qx_resolve_microvm_qemu_path(char *resolved, size_t resolved_len);
+static void qx_validate_container_runtime_contract(
+	const char *phase,
+	Oid taskoid,
+	const char *tool_name,
+	const char *handler_name,
+	const char *effective_sandbox,
+	const QxSandboxProfile *profile,
+	const char *principal_name,
+	const char *principal_runtime,
+	const char *provider_name,
+	const char *provider_kind,
+	const char *provider_endpoint,
+	const char *receipt_schema,
+	const char *receipt_alg,
+	const char *receipt_nonce,
+	bool require_attestation);
+static void qx_validate_microvm_runtime_contract(
+	const char *phase,
+	Oid taskoid,
+	const char *tool_name,
+	const char *handler_name,
+	const char *effective_sandbox,
+	const QxSandboxProfile *profile,
+	const char *principal_name,
+	const char *principal_runtime,
+	const char *provider_name,
+	const char *provider_kind,
+	const char *provider_endpoint,
+	const char *receipt_schema,
+	const char *receipt_alg,
+	const char *receipt_nonce,
+	bool require_attestation);
 
 static void
 qx_set_text_datum(Datum *values, bool *nulls, AttrNumber attnum,
@@ -228,17 +542,43 @@ qx_set_nodetree_datum(Datum *values, bool *nulls, AttrNumber attnum,
 	pfree(serialized);
 }
 
-static char *
-qx_text_attr_from_syscache(HeapTuple tup, AttrNumber attnum, int cacheid)
+static const char *
+qx_safe_runtime_text(const char *value)
 {
-	bool		isnull;
-	Datum		datum;
+	if (value == NULL || value[0] == '\0')
+		return "<unknown>";
 
-	datum = SysCacheGetAttr(cacheid, tup, attnum, &isnull);
-	if (isnull)
-		return NULL;
+	return value;
+}
 
-	return TextDatumGetCString(datum);
+static const char *
+qx_bool_literal(bool value)
+{
+	return value ? "true" : "false";
+}
+
+static const char *
+qx_effective_priority_name(const char *priority)
+{
+	if (priority == NULL || priority[0] == '\0')
+		return "normal";
+
+	return priority;
+}
+
+static char *
+qx_fetch_agent_name(Oid agentoid)
+{
+	QxCatalogAgentInfo agent;
+	char	   *name;
+
+	if (!QxCatalogLookupAgentByOid(agentoid, &agent))
+		elog(ERROR, "cache lookup failed for QhapaqXian agent %u", agentoid);
+
+	name = pstrdup(agent.name);
+	QxCatalogFreeAgentInfo(&agent);
+
+	return name;
 }
 
 static char *
@@ -267,39 +607,778 @@ qx_contract_value(const char *contract, const char *key)
 	return value;
 }
 
+static void
+qx_scheduler_apply_contract(QxSchedulerTaskEnvelope *envelope,
+							const char *contract)
+{
+	if (envelope == NULL || contract == NULL)
+		return;
+
+	envelope->principal_name = qx_contract_value(contract, "principal");
+	envelope->provider_name = qx_contract_value(contract, "provider");
+	envelope->provider_kind = qx_contract_value(contract, "provider_kind");
+	envelope->principal_runtime = qx_contract_value(contract,
+													 "principal_runtime");
+
+	if (envelope->principal_runtime == NULL)
+		envelope->principal_runtime = pstrdup(
+			qx_default_runtime_for_provider_kind(envelope->provider_kind));
+}
+
+static void
+qx_scheduler_fill_envelope(QxSchedulerTaskEnvelope *envelope,
+						   Oid ownerid,
+						   Oid sessionoid,
+						   Oid agentoid,
+						   Oid identityoid,
+						   Oid namespace_policy_oid,
+						   Oid taskoid,
+						   Oid attemptoid,
+						   const char *task_name,
+						   const char *agent_name,
+						   const char *identity_name,
+						   const char *namespace_policy_name,
+						   const char *priority,
+						   const char *checkpoint_label,
+						   const char *resume_label,
+						   bool resumable,
+						   bool checkpointable,
+						   bool is_retry,
+						   int32 budget_tokens,
+						   int32 budget_cost,
+						   int32 estimated_tokens,
+						   int32 estimated_cost,
+						   int32 retry_count,
+						   const char *contract)
+{
+	const char *effective_priority;
+
+	Assert(envelope != NULL);
+
+	QxSchedulerInitTaskEnvelope(envelope);
+	effective_priority = qx_effective_priority_name(priority);
+
+	envelope->ownerid = ownerid;
+	envelope->sessionoid = sessionoid;
+	envelope->agentoid = agentoid;
+	envelope->identityoid = identityoid;
+	envelope->namespace_policy_oid = namespace_policy_oid;
+	envelope->taskoid = taskoid;
+	envelope->attemptoid = attemptoid;
+	envelope->task_name = pstrdup(qx_safe_runtime_text(task_name));
+	envelope->agent_name = pstrdup(qx_safe_runtime_text(agent_name));
+	envelope->identity_name = pstrdup(qx_safe_runtime_text(identity_name));
+	envelope->namespace_policy_name =
+		pstrdup(qx_safe_runtime_text(namespace_policy_name));
+	envelope->priority = pstrdup(effective_priority);
+	envelope->checkpoint_label = checkpoint_label != NULL ?
+		pstrdup(checkpoint_label) : NULL;
+	envelope->resume_label = resume_label != NULL ?
+		pstrdup(resume_label) : NULL;
+	envelope->resumable = resumable;
+	envelope->checkpointable = checkpointable;
+	envelope->urgent = (QxSchedulerPriorityWeight(effective_priority) >= 80);
+	envelope->requires_heartbeat = true;
+	envelope->is_retry = is_retry;
+	envelope->budget_tokens = budget_tokens;
+	envelope->budget_cost = budget_cost;
+	envelope->estimated_tokens = estimated_tokens;
+	envelope->estimated_cost = estimated_cost;
+	envelope->retry_count = retry_count;
+	envelope->max_retries = 3;
+	envelope->queue_name = QxSchedulerBuildQueueKey(
+		envelope->namespace_policy_name,
+		envelope->priority,
+		envelope->agent_name);
+
+	qx_scheduler_apply_contract(envelope, contract);
+
+	envelope->heartbeat_interval_ms =
+		QxSchedulerDefaultHeartbeatIntervalMs(envelope);
+	envelope->lease_ttl_ms = QxSchedulerDefaultLeaseTtlMs(envelope);
+}
+
+static char *
+qx_scheduler_append_runtime_payload(char *base_payload,
+									const QxSchedulerTaskEnvelope *envelope,
+									bool include_lease)
+{
+	QxSchedulerQueueSnapshot *queue_snapshot;
+	QxSchedulerLeaseSnapshot *lease_snapshot = NULL;
+	QxSchedulerHeartbeatSnapshot *heartbeat_snapshot = NULL;
+	StringInfoData buf;
+	TimestampTz	now;
+
+	Assert(envelope != NULL);
+
+	if (!QxSchedulerRuntimeContractIsValid(envelope))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("scheduler contract is incomplete for runtime admission"),
+				 errdetail("Stage 26 admission now requires a valid scheduler envelope before execution proceeds.")));
+
+	queue_snapshot = QxSchedulerQueueSnapshotFromEnvelope(envelope);
+	if (include_lease)
+	{
+		lease_snapshot = QxSchedulerLeaseSnapshotFromEnvelope(envelope,
+															 InvalidOid,
+															 "embedded-runtime");
+		heartbeat_snapshot = QxSchedulerHeartbeatSnapshotFromLease(lease_snapshot);
+	}
+
+	initStringInfo(&buf);
+	appendStringInfoString(&buf, base_payload != NULL ? base_payload : "");
+	appendStringInfo(&buf,
+					 ";scheduler_queue=%s;scheduler_queue_kind=%d;scheduler_priority_weight=%d;scheduler_runtime=%s;scheduler_provider=%s;scheduler_provider_kind=%s;scheduler_resumable=%s;scheduler_checkpointable=%s;scheduler_urgent=%s;scheduler_retry=%d/%d;scheduler_heartbeat_ms=%d;scheduler_lease_ttl_ms=%d",
+					 qx_safe_runtime_text(queue_snapshot->queue_name),
+					 (int) queue_snapshot->queue_kind,
+					 QxSchedulerPriorityWeight(envelope->priority),
+					 qx_safe_runtime_text(envelope->principal_runtime),
+					 qx_safe_runtime_text(envelope->provider_name),
+					 qx_safe_runtime_text(envelope->provider_kind),
+					 qx_bool_literal(envelope->resumable),
+					 qx_bool_literal(envelope->checkpointable),
+					 qx_bool_literal(envelope->urgent),
+					 envelope->retry_count,
+					 envelope->max_retries,
+					 envelope->heartbeat_interval_ms,
+					 envelope->lease_ttl_ms);
+
+	if (envelope->checkpoint_label != NULL)
+		appendStringInfo(&buf, ";scheduler_checkpoint=%s",
+						 qx_safe_runtime_text(envelope->checkpoint_label));
+	if (envelope->resume_label != NULL)
+		appendStringInfo(&buf, ";scheduler_resume=%s",
+						 qx_safe_runtime_text(envelope->resume_label));
+
+	if (include_lease)
+	{
+		now = GetCurrentTimestamp();
+		appendStringInfo(&buf,
+						 ";scheduler_worker=%s;scheduler_lease_state=%d;scheduler_lease_expired=%s;scheduler_heartbeat_state=%d;scheduler_heartbeat_stale=%s;scheduler_receipt_mode=%s",
+						 qx_safe_runtime_text(lease_snapshot->worker_name),
+						 (int) lease_snapshot->state,
+						 qx_bool_literal(QxSchedulerLeaseExpired(lease_snapshot, now)),
+						 (int) heartbeat_snapshot->state,
+						 qx_bool_literal(QxSchedulerHeartbeatStale(heartbeat_snapshot,
+																  now)),
+						 qx_safe_runtime_text(heartbeat_snapshot->receipt_mode));
+	}
+
+	if (base_payload != NULL)
+		pfree(base_payload);
+
+	return buf.data;
+}
+
+static char *
+qx_runtime_recovery_selected_contract(const QxCatalogTaskInfo *task,
+									  bool prefer_resume)
+{
+	List	   *authorized_contracts;
+	Node	   *selected_node;
+	char	   *selected_contract = NULL;
+
+	if (task == NULL)
+		return NULL;
+
+	authorized_contracts = qx_parse_task_authorized_contracts(task->authorized_tools);
+	if (authorized_contracts != NIL)
+	{
+		selected_node = prefer_resume ?
+			(Node *) llast(authorized_contracts) :
+			(Node *) linitial(authorized_contracts);
+		selected_contract = pstrdup(strVal(selected_node));
+	}
+
+	if (authorized_contracts != NIL)
+		list_free_deep(authorized_contracts);
+
+	return selected_contract;
+}
+
+static char *
+qx_runtime_recovery_checkpoint_label(Oid checkpointoid)
+{
+	QxCatalogCheckpointInfo checkpoint;
+	char	   *label = NULL;
+
+	if (!OidIsValid(checkpointoid))
+		return NULL;
+
+	if (!QxCatalogLookupCheckpointByOid(checkpointoid, &checkpoint))
+		return NULL;
+
+	if (checkpoint.label != NULL)
+		label = pstrdup(checkpoint.label);
+
+	QxCatalogFreeCheckpointInfo(&checkpoint);
+
+	return label;
+}
+
+static void
+qx_runtime_fill_recovery_scheduler_envelope(
+	QxSchedulerTaskEnvelope *envelope,
+	const QxCatalogTaskInfo *task,
+	Oid attemptoid,
+	int32 retry_count,
+	const char *checkpoint_label,
+	const char *resume_label,
+	bool resumable,
+	bool checkpointable,
+	bool is_retry,
+	const char *contract)
+{
+	Assert(envelope != NULL);
+	Assert(task != NULL);
+
+	qx_scheduler_fill_envelope(envelope,
+							   task->ownerid,
+							   task->sessionoid,
+							   task->agentoid,
+							   task->identityoid,
+							   task->namespacepolicyoid,
+							   task->oid,
+							   attemptoid,
+							   task->name,
+							   task->agent_name,
+							   task->identity_name,
+							   task->policy_name,
+							   task->priority,
+							   checkpoint_label,
+							   resume_label,
+							   resumable,
+							   checkpointable,
+							   is_retry,
+							   task->budget_tokens,
+							   task->budget_cost,
+							   task->estimated_tokens,
+							   task->estimated_cost,
+							   retry_count,
+							   contract);
+}
+
+static void
+qx_runtime_remember_recovery_queueoid(QxRuntimeRecoveryHooksContext *context,
+									  Oid taskoid,
+									  Oid queueoid)
+{
+	ListCell   *lc;
+
+	if (context == NULL || !OidIsValid(taskoid) || !OidIsValid(queueoid))
+		return;
+
+	foreach(lc, context->queue_entries)
+	{
+		QxRuntimeRecoveryQueueMapEntry *entry = lfirst(lc);
+
+		if (entry->taskoid == taskoid)
+		{
+			entry->queueoid = queueoid;
+			return;
+		}
+	}
+
+	{
+		QxRuntimeRecoveryQueueMapEntry *entry;
+
+		entry = palloc0(sizeof(QxRuntimeRecoveryQueueMapEntry));
+		entry->taskoid = taskoid;
+		entry->queueoid = queueoid;
+		context->queue_entries = lappend(context->queue_entries, entry);
+	}
+}
+
+static Oid
+qx_runtime_lookup_recovery_queueoid(const QxRuntimeRecoveryHooksContext *context,
+									Oid taskoid)
+{
+	ListCell   *lc;
+
+	if (context == NULL || !OidIsValid(taskoid))
+		return InvalidOid;
+
+	foreach(lc, context->queue_entries)
+	{
+		QxRuntimeRecoveryQueueMapEntry *entry = lfirst(lc);
+
+		if (entry->taskoid == taskoid)
+			return entry->queueoid;
+	}
+
+	return InvalidOid;
+}
+
+static void
+qx_runtime_recovery_begin(const QxRecoveryReport *report, void *userdata)
+{
+	QxRuntimeRecoveryHooksContext *context = userdata;
+
+	(void) report;
+
+	if (context == NULL)
+		return;
+
+	context->queue_entries = NIL;
+	context->queueledgerrel = table_open(QxSchedulerQueueRelationId,
+										 RowExclusiveLock);
+	context->leaseledgerrel = table_open(QxSchedulerLeaseRelationId,
+										 RowExclusiveLock);
+	context->heartbeatledgerrel = table_open(QxSchedulerHeartbeatRelationId,
+											 RowExclusiveLock);
+}
+
+static void
+qx_runtime_recovery_requeue_task(const QxRecoveryTaskSummary *summary,
+								 void *userdata)
+{
+	QxRuntimeRecoveryHooksContext *context = userdata;
+	QxCatalogTaskInfo task;
+	QxSchedulerTaskEnvelope scheduler_envelope;
+	QxSchedulerQueueSnapshot *queue_snapshot;
+	char	   *selected_contract;
+	char	   *checkpoint_label;
+	char	   *resume_label;
+	Oid			queueoid;
+	Oid			attemptoid;
+	bool		prefer_resume;
+	int32		retry_count;
+
+	if (context == NULL || summary == NULL || !OidIsValid(summary->taskoid))
+		return;
+
+	if (!OidIsValid(summary->lastattemptoid))
+		return;
+
+	if (!QxCatalogLookupTaskByOid(summary->taskoid, &task))
+		elog(ERROR, "cache lookup failed for QhapaqXian recovery task %u",
+			 summary->taskoid);
+
+	prefer_resume = OidIsValid(summary->lastcheckpointoid);
+	checkpoint_label =
+		qx_runtime_recovery_checkpoint_label(summary->lastcheckpointoid);
+	resume_label = checkpoint_label != NULL ? pstrdup(checkpoint_label) : NULL;
+	selected_contract =
+		qx_runtime_recovery_selected_contract(&task, prefer_resume);
+	attemptoid = summary->lastattemptoid;
+	retry_count = Max(summary->attempt_count, 0);
+
+	qx_runtime_fill_recovery_scheduler_envelope(&scheduler_envelope,
+												&task,
+												attemptoid,
+												retry_count,
+												checkpoint_label,
+												resume_label,
+												true,
+												true,
+												(retry_count > 0),
+												selected_contract);
+	queue_snapshot = QxSchedulerQueueSnapshotFromEnvelope(&scheduler_envelope);
+	queue_snapshot->queue_kind = QX_SCHEDULER_QUEUE_RECOVERY;
+	queue_snapshot->retry_count = retry_count;
+	queueoid = qx_insert_scheduler_queue(context->queueledgerrel, queue_snapshot);
+	CommandCounterIncrement();
+	qx_runtime_remember_recovery_queueoid(context, summary->taskoid, queueoid);
+
+	if (selected_contract != NULL)
+		pfree(selected_contract);
+	if (checkpoint_label != NULL)
+		pfree(checkpoint_label);
+	if (resume_label != NULL)
+		pfree(resume_label);
+	QxCatalogFreeTaskInfo(&task);
+}
+
+static void
+qx_runtime_recovery_fence_attempt(const QxRecoveryAttemptSummary *summary,
+								  void *userdata)
+{
+	QxRuntimeRecoveryHooksContext *context = userdata;
+	QxCatalogTaskInfo task;
+	QxSchedulerTaskEnvelope scheduler_envelope;
+	QxSchedulerQueueSnapshot *queue_snapshot;
+	QxSchedulerLeaseSnapshot *lease_snapshot;
+	QxSchedulerLeaseSnapshot *reclaimed_lease_snapshot;
+	QxSchedulerHeartbeatSnapshot *heartbeat_snapshot;
+	char	   *selected_contract;
+	char	   *checkpoint_label = NULL;
+	char	   *resume_label = NULL;
+	Oid			queueoid;
+	Oid			leaseoid;
+	bool		prefer_resume;
+
+	if (context == NULL || summary == NULL || !OidIsValid(summary->attemptoid) ||
+		!OidIsValid(summary->taskoid))
+		return;
+
+	if (!QxCatalogLookupTaskByOid(summary->taskoid, &task))
+		elog(ERROR, "cache lookup failed for QhapaqXian recovery task %u",
+			 summary->taskoid);
+
+	prefer_resume = (summary->strategy != NULL &&
+					 strcmp(summary->strategy, "resume") == 0);
+	if (OidIsValid(task.lastcheckpointid))
+	{
+		checkpoint_label =
+			qx_runtime_recovery_checkpoint_label(task.lastcheckpointid);
+		if (prefer_resume && checkpoint_label != NULL)
+			resume_label = pstrdup(checkpoint_label);
+	}
+	selected_contract =
+		qx_runtime_recovery_selected_contract(&task, prefer_resume);
+	qx_runtime_fill_recovery_scheduler_envelope(&scheduler_envelope,
+												&task,
+												summary->attemptoid,
+												Max(summary->seqno, 0),
+												checkpoint_label,
+												resume_label,
+												prefer_resume,
+												true,
+												(summary->seqno > 1),
+												selected_contract);
+
+	queueoid = qx_runtime_lookup_recovery_queueoid(context, summary->taskoid);
+	if (!OidIsValid(queueoid))
+	{
+		queue_snapshot = QxSchedulerQueueSnapshotFromEnvelope(&scheduler_envelope);
+		queue_snapshot->queue_kind = QX_SCHEDULER_QUEUE_RECOVERY;
+		queue_snapshot->retry_count = Max(summary->seqno, 0);
+		queueoid = qx_insert_scheduler_queue(context->queueledgerrel,
+											 queue_snapshot);
+		CommandCounterIncrement();
+		qx_runtime_remember_recovery_queueoid(context, summary->taskoid, queueoid);
+	}
+
+	lease_snapshot = QxSchedulerLeaseSnapshotFromEnvelope(&scheduler_envelope,
+														  InvalidOid,
+														  "embedded-runtime");
+	reclaimed_lease_snapshot =
+		QxSchedulerReleaseLeaseSnapshot(lease_snapshot, true);
+	leaseoid = qx_insert_scheduler_lease(context->leaseledgerrel,
+										 queueoid,
+										 reclaimed_lease_snapshot);
+	heartbeat_snapshot =
+		QxSchedulerFinalizeHeartbeatSnapshot(reclaimed_lease_snapshot,
+											 "scheduler-reclaim");
+	heartbeat_snapshot->state = QX_SCHEDULER_HEARTBEAT_MISSED;
+	heartbeat_snapshot->lag_ms = scheduler_envelope.heartbeat_interval_ms;
+	heartbeat_snapshot->stale = true;
+	(void) qx_insert_scheduler_heartbeat(context->heartbeatledgerrel,
+										 leaseoid,
+										 heartbeat_snapshot);
+	CommandCounterIncrement();
+
+	if (selected_contract != NULL)
+		pfree(selected_contract);
+	if (checkpoint_label != NULL)
+		pfree(checkpoint_label);
+	if (resume_label != NULL)
+		pfree(resume_label);
+	QxCatalogFreeTaskInfo(&task);
+}
+
+static void
+qx_runtime_recovery_finish(const QxRecoveryReport *report, void *userdata)
+{
+	QxRuntimeRecoveryHooksContext *context = userdata;
+
+	(void) report;
+
+	if (context == NULL)
+		return;
+
+	if (context->queue_entries != NIL)
+		list_free_deep(context->queue_entries);
+	context->queue_entries = NIL;
+
+	if (context->heartbeatledgerrel != NULL)
+		table_close(context->heartbeatledgerrel, RowExclusiveLock);
+	if (context->leaseledgerrel != NULL)
+		table_close(context->leaseledgerrel, RowExclusiveLock);
+	if (context->queueledgerrel != NULL)
+		table_close(context->queueledgerrel, RowExclusiveLock);
+
+	context->heartbeatledgerrel = NULL;
+	context->leaseledgerrel = NULL;
+	context->queueledgerrel = NULL;
+}
+
+static void
+qx_runtime_ensure_startup_recovery_scan(Oid ownerid)
+{
+	QxRecoveryStartupRequest request;
+	QxRecoveryHooks hooks;
+	QxRecoveryReport *report;
+	QxRuntimeRecoveryHooksContext hook_context;
+	Oid			effective_ownerid;
+
+	effective_ownerid = OidIsValid(ownerid) ? ownerid : GetUserId();
+	if (qx_runtime_recovery_snapshot.valid &&
+		qx_runtime_recovery_snapshot.databaseoid == MyDatabaseId &&
+		qx_runtime_recovery_snapshot.ownerid == effective_ownerid)
+		return;
+
+	memset(&request, 0, sizeof(request));
+	request.databaseoid = MyDatabaseId;
+	request.ownerid = effective_ownerid;
+	request.include_attempts = true;
+	request.include_checkpoints = true;
+	request.fence_stale_attempts = true;
+	request.requeue_checkpointed_tasks = true;
+	request.rebuild_from_semantic_log = false;
+
+	memset(&hooks, 0, sizeof(hooks));
+	memset(&hook_context, 0, sizeof(hook_context));
+	hook_context.ownerid = effective_ownerid;
+	hooks.begin = qx_runtime_recovery_begin;
+	hooks.requeue_task = qx_runtime_recovery_requeue_task;
+	hooks.fence_attempt = qx_runtime_recovery_fence_attempt;
+	hooks.finish = qx_runtime_recovery_finish;
+	hooks.userdata = &hook_context;
+
+	report = QxRecoveryRunStartupScan(&request, &hooks);
+	qx_runtime_recovery_snapshot.valid = true;
+	qx_runtime_recovery_snapshot.databaseoid = MyDatabaseId;
+	qx_runtime_recovery_snapshot.ownerid = effective_ownerid;
+	if (report != NULL)
+	{
+		qx_runtime_recovery_snapshot.report = *report;
+		QxRecoveryFreeReport(report);
+	}
+	else
+		memset(&qx_runtime_recovery_snapshot.report, 0,
+			   sizeof(qx_runtime_recovery_snapshot.report));
+}
+
+static char *
+qx_runtime_failover_recovery_payload(char *base_payload,
+									 const QxRecoveryReport *report)
+{
+	StringInfoData buf;
+
+	if (report == NULL)
+		elog(ERROR, "failover recovery report cannot be null");
+
+	initStringInfo(&buf);
+	appendStringInfoString(&buf, base_payload != NULL ? base_payload : "");
+	appendStringInfo(&buf,
+					 ";recovery_startup_scan=%s;recovery_failover_rebuild=%s;recovery_tasks_scanned=%d;recovery_attempts_scanned=%d;recovery_checkpoints_scanned=%d;recovery_tasks_requeued=%d;recovery_attempts_fenced=%d;recovery_checkpoints_replayed=%d;recovery_orphan_attempts=%d;recovery_semantic_candidates=%d",
+					 qx_bool_literal(report->startup_scan),
+					 qx_bool_literal(report->failover_rebuild),
+					 report->tasks_scanned,
+					 report->attempts_scanned,
+					 report->checkpoints_scanned,
+					 report->tasks_requeued,
+					 report->attempts_fenced,
+					 report->checkpoints_replayed,
+					 report->orphan_attempts,
+					 report->semantic_replay_candidates);
+
+	if (base_payload != NULL)
+		pfree(base_payload);
+
+	return buf.data;
+}
+
+static char *
+qx_runtime_append_recovery_payload(char *base_payload)
+{
+	StringInfoData buf;
+	const QxRecoveryReport *report;
+
+	report = &qx_runtime_recovery_snapshot.report;
+	initStringInfo(&buf);
+	appendStringInfoString(&buf, base_payload != NULL ? base_payload : "");
+	appendStringInfo(&buf,
+					 ";recovery_startup_scan=%s;recovery_tasks_scanned=%d;recovery_attempts_scanned=%d;recovery_checkpoints_scanned=%d;recovery_tasks_requeued=%d;recovery_attempts_fenced=%d;recovery_orphan_attempts=%d;recovery_semantic_candidates=%d",
+					 qx_bool_literal(report->startup_scan),
+					 report->tasks_scanned,
+					 report->attempts_scanned,
+					 report->checkpoints_scanned,
+					 report->tasks_requeued,
+					 report->attempts_fenced,
+					 report->orphan_attempts,
+					 report->semantic_replay_candidates);
+
+	if (base_payload != NULL)
+		pfree(base_payload);
+
+	return buf.data;
+}
+
+static void
+qx_validate_container_runtime_contract(const char *phase,
+										 Oid taskoid,
+										 const char *tool_name,
+										 const char *handler_name,
+										 const char *effective_sandbox,
+										 const QxSandboxProfile *profile,
+										 const char *principal_name,
+										 const char *principal_runtime,
+										 const char *provider_name,
+										 const char *provider_kind,
+										 const char *provider_endpoint,
+										 const char *receipt_schema,
+										 const char *receipt_alg,
+										 const char *receipt_nonce,
+										 bool require_attestation)
+{
+	QxContainerBackendRequest request;
+	char	   *image_ref;
+
+	if (!qx_container_backend_is_supported_provider_kind(provider_kind) &&
+		!qx_container_backend_is_supported_runtime_class(principal_runtime))
+		return;
+
+	qx_container_backend_request_init(&request);
+	image_ref = pstrdup(getenv("QX_CONTAINER_IMAGE") != NULL ?
+						getenv("QX_CONTAINER_IMAGE") : "alpine:3.20");
+
+	request.phase = pstrdup(phase != NULL ? phase : "submit");
+	request.tool_name = pstrdup(qx_safe_runtime_text(tool_name));
+	request.principal_name = pstrdup(qx_safe_runtime_text(principal_name));
+	request.principal_runtime = pstrdup(qx_safe_runtime_text(principal_runtime));
+	request.provider_name = pstrdup(qx_safe_runtime_text(provider_name));
+	request.provider_kind = pstrdup(qx_safe_runtime_text(provider_kind));
+	request.provider_endpoint = pstrdup(qx_safe_runtime_text(provider_endpoint));
+	request.sandbox_name = pstrdup(qx_safe_runtime_text(effective_sandbox));
+	request.profile_name = pstrdup(profile->name);
+	request.environment_mode = pstrdup("minimal");
+	request.workdir_name = pstrdup("pg_qx_runtime");
+	request.command_line = psprintf("docker run --rm %s true", image_ref);
+	request.image_ref = image_ref;
+	request.receipt_schema = pstrdup(qx_safe_runtime_text(receipt_schema));
+	request.receipt_alg = pstrdup(qx_safe_runtime_text(receipt_alg));
+	request.receipt_nonce = pstrdup(qx_safe_runtime_text(receipt_nonce));
+	request.attestation_mode =
+		pstrdup(qx_container_backend_expected_attestation_mode());
+	request.detail = psprintf("task=%u;handler=%s",
+							  taskoid,
+							  handler_name != NULL ? handler_name : "<unknown>");
+	request.timeout_ms = profile->timeout_ms;
+	request.memory_kb = profile->memory_kb;
+	request.process_limit = profile->process_limit;
+	request.token_charge = 0;
+	request.cost_charge = 0;
+	request.require_attestation = require_attestation;
+	request.allow_network = false;
+	request.allow_privilege_escalation = false;
+
+	qx_container_backend_validate_request(&request);
+	qx_container_backend_request_free(&request);
+}
+
+static void
+qx_validate_microvm_runtime_contract(const char *phase,
+									 Oid taskoid,
+									 const char *tool_name,
+									 const char *handler_name,
+									 const char *effective_sandbox,
+									 const QxSandboxProfile *profile,
+									 const char *principal_name,
+									 const char *principal_runtime,
+									 const char *provider_name,
+									 const char *provider_kind,
+									 const char *provider_endpoint,
+									 const char *receipt_schema,
+									 const char *receipt_alg,
+									 const char *receipt_nonce,
+									 bool require_attestation)
+{
+	QxMicrovmBackendRequest request;
+	char		kernel_path[MAXPGPATH];
+	char		initrd_path[MAXPGPATH];
+	char		qemu_path[MAXPGPATH];
+	char	   *image_ref;
+	char	   *accel;
+
+	if (!qx_microvm_backend_is_supported_provider_kind(provider_kind) &&
+		!qx_microvm_backend_is_supported_runtime_class(principal_runtime))
+		return;
+
+	if (!qx_resolve_microvm_runtime_paths(kernel_path, sizeof(kernel_path),
+										  initrd_path, sizeof(initrd_path)))
+		return;
+
+	qx_microvm_backend_request_init(&request);
+	image_ref = psprintf("kernel=%s;initrd=%s", kernel_path, initrd_path);
+	accel = pstrdup(getenv("QX_MICROVM_ACCEL") != NULL ?
+					getenv("QX_MICROVM_ACCEL") : "tcg");
+	qx_resolve_microvm_qemu_path(qemu_path, sizeof(qemu_path));
+
+	request.phase = pstrdup(phase != NULL ? phase : "submit");
+	request.tool_name = pstrdup(qx_safe_runtime_text(tool_name));
+	request.principal_name = pstrdup(qx_safe_runtime_text(principal_name));
+	request.principal_runtime = pstrdup(qx_safe_runtime_text(principal_runtime));
+	request.provider_name = pstrdup(qx_safe_runtime_text(provider_name));
+	request.provider_kind = pstrdup(qx_safe_runtime_text(provider_kind));
+	request.provider_endpoint = pstrdup(qx_safe_runtime_text(provider_endpoint));
+	request.sandbox_name = pstrdup(qx_safe_runtime_text(effective_sandbox));
+	request.profile_name = pstrdup(profile->name);
+	request.environment_mode = pstrdup("minimal");
+	request.workdir_name = pstrdup("pg_qx_runtime");
+	request.command_line = psprintf("%s -M microvm -accel %s -kernel %s -initrd %s",
+									qemu_path,
+									accel,
+									kernel_path,
+									initrd_path);
+	request.image_ref = image_ref;
+	request.snapshot_ref = NULL;
+	request.receipt_schema = pstrdup(qx_safe_runtime_text(receipt_schema));
+	request.receipt_alg = pstrdup(qx_safe_runtime_text(receipt_alg));
+	request.receipt_nonce = pstrdup(qx_safe_runtime_text(receipt_nonce));
+	request.attestation_mode =
+		pstrdup(qx_microvm_backend_expected_attestation_mode());
+	request.detail = psprintf("task=%u;handler=%s",
+							  taskoid,
+							  handler_name != NULL ? handler_name : "<unknown>");
+	request.timeout_ms = profile->timeout_ms;
+	request.memory_kb = profile->memory_kb;
+	request.process_limit = profile->process_limit;
+	request.vcpu_count = 1;
+	request.token_charge = 0;
+	request.cost_charge = 0;
+	request.require_attestation = require_attestation;
+	request.allow_network = false;
+	request.allow_privilege_escalation = false;
+
+	qx_microvm_backend_validate_request(&request);
+	qx_microvm_backend_request_free(&request);
+	pfree(accel);
+}
+
 static char *
 qx_provider_receipt_key(Oid provideroid)
 {
-	HeapTuple	providertup;
-	Form_pg_qx_provider providerform;
+	QxCatalogProviderInfo provider;
 	char	   *receipt_key;
 
-	providertup = SearchSysCache1(QXPROVIDEROID, ObjectIdGetDatum(provideroid));
-	if (!HeapTupleIsValid(providertup))
+	if (!QxCatalogLookupProviderByOid(provideroid, &provider))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("provider %u no longer exists for runtime receipt verification",
 						provideroid)));
 
-	providerform = (Form_pg_qx_provider) GETSTRUCT(providertup);
-	if (!providerform->qxproviderenabled)
+	if (!provider.enabled)
 	{
-		ReleaseSysCache(providertup);
+		QxCatalogFreeProviderInfo(&provider);
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("provider %u is disabled for runtime receipt verification",
 						provideroid)));
 	}
 
-	receipt_key = qx_text_attr_from_syscache(providertup,
-											 Anum_pg_qx_provider_qxproviderreceiptkey,
-											 QXPROVIDEROID);
-	ReleaseSysCache(providertup);
-
-	if (receipt_key == NULL || receipt_key[0] == '\0')
+	if (provider.receipt_key == NULL || provider.receipt_key[0] == '\0')
+	{
+		QxCatalogFreeProviderInfo(&provider);
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("provider %u has no receipt key configured", provideroid)));
+	}
+
+	receipt_key = pstrdup(provider.receipt_key);
+	QxCatalogFreeProviderInfo(&provider);
 
 	return receipt_key;
 }
@@ -652,6 +1731,173 @@ qx_write_text_file(const char *path, const char *contents)
 }
 
 static void
+qx_resolve_docker_cli_path(char *resolved, size_t resolved_len)
+{
+	const char *override;
+
+	Assert(resolved != NULL);
+	override = getenv("QX_DOCKER_CLI");
+	if (override != NULL && override[0] != '\0')
+	{
+		strlcpy(resolved, override, resolved_len);
+		return;
+	}
+
+#ifdef WIN32
+	if (SearchPathA(NULL, "docker.exe", NULL, (DWORD) resolved_len,
+					resolved, NULL) > 0)
+		return;
+
+	strlcpy(resolved,
+			"C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe",
+			resolved_len);
+#else
+	{
+		const char *path = getenv("PATH");
+
+		if (path != NULL && path[0] != '\0')
+		{
+			char	   *copy = pstrdup(path);
+			char	   *cursor = copy;
+
+			while (cursor != NULL && *cursor != '\0')
+			{
+				char	   *sep = strchr(cursor, ':');
+				char		candidate[MAXPGPATH];
+
+				if (sep != NULL)
+					*sep = '\0';
+				join_path_components(candidate, cursor, "docker");
+				if (access(candidate, X_OK) == 0)
+				{
+					strlcpy(resolved, candidate, resolved_len);
+					pfree(copy);
+					return;
+				}
+				cursor = sep != NULL ? sep + 1 : NULL;
+			}
+			pfree(copy);
+		}
+	}
+
+	strlcpy(resolved, "/usr/bin/docker", resolved_len);
+#endif
+}
+
+static bool
+qx_runtime_path_exists(const char *path)
+{
+	struct stat st;
+
+	if (path == NULL || path[0] == '\0')
+		return false;
+
+	return stat(path, &st) == 0 && !S_ISDIR(st.st_mode);
+}
+
+static bool
+qx_resolve_microvm_asset_from_builddir(const char *filename,
+										 char *resolved,
+										 size_t resolved_len)
+{
+	const char *top_builddir;
+	char		asset_dir[MAXPGPATH];
+	char		candidate[MAXPGPATH];
+
+	top_builddir = getenv("top_builddir");
+	if (top_builddir == NULL || top_builddir[0] == '\0')
+		return false;
+
+	join_path_components(asset_dir, top_builddir, "microvm-assets");
+	join_path_components(candidate, asset_dir, filename);
+	canonicalize_path(candidate);
+	if (!qx_runtime_path_exists(candidate))
+		return false;
+
+	strlcpy(resolved, candidate, resolved_len);
+	return true;
+}
+
+static bool
+qx_resolve_microvm_runtime_paths(char *kernel_path,
+								 size_t kernel_path_len,
+								 char *initrd_path,
+								 size_t initrd_path_len)
+{
+	const char *kernel_override = getenv("QX_MICROVM_KERNEL");
+	const char *initrd_override = getenv("QX_MICROVM_INITRD");
+
+	if (kernel_override != NULL && kernel_override[0] != '\0' &&
+		initrd_override != NULL && initrd_override[0] != '\0' &&
+		qx_runtime_path_exists(kernel_override) &&
+		qx_runtime_path_exists(initrd_override))
+	{
+		strlcpy(kernel_path, kernel_override, kernel_path_len);
+		strlcpy(initrd_path, initrd_override, initrd_path_len);
+		return true;
+	}
+
+	if (!qx_resolve_microvm_asset_from_builddir("vmlinuz-virt",
+												 kernel_path,
+												 kernel_path_len))
+		return false;
+
+	if (qx_resolve_microvm_asset_from_builddir("initramfs-qx-microvm.cpio.gz",
+												 initrd_path,
+												 initrd_path_len))
+		return true;
+
+	if (qx_resolve_microvm_asset_from_builddir("initramfs-qx-microvm2.cpio.gz",
+												 initrd_path,
+												 initrd_path_len))
+		return true;
+
+	kernel_path[0] = '\0';
+	return false;
+}
+
+static void
+qx_resolve_microvm_qemu_path(char *resolved, size_t resolved_len)
+{
+	const char *override = getenv("QX_MICROVM_QEMU");
+
+	Assert(resolved != NULL);
+
+	if (override != NULL && override[0] != '\0')
+	{
+		strlcpy(resolved, override, resolved_len);
+		return;
+	}
+
+#ifdef WIN32
+	if (SearchPathA(NULL, "qemu-system-x86_64.exe", NULL, (DWORD) resolved_len,
+					resolved, NULL) > 0)
+		return;
+
+	strlcpy(resolved,
+			"C:\\Program Files\\qemu\\qemu-system-x86_64.exe",
+			resolved_len);
+#else
+	strlcpy(resolved, "qemu-system-x86_64", resolved_len);
+#endif
+}
+
+static const char *
+qx_default_docker_host(void)
+{
+	const char *override = getenv("DOCKER_HOST");
+
+	if (override != NULL && override[0] != '\0')
+		return override;
+
+#ifdef WIN32
+	return "npipe:////./pipe/dockerDesktopLinuxEngine";
+#else
+	return "unix:///var/run/docker.sock";
+#endif
+}
+
+static void
 qx_resolve_principal_program_path(const char *program_name,
 								  char *resolved,
 								  size_t resolved_len)
@@ -749,6 +1995,7 @@ qx_launch_principal_program(const char *program_path,
 							const char *runtime_dir,
 							const char *request_path,
 							const char *response_path,
+							bool preserve_host_identity,
 							QxSandboxObservation *observation)
 {
 #ifndef WIN32
@@ -805,6 +2052,7 @@ qx_launch_principal_program(const char *program_path,
 		}
 #endif
 #ifdef RLIMIT_FSIZE
+		if (!preserve_host_identity)
 		{
 			struct rlimit limit;
 
@@ -814,6 +2062,7 @@ qx_launch_principal_program(const char *program_path,
 		}
 #endif
 #ifdef RLIMIT_AS
+		if (!preserve_host_identity)
 		{
 			struct rlimit limit;
 
@@ -823,6 +2072,7 @@ qx_launch_principal_program(const char *program_path,
 		}
 #endif
 #ifdef RLIMIT_CPU
+		if (!preserve_host_identity)
 		{
 			struct rlimit limit;
 			int32		cpu_seconds;
@@ -900,6 +2150,10 @@ qx_launch_principal_program(const char *program_path,
 	char		cmdline[(MAXPGPATH * 3) + 128];
 	DWORD		exit_code = 0;
 	DWORD		wait_status;
+	DWORD		creation_flags;
+	DWORD		active_process_limit;
+	DWORD		job_limit_flags;
+	SIZE_T		process_memory_limit;
 	const char *system_root = getenv("SystemRoot");
 	char	   *timeout_value;
 	char	   *memory_value;
@@ -915,31 +2169,51 @@ qx_launch_principal_program(const char *program_path,
 	observation->launch_mode = "profiled_process";
 	observation->restricted_identity = false;
 	observation->wall_time_ms = 0;
-	need_restricted_identity = (strcmp(profile->name, "builtin") != 0);
-
-	job = CreateJobObjectA(NULL, NULL);
-	if (job == NULL)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not create sandbox job object for principal \"%s\": %m (error code %lu)",
-						program_path, GetLastError())));
-
-	job_limits.BasicLimitInformation.LimitFlags =
-		JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE |
-		JOB_OBJECT_LIMIT_ACTIVE_PROCESS |
-		JOB_OBJECT_LIMIT_PROCESS_MEMORY;
-	job_limits.BasicLimitInformation.ActiveProcessLimit = profile->process_limit;
-	job_limits.ProcessMemoryLimit = (SIZE_T) profile->memory_kb * 1024;
-	if (!SetInformationJobObject(job,
-								 JobObjectExtendedLimitInformation,
-								 &job_limits,
-								 sizeof(job_limits)))
+	/*
+	 * When the runtime delegates isolation to the container backend on
+	 * Windows, preserve the host identity so Docker Desktop's brokered named
+	 * pipe remains reachable. The job object still constrains the launcher,
+	 * but it must allow the local Docker broker process to spawn.
+	 */
+	need_restricted_identity =
+		(!preserve_host_identity && strcmp(profile->name, "builtin") != 0);
+	active_process_limit = (DWORD) profile->process_limit;
+	process_memory_limit = (SIZE_T) profile->memory_kb * 1024;
+	if (preserve_host_identity)
 	{
-		CloseHandle(job);
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not configure sandbox job object for principal \"%s\": %m (error code %lu)",
-						program_path, GetLastError())));
+		if (active_process_limit < 8)
+			active_process_limit = 8;
+		process_memory_limit = 0;
+	}
+
+	job = NULL;
+	if (!preserve_host_identity)
+	{
+		job = CreateJobObjectA(NULL, NULL);
+		if (job == NULL)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not create sandbox job object for principal \"%s\": %m (error code %lu)",
+							program_path, GetLastError())));
+
+		job_limit_flags =
+			JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE |
+			JOB_OBJECT_LIMIT_ACTIVE_PROCESS |
+			JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+		job_limits.BasicLimitInformation.LimitFlags = job_limit_flags;
+		job_limits.BasicLimitInformation.ActiveProcessLimit = active_process_limit;
+		job_limits.ProcessMemoryLimit = process_memory_limit;
+		if (!SetInformationJobObject(job,
+									 JobObjectExtendedLimitInformation,
+									 &job_limits,
+									 sizeof(job_limits)))
+		{
+			CloseHandle(job);
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not configure sandbox job object for principal \"%s\": %m (error code %lu)",
+							program_path, GetLastError())));
+		}
 	}
 
 	timeout_value = psprintf("%d", profile->timeout_ms);
@@ -972,6 +2246,9 @@ qx_launch_principal_program(const char *program_path,
 	snprintf(cmdline, sizeof(cmdline),
 			 "\"%s\" --request-file \"%s\" --response-file \"%s\"",
 			 program_path, request_path, response_path);
+	creation_flags = CREATE_NO_WINDOW;
+	if (!preserve_host_identity)
+		creation_flags |= CREATE_SUSPENDED;
 
 	if (need_restricted_identity)
 	{
@@ -981,7 +2258,8 @@ qx_launch_principal_program(const char *program_path,
 							  TOKEN_ADJUST_PRIVILEGES,
 							  &base_token))
 		{
-			CloseHandle(job);
+			if (job != NULL)
+				CloseHandle(job);
 			pfree(environment.data);
 			ereport(ERROR,
 					(errcode_for_file_access(),
@@ -995,7 +2273,8 @@ qx_launch_principal_program(const char *program_path,
 								   &launch_token))
 		{
 			CloseHandle(base_token);
-			CloseHandle(job);
+			if (job != NULL)
+				CloseHandle(job);
 			pfree(environment.data);
 			ereport(ERROR,
 					(errcode_for_file_access(),
@@ -1012,7 +2291,7 @@ qx_launch_principal_program(const char *program_path,
 							   NULL,
 							   NULL,
 							   FALSE,
-							   CREATE_SUSPENDED | CREATE_NO_WINDOW,
+							   creation_flags,
 							   environment.data,
 							   runtime_dir,
 							   &si,
@@ -1022,7 +2301,7 @@ qx_launch_principal_program(const char *program_path,
 						 NULL,
 						 NULL,
 						 FALSE,
-						 CREATE_SUSPENDED | CREATE_NO_WINDOW,
+						 creation_flags,
 						 environment.data,
 						 runtime_dir,
 						 &si,
@@ -1032,7 +2311,8 @@ qx_launch_principal_program(const char *program_path,
 			CloseHandle(launch_token);
 		if (base_token != NULL)
 			CloseHandle(base_token);
-		CloseHandle(job);
+		if (job != NULL)
+			CloseHandle(job);
 		pfree(environment.data);
 		ereport(ERROR,
 				(errcode_for_file_access(),
@@ -1040,7 +2320,7 @@ qx_launch_principal_program(const char *program_path,
 						program_path, GetLastError())));
 	}
 
-	if (!AssignProcessToJobObject(job, pi.hProcess))
+	if (job != NULL && !AssignProcessToJobObject(job, pi.hProcess))
 	{
 		TerminateProcess(pi.hProcess, 1);
 		CloseHandle(pi.hThread);
@@ -1057,16 +2337,21 @@ qx_launch_principal_program(const char *program_path,
 						program_path, GetLastError())));
 	}
 
-	if (ResumeThread(pi.hThread) == (DWORD) -1)
+	if (!preserve_host_identity &&
+		ResumeThread(pi.hThread) == (DWORD) -1)
 	{
-		TerminateJobObject(job, 1);
+		if (job != NULL)
+			TerminateJobObject(job, 1);
+		else
+			TerminateProcess(pi.hProcess, 1);
 		CloseHandle(pi.hThread);
 		CloseHandle(pi.hProcess);
 		if (launch_token != NULL)
 			CloseHandle(launch_token);
 		if (base_token != NULL)
 			CloseHandle(base_token);
-		CloseHandle(job);
+		if (job != NULL)
+			CloseHandle(job);
 		pfree(environment.data);
 		ereport(ERROR,
 				(errcode_for_file_access(),
@@ -1077,7 +2362,10 @@ qx_launch_principal_program(const char *program_path,
 	wait_status = WaitForSingleObject(pi.hProcess, profile->timeout_ms);
 	if (wait_status == WAIT_TIMEOUT)
 	{
-		TerminateJobObject(job, 1);
+		if (job != NULL)
+			TerminateJobObject(job, 1);
+		else
+			TerminateProcess(pi.hProcess, 1);
 		WaitForSingleObject(pi.hProcess, INFINITE);
 		CloseHandle(pi.hThread);
 		CloseHandle(pi.hProcess);
@@ -1085,7 +2373,8 @@ qx_launch_principal_program(const char *program_path,
 			CloseHandle(launch_token);
 		if (base_token != NULL)
 			CloseHandle(base_token);
-		CloseHandle(job);
+		if (job != NULL)
+			CloseHandle(job);
 		pfree(environment.data);
 		ereport(ERROR,
 				(errcode(ERRCODE_QUERY_CANCELED),
@@ -1097,14 +2386,18 @@ qx_launch_principal_program(const char *program_path,
 
 	if (wait_status != WAIT_OBJECT_0)
 	{
-		TerminateJobObject(job, 1);
+		if (job != NULL)
+			TerminateJobObject(job, 1);
+		else
+			TerminateProcess(pi.hProcess, 1);
 		CloseHandle(pi.hThread);
 		CloseHandle(pi.hProcess);
 		if (launch_token != NULL)
 			CloseHandle(launch_token);
 		if (base_token != NULL)
 			CloseHandle(base_token);
-		CloseHandle(job);
+		if (job != NULL)
+			CloseHandle(job);
 		pfree(environment.data);
 		ereport(ERROR,
 				(errcode_for_file_access(),
@@ -1120,7 +2413,8 @@ qx_launch_principal_program(const char *program_path,
 			CloseHandle(launch_token);
 		if (base_token != NULL)
 			CloseHandle(base_token);
-		CloseHandle(job);
+		if (job != NULL)
+			CloseHandle(job);
 		pfree(environment.data);
 		ereport(ERROR,
 				(errcode_for_file_access(),
@@ -1134,7 +2428,8 @@ qx_launch_principal_program(const char *program_path,
 		CloseHandle(launch_token);
 	if (base_token != NULL)
 		CloseHandle(base_token);
-	CloseHandle(job);
+	if (job != NULL)
+		CloseHandle(job);
 	observation->wall_time_ms =
 		(int32) TimestampDifferenceMilliseconds(started_at, GetCurrentTimestamp());
 	observation->restricted_identity = need_restricted_identity;
@@ -1464,6 +2759,8 @@ qx_free_external_result(QxExternalToolResult *result)
 		pfree(result->provider_name);
 	if (result->provider_kind != NULL)
 		pfree(result->provider_kind);
+	if (result->provider_endpoint != NULL)
+		pfree(result->provider_endpoint);
 	if (result->sandbox_name != NULL)
 		pfree(result->sandbox_name);
 	if (result->profile_name != NULL)
@@ -1472,6 +2769,8 @@ qx_free_external_result(QxExternalToolResult *result)
 		pfree(result->environment_mode);
 	if (result->workdir_name != NULL)
 		pfree(result->workdir_name);
+	if (result->launch_mode != NULL)
+		pfree(result->launch_mode);
 	if (result->receipt_schema != NULL)
 		pfree(result->receipt_schema);
 	if (result->receipt_alg != NULL)
@@ -1483,6 +2782,35 @@ qx_free_external_result(QxExternalToolResult *result)
 	if (result->attestation_mode != NULL)
 		pfree(result->attestation_mode);
 	memset(result, 0, sizeof(*result));
+}
+
+static void
+qx_build_semantic_execution_metadata(QxSemanticExecutionMetadata *metadata,
+									 const QxExternalToolResult *result)
+{
+	memset(metadata, 0, sizeof(*metadata));
+
+	metadata->provider_name = result->provider_name;
+	metadata->provider_kind = result->provider_kind;
+	metadata->provider_endpoint = result->provider_endpoint;
+	metadata->principal_name = result->principal_name;
+	metadata->principal_runtime = result->principal_runtime;
+	metadata->sandbox_name = result->sandbox_name;
+	metadata->profile_name = result->profile_name;
+	metadata->environment_mode = result->environment_mode;
+	metadata->workdir_name = result->workdir_name;
+	metadata->launch_mode = result->launch_mode;
+	metadata->receipt_schema = result->receipt_schema;
+	metadata->receipt_alg = result->receipt_alg;
+	metadata->receipt_nonce = result->receipt_nonce;
+	metadata->attestation_mode = result->attestation_mode;
+	metadata->timeout_ms = result->timeout_ms;
+	metadata->process_limit = result->process_limit;
+	metadata->wall_time_ms = result->wall_time_ms;
+	metadata->token_charge = result->token_charge;
+	metadata->cost_charge = result->cost_charge;
+	metadata->path_present = result->path_present;
+	metadata->restricted_identity = result->restricted_identity;
 }
 
 static void
@@ -1510,15 +2838,25 @@ qx_execute_tool_contract(const char *contract, const char *phase, Oid taskoid,
 	char	   *expected_attestation;
 	const char *effective_sandbox;
 	const QxSandboxProfile *profile;
+	const QxSandboxProfile *execution_profile;
+	QxSandboxProfile microvm_profile;
 	QxSandboxObservation observation;
 	char		runtime_dir[MAXPGPATH];
 	char		program_path[MAXPGPATH];
 	char		signer_path[MAXPGPATH];
+	char		docker_cli_path[MAXPGPATH];
+	char		microvm_qemu_path[MAXPGPATH];
+	char		microvm_kernel_path[MAXPGPATH];
+	char		microvm_initrd_path[MAXPGPATH];
 	char		request_path[MAXPGPATH];
 	char		response_path[MAXPGPATH];
 	char	   *request_payload;
+	char	   *container_request_lines = NULL;
+	char	   *microvm_request_lines = NULL;
 	Oid			provideroid = InvalidOid;
 	const char *resolved_signer = "";
+	bool		use_container_backend = false;
+	bool		use_microvm_backend = false;
 
 	if (contract == NULL)
 		ereport(ERROR,
@@ -1589,6 +2927,85 @@ qx_execute_tool_contract(const char *contract, const char *phase, Oid taskoid,
 	effective_sandbox = qx_effective_sandbox_name(tool_sandbox,
 												  principal_sandbox);
 	profile = qx_lookup_sandbox_profile(effective_sandbox);
+	execution_profile = profile;
+	use_container_backend =
+		qx_container_backend_is_supported_provider_kind(provider_kind) &&
+		qx_container_backend_is_supported_runtime_class(principal_runtime);
+	use_microvm_backend =
+		qx_microvm_backend_is_supported_provider_kind(provider_kind) &&
+		qx_microvm_backend_is_supported_runtime_class(principal_runtime) &&
+		qx_resolve_microvm_runtime_paths(microvm_kernel_path,
+											 sizeof(microvm_kernel_path),
+											 microvm_initrd_path,
+											 sizeof(microvm_initrd_path));
+	if (use_microvm_backend)
+	{
+		microvm_profile = *profile;
+		if (microvm_profile.timeout_ms < QX_MICROVM_TIMEOUT_FLOOR_MS)
+			microvm_profile.timeout_ms = QX_MICROVM_TIMEOUT_FLOOR_MS;
+		if (microvm_profile.process_limit < 4)
+			microvm_profile.process_limit = 4;
+		if (microvm_profile.memory_kb < 262144)
+			microvm_profile.memory_kb = 262144;
+		execution_profile = &microvm_profile;
+	}
+	qx_validate_container_runtime_contract(phase,
+										   taskoid,
+										   tool_name,
+										   handler_name,
+										   effective_sandbox,
+										   execution_profile,
+										   principal_name,
+										   principal_runtime,
+										   provider_name,
+										   provider_kind,
+										   provider_endpoint,
+										   receipt_schema != NULL ? receipt_schema : "qx.receipt.v1",
+										   receipt_alg != NULL ? receipt_alg : "hmac-sha256",
+										   receipt_nonce,
+										   provider_attestation != NULL &&
+										   strcmp(provider_attestation, "required") == 0);
+	qx_validate_microvm_runtime_contract(phase,
+										 taskoid,
+										 tool_name,
+										 handler_name,
+										 effective_sandbox,
+										 execution_profile,
+										 principal_name,
+										 principal_runtime,
+										 provider_name,
+										 provider_kind,
+										 provider_endpoint,
+										 receipt_schema != NULL ? receipt_schema : "qx.receipt.v1",
+										 receipt_alg != NULL ? receipt_alg : "hmac-sha256",
+										 receipt_nonce,
+										 provider_attestation != NULL &&
+										 strcmp(provider_attestation, "required") == 0);
+	if (use_container_backend)
+	{
+		const char *container_image = getenv("QX_CONTAINER_IMAGE");
+
+		qx_resolve_docker_cli_path(docker_cli_path, sizeof(docker_cli_path));
+		container_request_lines = psprintf(
+			"DOCKER_CLI=%s\nDOCKER_HOST=%s\nCONTAINER_IMAGE=%s\n",
+			docker_cli_path,
+			qx_default_docker_host(),
+			(container_image != NULL && container_image[0] != '\0') ?
+			container_image : "alpine:3.20");
+	}
+	if (use_microvm_backend)
+	{
+		const char *microvm_accel = getenv("QX_MICROVM_ACCEL");
+
+		qx_resolve_microvm_qemu_path(microvm_qemu_path, sizeof(microvm_qemu_path));
+		microvm_request_lines = psprintf(
+			"QEMU_CLI=%s\nMICROVM_KERNEL=%s\nMICROVM_INITRD=%s\nMICROVM_ACCEL=%s\n",
+			microvm_qemu_path,
+			microvm_kernel_path,
+			microvm_initrd_path,
+			(microvm_accel != NULL && microvm_accel[0] != '\0') ?
+			microvm_accel : "tcg");
+	}
 	qx_resolve_principal_program_path(program_name, program_path, sizeof(program_path));
 	qx_runtime_temp_dir(runtime_dir, sizeof(runtime_dir));
 	qx_runtime_temp_path(request_path, sizeof(request_path), "req");
@@ -1614,15 +3031,40 @@ qx_execute_tool_contract(const char *contract, const char *phase, Oid taskoid,
 		receipt_nonce,
 		(receipt_alg != NULL && strcmp(receipt_alg, "ed25519") == 0) ? "" : receipt_key,
 		resolved_signer);
+	if (container_request_lines != NULL)
+	{
+		char	   *augmented_payload;
+
+		augmented_payload = psprintf("%s%s",
+									 request_payload,
+									 container_request_lines);
+		pfree(request_payload);
+		request_payload = augmented_payload;
+	}
+	if (microvm_request_lines != NULL)
+	{
+		char	   *augmented_payload;
+
+		augmented_payload = psprintf("%s%s",
+									 request_payload,
+									 microvm_request_lines);
+		pfree(request_payload);
+		request_payload = augmented_payload;
+	}
 	qx_write_text_file(request_path, request_payload);
 	pfree(request_payload);
+	if (container_request_lines != NULL)
+		pfree(container_request_lines);
+	if (microvm_request_lines != NULL)
+		pfree(microvm_request_lines);
 
 	memset(&observation, 0, sizeof(observation));
-	qx_launch_principal_program(program_path, profile, runtime_dir,
+	qx_launch_principal_program(program_path, execution_profile, runtime_dir,
 								request_path, response_path,
+								(use_container_backend || use_microvm_backend),
 								&observation);
 	qx_read_external_result(response_path, result);
-	qx_validate_external_result(result, profile,
+	qx_validate_external_result(result, execution_profile,
 								phase,
 								taskoid,
 								tool_name,
@@ -1655,6 +3097,8 @@ qx_execute_tool_contract(const char *contract, const char *phase, Oid taskoid,
 		result->provider_name = pstrdup(provider_name);
 	if (result->provider_kind == NULL)
 		result->provider_kind = pstrdup(provider_kind != NULL ? provider_kind : "loopback");
+	if (result->provider_endpoint == NULL && provider_endpoint != NULL)
+		result->provider_endpoint = pstrdup(provider_endpoint);
 	if (result->sandbox_name == NULL)
 		result->sandbox_name = pstrdup(effective_sandbox);
 	if (result->profile_name == NULL)
@@ -1663,6 +3107,8 @@ qx_execute_tool_contract(const char *contract, const char *phase, Oid taskoid,
 		result->environment_mode = pstrdup("minimal");
 	if (result->workdir_name == NULL)
 		result->workdir_name = pstrdup("pg_qx_runtime");
+	if (result->launch_mode == NULL)
+		result->launch_mode = pstrdup(observation.launch_mode != NULL ? observation.launch_mode : "profiled_process");
 	if (result->receipt_schema == NULL)
 		result->receipt_schema = pstrdup(receipt_schema != NULL ? receipt_schema : "qx.receipt.v1");
 	if (result->receipt_alg == NULL)
@@ -1679,6 +3125,8 @@ qx_execute_tool_contract(const char *contract, const char *phase, Oid taskoid,
 		result->timeout_ms = profile->timeout_ms;
 	if (result->process_limit == 0)
 		result->process_limit = profile->process_limit;
+	result->restricted_identity = observation.restricted_identity;
+	result->wall_time_ms = observation.wall_time_ms;
 	if (result->detail != NULL)
 	{
 		char	   *augmented_detail;
@@ -1730,44 +3178,20 @@ qx_execute_tool_contract(const char *contract, const char *phase, Oid taskoid,
 }
 
 static List *
-qx_fetch_task_authorized_contracts(HeapTuple tasktup)
+qx_parse_task_authorized_contracts(const char *serialized)
 {
-	char	   *serialized;
 	Node	   *node;
 
-	serialized = qx_text_attr_from_syscache(tasktup,
-											Anum_pg_qx_task_qxtaskauthorizedtools,
-											QXTASKOID);
 	if (serialized == NULL)
 		return NIL;
 
 	node = stringToNode(serialized);
-	pfree(serialized);
 	if (node == NULL)
 		return NIL;
 	if (!IsA(node, List))
 		elog(ERROR, "QhapaqXian authorized tool payload was not a List");
 
 	return castNode(List, node);
-}
-
-static char *
-qx_fetch_task_goal(HeapTuple tasktup)
-{
-	return qx_text_attr_from_syscache(tasktup,
-									  Anum_pg_qx_task_qxtaskgoal,
-									  QXTASKOID);
-}
-
-static bool
-qx_task_input_present(HeapTuple tasktup)
-{
-	bool		isnull;
-
-	(void) SysCacheGetAttr(QXTASKOID, tasktup,
-						   Anum_pg_qx_task_qxtaskinput,
-						   &isnull);
-	return !isnull;
 }
 
 static void
@@ -1849,42 +3273,46 @@ qx_charge_task_budget(Relation taskrel, Oid taskoid,
 					  int32 token_delta, int32 cost_delta,
 					  const char *charge_name)
 {
+	QxCatalogTaskInfo task;
 	HeapTuple	tasktup;
 	HeapTuple	newtup;
-	Form_pg_qx_task taskform;
 	Datum		values[Natts_pg_qx_task];
 	bool		nulls[Natts_pg_qx_task];
 	bool		replaces[Natts_pg_qx_task];
 	int32		new_tokens;
 	int32		new_cost;
 
-	tasktup = SearchSysCache1(QXTASKOID, ObjectIdGetDatum(taskoid));
-	if (!HeapTupleIsValid(tasktup))
+	if (!QxCatalogLookupTaskByOid(taskoid, &task))
 		elog(ERROR, "cache lookup failed for QhapaqXian task %u", taskoid);
 
-	taskform = (Form_pg_qx_task) GETSTRUCT(tasktup);
-	new_tokens = taskform->qxtaskconsumedtokens + token_delta;
-	new_cost = taskform->qxtaskconsumedcost + cost_delta;
+	new_tokens = task.consumed_tokens + token_delta;
+	new_cost = task.consumed_cost + cost_delta;
 
-	if (taskform->qxtaskbudgettokens > 0 && new_tokens > taskform->qxtaskbudgettokens)
+	if (task.budget_tokens > 0 && new_tokens > task.budget_tokens)
 	{
-		ReleaseSysCache(tasktup);
+		QxCatalogFreeTaskInfo(&task);
 		ereport(ERROR,
 				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
 				 errmsg("runtime token budget exceeded for task %u", taskoid),
 				 errdetail("Charge \"%s\" would move token usage to %d, above the ceiling %d.",
-						   charge_name, new_tokens, taskform->qxtaskbudgettokens)));
+						   charge_name, new_tokens, task.budget_tokens)));
 	}
 
-	if (taskform->qxtaskbudgetcost > 0 && new_cost > taskform->qxtaskbudgetcost)
+	if (task.budget_cost > 0 && new_cost > task.budget_cost)
 	{
-		ReleaseSysCache(tasktup);
+		QxCatalogFreeTaskInfo(&task);
 		ereport(ERROR,
 				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
 				 errmsg("runtime cost budget exceeded for task %u", taskoid),
 				 errdetail("Charge \"%s\" would move cost usage to %d, above the ceiling %d.",
-						   charge_name, new_cost, taskform->qxtaskbudgetcost)));
+						   charge_name, new_cost, task.budget_cost)));
 	}
+
+	QxCatalogFreeTaskInfo(&task);
+
+	tasktup = SearchSysCache1(QXTASKOID, ObjectIdGetDatum(taskoid));
+	if (!HeapTupleIsValid(tasktup))
+		elog(ERROR, "cache lookup failed for QhapaqXian task %u", taskoid);
 
 	memset(values, 0, sizeof(values));
 	memset(nulls, false, sizeof(nulls));
@@ -1973,7 +3401,8 @@ qx_insert_step(Relation rel, Oid sessionoid, Oid taskoid, int16 seqno,
 
 static Oid
 qx_insert_event(Relation rel, Oid sessionoid, Oid taskoid, Oid stepoid,
-				Oid ownerid, const char *kind, const char *payload)
+				Oid ownerid, const QxSemanticExecutionMetadata *metadata,
+				const char *kind, const char *payload)
 {
 	Datum		values[Natts_pg_qx_event];
 	bool		nulls[Natts_pg_qx_event];
@@ -1993,8 +3422,13 @@ qx_insert_event(Relation rel, Oid sessionoid, Oid taskoid, Oid stepoid,
 	values[Anum_pg_qx_event_qxeventtaskid - 1] = ObjectIdGetDatum(taskoid);
 	values[Anum_pg_qx_event_qxeventstepid - 1] = ObjectIdGetDatum(stepoid);
 	values[Anum_pg_qx_event_qxeventowner - 1] = ObjectIdGetDatum(ownerid);
-	eventlsn = QxEmitSemanticEventRecord(eventoid, sessionoid, taskoid, stepoid,
-										 ownerid, kind, payload);
+	if (metadata != NULL)
+		eventlsn = QxEmitSemanticEventRecordV2(eventoid, sessionoid, taskoid,
+											   stepoid, ownerid, metadata,
+											   kind, payload);
+	else
+		eventlsn = QxEmitSemanticEventRecord(eventoid, sessionoid, taskoid,
+											 stepoid, ownerid, kind, payload);
 	values[Anum_pg_qx_event_qxeventlsn - 1] = LSNGetDatum(eventlsn);
 	qx_set_text_datum(values, nulls, Anum_pg_qx_event_qxeventkind, kind);
 	qx_set_text_datum(values, nulls, Anum_pg_qx_event_qxeventpayload, payload);
@@ -2008,7 +3442,8 @@ qx_insert_event(Relation rel, Oid sessionoid, Oid taskoid, Oid stepoid,
 
 static Oid
 qx_insert_trace(Relation rel, Oid sessionoid, Oid taskoid, Oid stepoid,
-				Oid ownerid, const char *name, const char *detail)
+				Oid ownerid, const QxSemanticExecutionMetadata *metadata,
+				const char *name, const char *detail)
 {
 	Datum		values[Natts_pg_qx_trace];
 	bool		nulls[Natts_pg_qx_trace];
@@ -2030,9 +3465,16 @@ qx_insert_trace(Relation rel, Oid sessionoid, Oid taskoid, Oid stepoid,
 	values[Anum_pg_qx_trace_qxtraceowner - 1] = ObjectIdGetDatum(ownerid);
 	values[Anum_pg_qx_trace_qxtracestate - 1] =
 		CharGetDatum(QX_TRACE_STATE_CLOSED);
-	tracelsn = QxEmitSemanticTraceRecord(traceoid, sessionoid, taskoid, stepoid,
-										 ownerid, QX_TRACE_STATE_CLOSED,
-										 name, detail);
+	if (metadata != NULL)
+		tracelsn = QxEmitSemanticTraceRecordV2(traceoid, sessionoid, taskoid,
+											   stepoid, ownerid, metadata,
+											   QX_TRACE_STATE_CLOSED, name,
+											   detail);
+	else
+		tracelsn = QxEmitSemanticTraceRecord(traceoid, sessionoid, taskoid,
+											 stepoid, ownerid,
+											 QX_TRACE_STATE_CLOSED, name,
+											 detail);
 	values[Anum_pg_qx_trace_qxtracelsn - 1] = LSNGetDatum(tracelsn);
 	qx_set_text_datum(values, nulls, Anum_pg_qx_trace_qxtracename, name);
 	qx_set_text_datum(values, nulls, Anum_pg_qx_trace_qxtracedetail, detail);
@@ -2046,8 +3488,10 @@ qx_insert_trace(Relation rel, Oid sessionoid, Oid taskoid, Oid stepoid,
 
 static Oid
 qx_insert_checkpoint(Relation rel, Oid sessionoid, Oid taskoid, Oid attemptoid,
-					 Oid stepoid, Oid ownerid, char taskstate,
-					 int16 nextstepseqno, const char *label, const char *data)
+					 Oid stepoid, Oid ownerid,
+					 const QxSemanticExecutionMetadata *metadata,
+					 char taskstate, int16 nextstepseqno,
+					 const char *label, const char *data)
 {
 	Datum		values[Natts_pg_qx_checkpoint];
 	bool		nulls[Natts_pg_qx_checkpoint];
@@ -2079,12 +3523,22 @@ qx_insert_checkpoint(Relation rel, Oid sessionoid, Oid taskoid, Oid attemptoid,
 		CharGetDatum(taskstate);
 	values[Anum_pg_qx_checkpoint_qxcheckpointnextstepseqno - 1] =
 		Int16GetDatum(nextstepseqno);
-	checkpointlsn = QxEmitSemanticCheckpointRecord(checkpointoid, sessionoid,
-												   taskoid, attemptoid, stepoid,
-												   ownerid,
-												   QX_CHECKPOINT_STATE_DURABLE,
-												   taskstate, nextstepseqno,
-												   label, data);
+	if (metadata != NULL)
+		checkpointlsn = QxEmitSemanticCheckpointRecordV2(checkpointoid,
+														 sessionoid, taskoid,
+														 attemptoid, stepoid,
+														 ownerid, metadata,
+														 QX_CHECKPOINT_STATE_DURABLE,
+														 taskstate, nextstepseqno,
+														 label, data);
+	else
+		checkpointlsn = QxEmitSemanticCheckpointRecord(checkpointoid,
+													   sessionoid, taskoid,
+													   attemptoid, stepoid,
+													   ownerid,
+													   QX_CHECKPOINT_STATE_DURABLE,
+													   taskstate, nextstepseqno,
+													   label, data);
 	values[Anum_pg_qx_checkpoint_qxcheckpointlsn - 1] =
 		LSNGetDatum(checkpointlsn);
 	qx_set_text_datum(values, nulls, Anum_pg_qx_checkpoint_qxcheckpointlabel,
@@ -2097,6 +3551,1536 @@ qx_insert_checkpoint(Relation rel, Oid sessionoid, Oid taskoid, Oid attemptoid,
 	heap_freetuple(tup);
 
 	return checkpointoid;
+}
+
+static Oid
+qx_insert_scheduler_queue(Relation rel,
+						  const QxSchedulerQueueSnapshot *snapshot)
+{
+	Datum		values[Natts_pg_qx_scheduler_queue];
+	bool		nulls[Natts_pg_qx_scheduler_queue];
+	Oid			queueoid;
+	HeapTuple	tup;
+
+	Assert(snapshot != NULL);
+
+	memset(values, 0, sizeof(values));
+	memset(nulls, false, sizeof(nulls));
+
+	queueoid = GetNewOidWithIndex(rel, QxSchedulerQueueOidIndexId,
+								  Anum_pg_qx_scheduler_queue_oid);
+	values[Anum_pg_qx_scheduler_queue_oid - 1] = ObjectIdGetDatum(queueoid);
+	values[Anum_pg_qx_scheduler_queue_qxqueueledgerdbid - 1] =
+		ObjectIdGetDatum(MyDatabaseId);
+	values[Anum_pg_qx_scheduler_queue_qxqueueledgerowner - 1] =
+		ObjectIdGetDatum(snapshot->ownerid);
+	values[Anum_pg_qx_scheduler_queue_qxqueueledgernamespaceid - 1] =
+		ObjectIdGetDatum(snapshot->namespace_policy_oid);
+	values[Anum_pg_qx_scheduler_queue_qxqueueledgeragentid - 1] =
+		ObjectIdGetDatum(snapshot->agentoid);
+	values[Anum_pg_qx_scheduler_queue_qxqueueledgersessionid - 1] =
+		ObjectIdGetDatum(snapshot->sessionoid);
+	values[Anum_pg_qx_scheduler_queue_qxqueueledgertaskid - 1] =
+		ObjectIdGetDatum(snapshot->taskoid);
+	values[Anum_pg_qx_scheduler_queue_qxqueueledgerattemptid - 1] =
+		ObjectIdGetDatum(snapshot->attemptoid);
+	values[Anum_pg_qx_scheduler_queue_qxqueueledgerkind - 1] =
+		Int16GetDatum((int16) snapshot->queue_kind);
+	values[Anum_pg_qx_scheduler_queue_qxqueueledgerrunnablecount - 1] =
+		Int32GetDatum(snapshot->runnable_count);
+	values[Anum_pg_qx_scheduler_queue_qxqueueledgerleasedcount - 1] =
+		Int32GetDatum(snapshot->leased_count);
+	values[Anum_pg_qx_scheduler_queue_qxqueueledgerblockedcount - 1] =
+		Int32GetDatum(snapshot->blocked_count);
+	values[Anum_pg_qx_scheduler_queue_qxqueueledgerretrycount - 1] =
+		Int32GetDatum(snapshot->retry_count);
+	values[Anum_pg_qx_scheduler_queue_qxqueueledgerenqueuedat - 1] =
+		TimestampTzGetDatum(snapshot->enqueued_at);
+	values[Anum_pg_qx_scheduler_queue_qxqueueledgereligibleat - 1] =
+		TimestampTzGetDatum(snapshot->eligible_at);
+	values[Anum_pg_qx_scheduler_queue_qxqueueledgerupdatedat - 1] =
+		TimestampTzGetDatum(snapshot->updated_at);
+	qx_set_text_datum(values, nulls,
+					  Anum_pg_qx_scheduler_queue_qxqueueledgername,
+					  snapshot->queue_name);
+	qx_set_text_datum(values, nulls,
+					  Anum_pg_qx_scheduler_queue_qxqueueledgeragentname,
+					  snapshot->agent_name);
+	qx_set_text_datum(values, nulls,
+					  Anum_pg_qx_scheduler_queue_qxqueueledgeridentityname,
+					  snapshot->identity_name);
+	qx_set_text_datum(values, nulls,
+					  Anum_pg_qx_scheduler_queue_qxqueueledgernamespacepolicyname,
+					  snapshot->namespace_policy_name);
+	qx_set_text_datum(values, nulls,
+					  Anum_pg_qx_scheduler_queue_qxqueueledgerpriority,
+					  snapshot->priority);
+	qx_set_text_datum(values, nulls,
+					  Anum_pg_qx_scheduler_queue_qxqueueledgerprincipalname,
+					  snapshot->principal_name);
+	qx_set_text_datum(values, nulls,
+					  Anum_pg_qx_scheduler_queue_qxqueueledgerprovidername,
+					  snapshot->provider_name);
+	qx_set_text_datum(values, nulls,
+					  Anum_pg_qx_scheduler_queue_qxqueueledgerproviderkind,
+					  snapshot->provider_kind);
+	qx_set_text_datum(values, nulls,
+					  Anum_pg_qx_scheduler_queue_qxqueueledgerprincipalruntime,
+					  snapshot->principal_runtime);
+
+	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
+	CatalogTupleInsert(rel, tup);
+	heap_freetuple(tup);
+
+	return queueoid;
+}
+
+static Oid
+qx_insert_scheduler_lease(Relation rel, Oid queueoid,
+						  const QxSchedulerLeaseSnapshot *snapshot)
+{
+	Datum		values[Natts_pg_qx_scheduler_lease];
+	bool		nulls[Natts_pg_qx_scheduler_lease];
+	Oid			leaseoid;
+	HeapTuple	tup;
+
+	Assert(snapshot != NULL);
+
+	memset(values, 0, sizeof(values));
+	memset(nulls, false, sizeof(nulls));
+
+	leaseoid = GetNewOidWithIndex(rel, QxSchedulerLeaseOidIndexId,
+								  Anum_pg_qx_scheduler_lease_oid);
+	values[Anum_pg_qx_scheduler_lease_oid - 1] = ObjectIdGetDatum(leaseoid);
+	values[Anum_pg_qx_scheduler_lease_qxleaseledgerdbid - 1] =
+		ObjectIdGetDatum(MyDatabaseId);
+	values[Anum_pg_qx_scheduler_lease_qxleaseledgerowner - 1] =
+		ObjectIdGetDatum(snapshot->ownerid);
+	values[Anum_pg_qx_scheduler_lease_qxleaseledgerqueueid - 1] =
+		ObjectIdGetDatum(queueoid);
+	values[Anum_pg_qx_scheduler_lease_qxleaseledgerworkerid - 1] =
+		ObjectIdGetDatum(snapshot->workeroid);
+	values[Anum_pg_qx_scheduler_lease_qxleaseledgersessionid - 1] =
+		ObjectIdGetDatum(snapshot->sessionoid);
+	values[Anum_pg_qx_scheduler_lease_qxleaseledgertaskid - 1] =
+		ObjectIdGetDatum(snapshot->taskoid);
+	values[Anum_pg_qx_scheduler_lease_qxleaseledgerattemptid - 1] =
+		ObjectIdGetDatum(snapshot->attemptoid);
+	values[Anum_pg_qx_scheduler_lease_qxleaseledgerstate - 1] =
+		Int16GetDatum((int16) snapshot->state);
+	values[Anum_pg_qx_scheduler_lease_qxleaseledgeracquiredat - 1] =
+		TimestampTzGetDatum(snapshot->acquired_at);
+	values[Anum_pg_qx_scheduler_lease_qxleaseledgerrenewedat - 1] =
+		TimestampTzGetDatum(snapshot->renewed_at);
+	values[Anum_pg_qx_scheduler_lease_qxleaseledgerexpiresat - 1] =
+		TimestampTzGetDatum(snapshot->expires_at);
+	values[Anum_pg_qx_scheduler_lease_qxleaseledgerlastheartbeatat - 1] =
+		TimestampTzGetDatum(snapshot->last_heartbeat_at);
+	values[Anum_pg_qx_scheduler_lease_qxleaseledgerrenewalcount - 1] =
+		Int32GetDatum(snapshot->renewal_count);
+	values[Anum_pg_qx_scheduler_lease_qxleaseledgerneedsrecovery - 1] =
+		BoolGetDatum(snapshot->needs_recovery);
+	qx_set_text_datum(values, nulls,
+					  Anum_pg_qx_scheduler_lease_qxleaseledgerqueuename,
+					  snapshot->queue_name);
+	qx_set_text_datum(values, nulls,
+					  Anum_pg_qx_scheduler_lease_qxleaseledgerworkername,
+					  snapshot->worker_name);
+	qx_set_text_datum(values, nulls,
+					  Anum_pg_qx_scheduler_lease_qxleaseledgerleasetoken,
+					  snapshot->lease_token);
+	qx_set_text_datum(values, nulls,
+					  Anum_pg_qx_scheduler_lease_qxleaseledgerprincipalname,
+					  snapshot->principal_name);
+	qx_set_text_datum(values, nulls,
+					  Anum_pg_qx_scheduler_lease_qxleaseledgerprovidername,
+					  snapshot->provider_name);
+	qx_set_text_datum(values, nulls,
+					  Anum_pg_qx_scheduler_lease_qxleaseledgerproviderkind,
+					  snapshot->provider_kind);
+	qx_set_text_datum(values, nulls,
+					  Anum_pg_qx_scheduler_lease_qxleaseledgerprincipalruntime,
+					  snapshot->principal_runtime);
+
+	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
+	CatalogTupleInsert(rel, tup);
+	heap_freetuple(tup);
+
+	return leaseoid;
+}
+
+static Oid
+qx_insert_scheduler_heartbeat(Relation rel, Oid leaseoid,
+							  const QxSchedulerHeartbeatSnapshot *snapshot)
+{
+	Datum		values[Natts_pg_qx_scheduler_heartbeat];
+	bool		nulls[Natts_pg_qx_scheduler_heartbeat];
+	Oid			heartbeatoid;
+	HeapTuple	tup;
+
+	Assert(snapshot != NULL);
+
+	memset(values, 0, sizeof(values));
+	memset(nulls, false, sizeof(nulls));
+
+	heartbeatoid = GetNewOidWithIndex(rel, QxSchedulerHeartbeatOidIndexId,
+									  Anum_pg_qx_scheduler_heartbeat_oid);
+	values[Anum_pg_qx_scheduler_heartbeat_oid - 1] =
+		ObjectIdGetDatum(heartbeatoid);
+	values[Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerdbid - 1] =
+		ObjectIdGetDatum(MyDatabaseId);
+	values[Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerowner - 1] =
+		ObjectIdGetDatum(snapshot->ownerid);
+	values[Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerleaseid - 1] =
+		ObjectIdGetDatum(leaseoid);
+	values[Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerworkerid - 1] =
+		ObjectIdGetDatum(snapshot->workeroid);
+	values[Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgersessionid - 1] =
+		ObjectIdGetDatum(snapshot->sessionoid);
+	values[Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgertaskid - 1] =
+		ObjectIdGetDatum(snapshot->taskoid);
+	values[Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerattemptid - 1] =
+		ObjectIdGetDatum(snapshot->attemptoid);
+	values[Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerstate - 1] =
+		Int16GetDatum((int16) snapshot->state);
+	values[Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerlagms - 1] =
+		Int32GetDatum(snapshot->lag_ms);
+	values[Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerobservedat - 1] =
+		TimestampTzGetDatum(snapshot->observed_at);
+	values[Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerexpectedbefore - 1] =
+		TimestampTzGetDatum(snapshot->expected_before);
+	values[Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerstale - 1] =
+		BoolGetDatum(snapshot->stale);
+	qx_set_text_datum(values, nulls,
+					  Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerworkername,
+					  snapshot->worker_name);
+	qx_set_text_datum(values, nulls,
+					  Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerqueuename,
+					  snapshot->queue_name);
+	qx_set_text_datum(values, nulls,
+					  Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerprincipalruntime,
+					  snapshot->principal_runtime);
+	qx_set_text_datum(values, nulls,
+					  Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerproviderkind,
+					  snapshot->provider_kind);
+	qx_set_text_datum(values, nulls,
+					  Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerreceiptmode,
+					  snapshot->receipt_mode);
+
+	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
+	CatalogTupleInsert(rel, tup);
+	heap_freetuple(tup);
+
+	return heartbeatoid;
+}
+
+static char *
+qx_runtime_heap_text_attr(Relation rel, HeapTuple tup, AttrNumber attnum)
+{
+	Datum		datum;
+	bool		isnull;
+
+	datum = heap_getattr(tup, attnum, RelationGetDescr(rel), &isnull);
+	if (isnull)
+		return NULL;
+
+	return TextDatumGetCString(datum);
+}
+
+static void
+qx_runtime_copy_scheduler_queue_snapshot(Relation rel, HeapTuple tup,
+										 QxSchedulerQueueSnapshot *snapshot)
+{
+	Form_pg_qx_scheduler_queue form;
+
+	Assert(snapshot != NULL);
+
+	form = (Form_pg_qx_scheduler_queue) GETSTRUCT(tup);
+	MemSet(snapshot, 0, sizeof(QxSchedulerQueueSnapshot));
+	snapshot->queueoid = form->oid;
+	snapshot->ownerid = form->qxqueueledgerowner;
+	snapshot->namespace_policy_oid = form->qxqueueledgernamespaceid;
+	snapshot->agentoid = form->qxqueueledgeragentid;
+	snapshot->sessionoid = form->qxqueueledgersessionid;
+	snapshot->taskoid = form->qxqueueledgertaskid;
+	snapshot->attemptoid = form->qxqueueledgerattemptid;
+	snapshot->queue_kind = (QxSchedulerQueueKind) form->qxqueueledgerkind;
+	snapshot->runnable_count = form->qxqueueledgerrunnablecount;
+	snapshot->leased_count = form->qxqueueledgerleasedcount;
+	snapshot->blocked_count = form->qxqueueledgerblockedcount;
+	snapshot->retry_count = form->qxqueueledgerretrycount;
+	snapshot->enqueued_at = form->qxqueueledgerenqueuedat;
+	snapshot->eligible_at = form->qxqueueledgereligibleat;
+	snapshot->updated_at = form->qxqueueledgerupdatedat;
+	snapshot->queue_name = qx_runtime_heap_text_attr(rel, tup,
+		Anum_pg_qx_scheduler_queue_qxqueueledgername);
+	snapshot->agent_name = qx_runtime_heap_text_attr(rel, tup,
+		Anum_pg_qx_scheduler_queue_qxqueueledgeragentname);
+	snapshot->identity_name = qx_runtime_heap_text_attr(rel, tup,
+		Anum_pg_qx_scheduler_queue_qxqueueledgeridentityname);
+	snapshot->namespace_policy_name = qx_runtime_heap_text_attr(rel, tup,
+		Anum_pg_qx_scheduler_queue_qxqueueledgernamespacepolicyname);
+	snapshot->priority = qx_runtime_heap_text_attr(rel, tup,
+		Anum_pg_qx_scheduler_queue_qxqueueledgerpriority);
+	snapshot->principal_name = qx_runtime_heap_text_attr(rel, tup,
+		Anum_pg_qx_scheduler_queue_qxqueueledgerprincipalname);
+	snapshot->provider_name = qx_runtime_heap_text_attr(rel, tup,
+		Anum_pg_qx_scheduler_queue_qxqueueledgerprovidername);
+	snapshot->provider_kind = qx_runtime_heap_text_attr(rel, tup,
+		Anum_pg_qx_scheduler_queue_qxqueueledgerproviderkind);
+	snapshot->principal_runtime = qx_runtime_heap_text_attr(rel, tup,
+		Anum_pg_qx_scheduler_queue_qxqueueledgerprincipalruntime);
+}
+
+static bool
+qx_runtime_latest_queue(Relation queueledgerrel, Oid taskoid, Oid attemptoid,
+						QxSchedulerQueueSnapshot *snapshot)
+{
+	TableScanDesc scan;
+	HeapTuple	tup;
+	HeapTuple	best = NULL;
+	Oid			bestoid = InvalidOid;
+
+	Assert(snapshot != NULL);
+
+	scan = table_beginscan_catalog(queueledgerrel, 0, NULL);
+	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	{
+		Form_pg_qx_scheduler_queue form =
+			(Form_pg_qx_scheduler_queue) GETSTRUCT(tup);
+
+		if (form->qxqueueledgerdbid != MyDatabaseId ||
+			form->qxqueueledgertaskid != taskoid ||
+			form->qxqueueledgerattemptid != attemptoid)
+			continue;
+
+		if (!OidIsValid(bestoid) || form->oid > bestoid)
+		{
+			if (best != NULL)
+				heap_freetuple(best);
+			best = heap_copytuple(tup);
+			bestoid = form->oid;
+		}
+	}
+	table_endscan(scan);
+
+	if (best == NULL)
+		return false;
+
+	qx_runtime_copy_scheduler_queue_snapshot(queueledgerrel, best, snapshot);
+	heap_freetuple(best);
+	return true;
+}
+
+static void
+qx_runtime_copy_scheduler_lease_snapshot(Relation rel, HeapTuple tup,
+										 QxSchedulerLeaseSnapshot *snapshot,
+										 Oid *queueoid)
+{
+	Form_pg_qx_scheduler_lease form;
+
+	Assert(snapshot != NULL);
+
+	form = (Form_pg_qx_scheduler_lease) GETSTRUCT(tup);
+	MemSet(snapshot, 0, sizeof(QxSchedulerLeaseSnapshot));
+	snapshot->leaseoid = form->oid;
+	snapshot->queueoid = form->qxleaseledgerqueueid;
+	snapshot->ownerid = form->qxleaseledgerowner;
+	snapshot->workeroid = form->qxleaseledgerworkerid;
+	snapshot->sessionoid = form->qxleaseledgersessionid;
+	snapshot->taskoid = form->qxleaseledgertaskid;
+	snapshot->attemptoid = form->qxleaseledgerattemptid;
+	snapshot->state = (QxSchedulerLeaseState) form->qxleaseledgerstate;
+	snapshot->acquired_at = form->qxleaseledgeracquiredat;
+	snapshot->renewed_at = form->qxleaseledgerrenewedat;
+	snapshot->expires_at = form->qxleaseledgerexpiresat;
+	snapshot->last_heartbeat_at = form->qxleaseledgerlastheartbeatat;
+	snapshot->renewal_count = form->qxleaseledgerrenewalcount;
+	snapshot->needs_recovery = form->qxleaseledgerneedsrecovery;
+	snapshot->queue_name = qx_runtime_heap_text_attr(rel, tup,
+		Anum_pg_qx_scheduler_lease_qxleaseledgerqueuename);
+	snapshot->worker_name = qx_runtime_heap_text_attr(rel, tup,
+		Anum_pg_qx_scheduler_lease_qxleaseledgerworkername);
+	snapshot->lease_token = qx_runtime_heap_text_attr(rel, tup,
+		Anum_pg_qx_scheduler_lease_qxleaseledgerleasetoken);
+	snapshot->principal_name = qx_runtime_heap_text_attr(rel, tup,
+		Anum_pg_qx_scheduler_lease_qxleaseledgerprincipalname);
+	snapshot->provider_name = qx_runtime_heap_text_attr(rel, tup,
+		Anum_pg_qx_scheduler_lease_qxleaseledgerprovidername);
+	snapshot->provider_kind = qx_runtime_heap_text_attr(rel, tup,
+		Anum_pg_qx_scheduler_lease_qxleaseledgerproviderkind);
+	snapshot->principal_runtime = qx_runtime_heap_text_attr(rel, tup,
+		Anum_pg_qx_scheduler_lease_qxleaseledgerprincipalruntime);
+
+	if (queueoid != NULL)
+		*queueoid = form->qxleaseledgerqueueid;
+}
+
+static bool
+qx_runtime_latest_lease(Relation leaseledgerrel, Oid taskoid,
+						Oid attemptoid,
+						QxSchedulerLeaseSnapshot *snapshot,
+						Oid *queueoid)
+{
+	TableScanDesc scan;
+	HeapTuple	tup;
+	HeapTuple	best = NULL;
+	Oid			bestoid = InvalidOid;
+
+	Assert(snapshot != NULL);
+
+	scan = table_beginscan_catalog(leaseledgerrel, 0, NULL);
+	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	{
+		Form_pg_qx_scheduler_lease form =
+			(Form_pg_qx_scheduler_lease) GETSTRUCT(tup);
+
+		if (form->qxleaseledgerdbid != MyDatabaseId ||
+			form->qxleaseledgertaskid != taskoid ||
+			form->qxleaseledgerattemptid != attemptoid)
+			continue;
+
+		if (!OidIsValid(bestoid) || form->oid > bestoid)
+		{
+			if (best != NULL)
+				heap_freetuple(best);
+			best = heap_copytuple(tup);
+			bestoid = form->oid;
+		}
+	}
+	table_endscan(scan);
+
+	if (best == NULL)
+		return false;
+
+	qx_runtime_copy_scheduler_lease_snapshot(leaseledgerrel, best,
+											 snapshot, queueoid);
+	heap_freetuple(best);
+	return true;
+}
+
+static int32
+qx_runtime_lease_ttl_ms(const QxSchedulerLeaseSnapshot *snapshot)
+{
+	TimestampTz	ttl_usecs;
+
+	if (snapshot == NULL)
+		return 1;
+
+	ttl_usecs = snapshot->expires_at - snapshot->renewed_at;
+	if (ttl_usecs <= 0)
+		return 1;
+
+	return Max((int32) (ttl_usecs / USECS_PER_MSEC), 1);
+}
+
+static void
+qx_runtime_free_scheduler_queue_snapshot(QxSchedulerQueueSnapshot *snapshot)
+{
+	if (snapshot == NULL)
+		return;
+
+	if (snapshot->queue_name != NULL)
+		pfree(snapshot->queue_name);
+	if (snapshot->agent_name != NULL)
+		pfree(snapshot->agent_name);
+	if (snapshot->identity_name != NULL)
+		pfree(snapshot->identity_name);
+	if (snapshot->namespace_policy_name != NULL)
+		pfree(snapshot->namespace_policy_name);
+	if (snapshot->priority != NULL)
+		pfree(snapshot->priority);
+	if (snapshot->principal_name != NULL)
+		pfree(snapshot->principal_name);
+	if (snapshot->provider_name != NULL)
+		pfree(snapshot->provider_name);
+	if (snapshot->provider_kind != NULL)
+		pfree(snapshot->provider_kind);
+	if (snapshot->principal_runtime != NULL)
+		pfree(snapshot->principal_runtime);
+	MemSet(snapshot, 0, sizeof(QxSchedulerQueueSnapshot));
+}
+
+static int32
+qx_runtime_scheduler_slot_count(void)
+{
+	return QX_SCHEDULER_DB_WORKER_SLOTS;
+}
+
+static int32
+qx_runtime_scheduler_owner_slot(Oid taskoid, int32 slot_count)
+{
+	uint32		hash;
+
+	if (slot_count <= 1)
+		return 0;
+
+	/* A small reversible mix avoids parity-locking on monotonic OIDs. */
+	hash = (uint32) taskoid;
+	hash ^= hash >> 16;
+	hash *= UINT32_C(0x7feb352d);
+	hash ^= hash >> 15;
+	hash *= UINT32_C(0x846ca68b);
+	hash ^= hash >> 16;
+
+	return (int32) (hash % (uint32) slot_count);
+}
+
+static bool
+qx_runtime_scheduler_worker_owns_task(Oid taskoid,
+									  int32 slot_index,
+									  int32 slot_count)
+{
+	if (slot_count <= 1)
+		return true;
+
+	return qx_runtime_scheduler_owner_slot(taskoid, slot_count) == slot_index;
+}
+
+static int32
+qx_runtime_retry_backoff_ms(const char *priority,
+							int32 retry_count,
+							int32 lease_ttl_ms,
+							Oid taskoid)
+{
+	int32		base_ms;
+	int32		retry_factor;
+	int32		jitter_window_ms;
+	int32		jitter_ms;
+	uint32		jitter_seed;
+
+	base_ms = Max(lease_ttl_ms, QX_SCHEDULER_WORKER_NAPTIME_MS);
+
+	if (priority != NULL && priority[0] != '\0')
+	{
+		if (pg_strcasecmp(priority, "urgent") == 0 ||
+			pg_strcasecmp(priority, "critical") == 0)
+			base_ms = Max(base_ms / 2, QX_SCHEDULER_WORKER_NAPTIME_MS);
+		else if (pg_strcasecmp(priority, "high") == 0)
+			base_ms = Max((base_ms * 3) / 4, QX_SCHEDULER_WORKER_NAPTIME_MS * 2);
+		else if (pg_strcasecmp(priority, "normal") == 0)
+			base_ms = Max(base_ms, QX_SCHEDULER_WORKER_NAPTIME_MS * 3);
+		else if (pg_strcasecmp(priority, "low") == 0)
+			base_ms = Max(base_ms * 2, QX_SCHEDULER_WORKER_NAPTIME_MS * 5);
+		else if (pg_strcasecmp(priority, "idle") == 0)
+			base_ms = Max(base_ms * 3, QX_SCHEDULER_WORKER_NAPTIME_MS * 8);
+	}
+
+	retry_factor = 1 << Min(Max(retry_count, 1) - 1, 3);
+	base_ms = Min(base_ms * retry_factor, 60000);
+
+	jitter_window_ms = Min(Max(base_ms / 8, 1), 1500);
+	jitter_seed = (uint32) taskoid ^ ((uint32) Max(retry_count, 1) * UINT32_C(2654435761));
+	jitter_ms = (int32) (jitter_seed % (uint32) jitter_window_ms);
+
+	return base_ms + jitter_ms;
+}
+
+static bool
+qx_runtime_retry_candidate_better(
+	const QxCatalogTaskInfo *candidate_task,
+	const QxCatalogAttemptInfo *candidate_attempt,
+	const QxSchedulerQueueSnapshot *candidate_queue,
+	const QxCatalogTaskInfo *best_task,
+	const QxCatalogAttemptInfo *best_attempt,
+	const QxSchedulerQueueSnapshot *best_queue)
+{
+	int32		candidate_weight;
+	int32		best_weight;
+
+	Assert(candidate_task != NULL);
+	Assert(candidate_attempt != NULL);
+	Assert(candidate_queue != NULL);
+
+	if (best_task == NULL || best_attempt == NULL || best_queue == NULL)
+		return true;
+
+	candidate_weight = QxSchedulerPriorityWeight(candidate_queue->priority);
+	best_weight = QxSchedulerPriorityWeight(best_queue->priority);
+
+	if (candidate_weight != best_weight)
+		return candidate_weight > best_weight;
+
+	if (candidate_queue->eligible_at != best_queue->eligible_at)
+		return candidate_queue->eligible_at < best_queue->eligible_at;
+
+	if (candidate_queue->enqueued_at != best_queue->enqueued_at)
+		return candidate_queue->enqueued_at < best_queue->enqueued_at;
+
+	if (candidate_attempt->seqno != best_attempt->seqno)
+		return candidate_attempt->seqno < best_attempt->seqno;
+
+	return candidate_task->oid < best_task->oid;
+}
+
+static void
+qx_runtime_set_heartbeat_receipt(QxSchedulerHeartbeatSnapshot *heartbeat,
+								 const char *receipt_mode)
+{
+	if (heartbeat == NULL)
+		return;
+
+	if (heartbeat->receipt_mode != NULL)
+		pfree(heartbeat->receipt_mode);
+	heartbeat->receipt_mode = pstrdup(qx_safe_runtime_text(receipt_mode));
+}
+
+static void
+qx_runtime_free_scheduler_lease_snapshot(QxSchedulerLeaseSnapshot *snapshot)
+{
+	if (snapshot == NULL)
+		return;
+
+	if (snapshot->queue_name != NULL)
+		pfree(snapshot->queue_name);
+	if (snapshot->worker_name != NULL)
+		pfree(snapshot->worker_name);
+	if (snapshot->lease_token != NULL)
+		pfree(snapshot->lease_token);
+	if (snapshot->principal_name != NULL)
+		pfree(snapshot->principal_name);
+	if (snapshot->provider_name != NULL)
+		pfree(snapshot->provider_name);
+	if (snapshot->provider_kind != NULL)
+		pfree(snapshot->provider_kind);
+	if (snapshot->principal_runtime != NULL)
+		pfree(snapshot->principal_runtime);
+	MemSet(snapshot, 0, sizeof(QxSchedulerLeaseSnapshot));
+}
+
+static int16
+qx_runtime_next_step_seqno(Relation steprel, Oid taskoid)
+{
+	TableScanDesc scan;
+	HeapTuple	tup;
+	int16		maxseqno = 0;
+
+	scan = table_beginscan_catalog(steprel, 0, NULL);
+	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	{
+		Form_pg_qx_step form = (Form_pg_qx_step) GETSTRUCT(tup);
+
+		if (form->qxstepdbid != MyDatabaseId ||
+			form->qxsteptaskid != taskoid)
+			continue;
+
+		if (form->qxstepseqno > maxseqno)
+			maxseqno = form->qxstepseqno;
+	}
+	table_endscan(scan);
+
+	return maxseqno + 1;
+}
+
+static List *
+qx_runtime_scheduler_db_targets(void)
+{
+	Relation	rel;
+	TableScanDesc scan;
+	HeapTuple	tup;
+	List	   *targets = NIL;
+
+	rel = table_open(DatabaseRelationId, AccessShareLock);
+	scan = table_beginscan_catalog(rel, 0, NULL);
+
+	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	{
+		Form_pg_database form = (Form_pg_database) GETSTRUCT(tup);
+		QxRuntimeSchedulerDbTarget *target;
+
+		if (!form->datallowconn || form->datistemplate)
+			continue;
+
+		target = palloc0(sizeof(QxRuntimeSchedulerDbTarget));
+		target->dboid = form->oid;
+		target->dbname = pstrdup(NameStr(form->datname));
+		targets = lappend(targets, target);
+	}
+
+	table_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	return targets;
+}
+
+static void
+qx_runtime_free_scheduler_db_targets(List *targets)
+{
+	ListCell   *lc;
+
+	foreach(lc, targets)
+	{
+		QxRuntimeSchedulerDbTarget *target = lfirst(lc);
+
+		if (target->dbname != NULL)
+			pfree(target->dbname);
+		pfree(target);
+	}
+
+	list_free(targets);
+}
+
+static QxRuntimeSchedulerDbWorker *
+qx_runtime_find_scheduler_db_worker(const List *workers,
+									Oid dboid,
+									int32 slot_index)
+{
+	ListCell   *lc;
+
+	foreach(lc, workers)
+	{
+		QxRuntimeSchedulerDbWorker *worker = lfirst(lc);
+
+		if (worker->dboid == dboid &&
+			worker->slot_index == slot_index)
+			return worker;
+	}
+
+	return NULL;
+}
+
+static bool
+qx_runtime_launch_scheduler_db_worker(Oid dboid,
+									  const char *dbname,
+									  int32 slot_index,
+									  int32 slot_count,
+									  BackgroundWorkerHandle **handle)
+{
+	BackgroundWorker worker;
+	QxRuntimeSchedulerWorkerKey key;
+	MemoryContext oldcontext;
+
+	memset(&worker, 0, sizeof(worker));
+	memset(&key, 0, sizeof(key));
+	worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
+		BGWORKER_BACKEND_DATABASE_CONNECTION;
+	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+	worker.bgw_restart_time = 1;
+	snprintf(worker.bgw_library_name, MAXPGPATH, "postgres");
+	snprintf(worker.bgw_function_name, BGW_MAXLEN,
+			 "QxRuntimeSchedulerDatabaseWorkerMain");
+	snprintf(worker.bgw_name, BGW_MAXLEN,
+			 "qhapaqxian scheduler db %s slot %d/%d",
+			 dbname != NULL ? dbname : "<unknown>",
+			 slot_index + 1,
+			 Max(slot_count, 1));
+	snprintf(worker.bgw_type, BGW_MAXLEN, "qhapaqxian scheduler db");
+	worker.bgw_main_arg = ObjectIdGetDatum(dboid);
+	key.dboid = dboid;
+	key.slot_index = slot_index;
+	key.slot_count = slot_count;
+	memcpy(worker.bgw_extra, &key, sizeof(key));
+	worker.bgw_notify_pid = MyProcPid;
+
+	oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+	if (!RegisterDynamicBackgroundWorker(&worker, handle))
+	{
+		MemoryContextSwitchTo(oldcontext);
+		return false;
+	}
+	MemoryContextSwitchTo(oldcontext);
+	return true;
+}
+
+static void
+qx_runtime_scheduler_heartbeat_wait(uint32 *wait_event,
+									const char *wait_name,
+									long timeout_ms)
+{
+	if (*wait_event == 0)
+		*wait_event = WaitEventExtensionNew(wait_name);
+
+	(void) WaitLatch(MyLatch,
+					 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+					 timeout_ms,
+					 *wait_event);
+	ResetLatch(MyLatch);
+	CHECK_FOR_INTERRUPTS();
+
+	if (ConfigReloadPending)
+	{
+		ConfigReloadPending = false;
+		ProcessConfigFile(PGC_SIGHUP);
+	}
+}
+
+static bool
+qx_runtime_reclaim_running_attempt(Relation taskrel,
+								   Relation attemptrel,
+								   Relation queueledgerrel,
+								   Relation leaseledgerrel,
+								   Relation heartbeatledgerrel,
+								   const QxCatalogTaskInfo *task,
+								   const QxCatalogAttemptInfo *attempt,
+								   const QxSchedulerLeaseSnapshot *lease_snapshot,
+								   Oid queueoid,
+								   const char *worker_name,
+								   QxRuntimeSchedulerCycleStats *stats)
+{
+	QxSchedulerTaskEnvelope scheduler_envelope;
+	QxSchedulerQueueSnapshot *queue_snapshot = NULL;
+	QxSchedulerLeaseSnapshot *reclaimed_lease_snapshot;
+	QxSchedulerHeartbeatSnapshot *heartbeat_snapshot;
+	char	   *selected_contract = NULL;
+	char	   *checkpoint_label = NULL;
+	char	   *resume_label = NULL;
+	bool		repairable;
+	int32		retry_backoff_ms;
+	int32		heartbeat_lag_ms;
+	Oid			reclaimed_queueoid = queueoid;
+	Oid			leaseoid;
+
+	Assert(task != NULL);
+	Assert(attempt != NULL);
+	Assert(lease_snapshot != NULL);
+
+	repairable = OidIsValid(task->lastcheckpointid);
+
+	if (repairable)
+	{
+		checkpoint_label =
+			qx_runtime_recovery_checkpoint_label(task->lastcheckpointid);
+		if (checkpoint_label != NULL)
+			resume_label = pstrdup(checkpoint_label);
+		selected_contract =
+			qx_runtime_recovery_selected_contract(task, true);
+		qx_runtime_fill_recovery_scheduler_envelope(&scheduler_envelope,
+													(task),
+													attempt->oid,
+													Max((int32) attempt->seqno, 0),
+													checkpoint_label,
+													resume_label,
+													true,
+													true,
+													(attempt->seqno > 1),
+													selected_contract);
+		queue_snapshot = QxSchedulerQueueSnapshotFromEnvelope(&scheduler_envelope);
+		queue_snapshot->queue_kind = QX_SCHEDULER_QUEUE_RECOVERY;
+		queue_snapshot->retry_count = Max((int32) attempt->seqno, 0);
+		reclaimed_queueoid = qx_insert_scheduler_queue(queueledgerrel,
+													   queue_snapshot);
+		CommandCounterIncrement();
+		if (stats != NULL)
+			stats->recovery_requeued++;
+
+		qx_update_attempt_state(attemptrel, attempt->oid,
+								QX_ATTEMPT_STATE_CHECKPOINTED);
+		qx_update_task_runtime(taskrel, task->oid,
+							   QX_TASK_STATE_CHECKPOINTED,
+							   attempt->oid,
+							   true,
+							   task->lastcheckpointid,
+							   true);
+		CommandCounterIncrement();
+		if (stats != NULL)
+			stats->leases_repaired++;
+	}
+	else
+	{
+		selected_contract =
+			qx_runtime_recovery_selected_contract(task, false);
+		qx_runtime_fill_recovery_scheduler_envelope(&scheduler_envelope,
+													(task),
+													attempt->oid,
+													Max((int32) attempt->seqno, 1),
+													NULL,
+													NULL,
+													false,
+													true,
+													true,
+													selected_contract);
+		queue_snapshot = QxSchedulerQueueSnapshotFromEnvelope(&scheduler_envelope);
+		queue_snapshot->queue_kind = QX_SCHEDULER_QUEUE_RETRY;
+		queue_snapshot->retry_count = Max((int32) attempt->seqno, 1);
+		retry_backoff_ms = qx_runtime_retry_backoff_ms(queue_snapshot->priority,
+													   queue_snapshot->retry_count,
+													   qx_runtime_lease_ttl_ms(lease_snapshot),
+													   task->oid);
+		queue_snapshot->eligible_at = queue_snapshot->enqueued_at +
+			((TimestampTz) retry_backoff_ms * USECS_PER_MSEC);
+		reclaimed_queueoid = qx_insert_scheduler_queue(queueledgerrel,
+													   queue_snapshot);
+		CommandCounterIncrement();
+		if (stats != NULL)
+			stats->recovery_requeued++;
+
+		qx_update_attempt_state(attemptrel, attempt->oid,
+								QX_ATTEMPT_STATE_FAILED);
+		qx_update_task_runtime(taskrel, task->oid,
+							   QX_TASK_STATE_QUEUED,
+							   attempt->oid,
+							   true,
+							   InvalidOid,
+							   true);
+		CommandCounterIncrement();
+		if (stats != NULL)
+			stats->leases_repaired++;
+	}
+
+	reclaimed_lease_snapshot =
+		QxSchedulerReleaseLeaseSnapshot(lease_snapshot, true);
+	if (worker_name != NULL && worker_name[0] != '\0')
+	{
+		if (reclaimed_lease_snapshot->worker_name != NULL)
+			pfree(reclaimed_lease_snapshot->worker_name);
+		reclaimed_lease_snapshot->worker_name = pstrdup(worker_name);
+	}
+	leaseoid = qx_insert_scheduler_lease(leaseledgerrel,
+										 reclaimed_queueoid,
+										 reclaimed_lease_snapshot);
+	heartbeat_snapshot =
+		QxSchedulerFinalizeHeartbeatSnapshot(reclaimed_lease_snapshot,
+											 "scheduler-reclaim");
+	heartbeat_lag_ms = Max(qx_runtime_lease_ttl_ms(lease_snapshot) / 3, 1);
+	heartbeat_snapshot->state = QX_SCHEDULER_HEARTBEAT_MISSED;
+	heartbeat_snapshot->lag_ms = heartbeat_lag_ms;
+	heartbeat_snapshot->stale = true;
+	(void) qx_insert_scheduler_heartbeat(heartbeatledgerrel,
+										 leaseoid,
+										 heartbeat_snapshot);
+	CommandCounterIncrement();
+
+	if (stats != NULL)
+	{
+		stats->leases_reclaimed++;
+		stats->heartbeats_written++;
+	}
+
+	if (selected_contract != NULL)
+		pfree(selected_contract);
+	if (checkpoint_label != NULL)
+		pfree(checkpoint_label);
+	if (resume_label != NULL)
+		pfree(resume_label);
+
+	return repairable;
+}
+
+static void
+qx_runtime_run_scheduler_cycle(QxRuntimeSchedulerCycleStats *stats,
+							   int32 slot_index,
+							   int32 slot_count)
+{
+	List	   *tasks;
+	ListCell   *lc;
+	Relation	taskrel;
+	Relation	attemptrel;
+	Relation	queueledgerrel;
+	Relation	leaseledgerrel;
+	Relation	heartbeatledgerrel;
+	TimestampTz	now;
+
+	Assert(stats != NULL);
+	MemSet(stats, 0, sizeof(*stats));
+
+	tasks = QxCatalogBuildTaskInfoList(MyDatabaseId, InvalidOid);
+	taskrel = table_open(QxTaskRelationId, RowExclusiveLock);
+	attemptrel = table_open(QxAttemptRelationId, RowExclusiveLock);
+	queueledgerrel = table_open(QxSchedulerQueueRelationId, RowExclusiveLock);
+	leaseledgerrel = table_open(QxSchedulerLeaseRelationId, RowExclusiveLock);
+	heartbeatledgerrel = table_open(QxSchedulerHeartbeatRelationId,
+									RowExclusiveLock);
+	now = GetCurrentTimestamp();
+
+	foreach(lc, tasks)
+	{
+		QxCatalogTaskInfo *task = lfirst(lc);
+		QxCatalogAttemptInfo attempt;
+		QxSchedulerLeaseSnapshot lease_snapshot;
+		QxSchedulerLeaseSnapshot *renewed_lease_snapshot;
+		QxSchedulerHeartbeatSnapshot *heartbeat_snapshot;
+		Oid			queueoid = InvalidOid;
+		Oid			leaseoid;
+		int32		lease_ttl_ms;
+
+		stats->tasks_scanned++;
+		if (task->state != QX_TASK_STATE_RUNNING ||
+			!OidIsValid(task->lastattemptid))
+			continue;
+		if (!qx_runtime_scheduler_worker_owns_task(task->oid,
+												   slot_index,
+												   slot_count))
+		{
+			stats->ownership_skipped++;
+			continue;
+		}
+
+		stats->running_tasks++;
+		if (!QxCatalogLookupAttemptByOid(task->lastattemptid, &attempt))
+			elog(ERROR, "cache lookup failed for QhapaqXian attempt %u",
+				 task->lastattemptid);
+
+		if (attempt.state != QX_ATTEMPT_STATE_RUNNING)
+		{
+			QxCatalogFreeAttemptInfo(&attempt);
+			continue;
+		}
+
+		MemSet(&lease_snapshot, 0, sizeof(lease_snapshot));
+		if (!qx_runtime_latest_lease(leaseledgerrel,
+									 task->oid,
+									 attempt.oid,
+									 &lease_snapshot,
+									 &queueoid))
+		{
+			QxCatalogFreeAttemptInfo(&attempt);
+			continue;
+		}
+
+		stats->leases_seen++;
+		if (lease_snapshot.state != QX_SCHEDULER_LEASE_HELD ||
+			!QxSchedulerLeaseNeedsReclaim(&lease_snapshot, now))
+		{
+			qx_runtime_free_scheduler_lease_snapshot(&lease_snapshot);
+			QxCatalogFreeAttemptInfo(&attempt);
+			continue;
+		}
+
+		if (lease_snapshot.renewal_count <= 0)
+		{
+			lease_ttl_ms = qx_runtime_lease_ttl_ms(&lease_snapshot);
+			renewed_lease_snapshot =
+				QxSchedulerRenewLeaseSnapshot(&lease_snapshot, lease_ttl_ms);
+			leaseoid = qx_insert_scheduler_lease(leaseledgerrel,
+												 queueoid,
+												 renewed_lease_snapshot);
+			heartbeat_snapshot =
+				QxSchedulerHeartbeatSnapshotFromLease(renewed_lease_snapshot);
+			qx_runtime_set_heartbeat_receipt(heartbeat_snapshot,
+											 "scheduler-renew");
+			(void) qx_insert_scheduler_heartbeat(heartbeatledgerrel,
+												 leaseoid,
+												 heartbeat_snapshot);
+			CommandCounterIncrement();
+
+			stats->leases_renewed++;
+			stats->heartbeats_written++;
+		}
+		else
+			(void) qx_runtime_reclaim_running_attempt(taskrel,
+													 attemptrel,
+													 queueledgerrel,
+													 leaseledgerrel,
+													 heartbeatledgerrel,
+													 task,
+													 &attempt,
+													 &lease_snapshot,
+													 queueoid,
+													 MyBgworkerEntry != NULL ?
+													 MyBgworkerEntry->bgw_name :
+													 "qhapaqxian scheduler",
+													 stats);
+
+		qx_runtime_free_scheduler_lease_snapshot(&lease_snapshot);
+		QxCatalogFreeAttemptInfo(&attempt);
+	}
+
+	table_close(heartbeatledgerrel, RowExclusiveLock);
+	table_close(leaseledgerrel, RowExclusiveLock);
+	table_close(queueledgerrel, RowExclusiveLock);
+	table_close(attemptrel, RowExclusiveLock);
+	table_close(taskrel, RowExclusiveLock);
+	QxCatalogFreeTaskInfoList(tasks);
+}
+
+static void
+qx_runtime_run_scheduler_retry_cycle(QxRuntimeSchedulerCycleStats *stats,
+									 int32 slot_index,
+									 int32 slot_count)
+{
+	List	   *tasks;
+	ListCell   *lc;
+	Relation	taskrel;
+	Relation	attemptrel;
+	Relation	steprel;
+	Relation	eventrel;
+	Relation	tracerel;
+	Relation	checkpointrel;
+	Relation	queueledgerrel;
+	Relation	leaseledgerrel;
+	Relation	heartbeatledgerrel;
+	TimestampTz	now;
+	QxCatalogTaskInfo *selected_task = NULL;
+	QxCatalogAttemptInfo selected_failed_attempt;
+	QxSchedulerQueueSnapshot selected_retry_queue;
+	bool		have_selected = false;
+
+	tasks = QxCatalogBuildTaskInfoList(MyDatabaseId, InvalidOid);
+	taskrel = table_open(QxTaskRelationId, RowExclusiveLock);
+	attemptrel = table_open(QxAttemptRelationId, RowExclusiveLock);
+	steprel = table_open(QxStepRelationId, RowExclusiveLock);
+	eventrel = table_open(QxEventRelationId, RowExclusiveLock);
+	tracerel = table_open(QxTraceRelationId, RowExclusiveLock);
+	checkpointrel = table_open(QxCheckpointRelationId, RowExclusiveLock);
+	queueledgerrel = table_open(QxSchedulerQueueRelationId, RowExclusiveLock);
+	leaseledgerrel = table_open(QxSchedulerLeaseRelationId, RowExclusiveLock);
+	heartbeatledgerrel = table_open(QxSchedulerHeartbeatRelationId,
+									RowExclusiveLock);
+	now = GetCurrentTimestamp();
+	MemSet(&selected_failed_attempt, 0, sizeof(selected_failed_attempt));
+	MemSet(&selected_retry_queue, 0, sizeof(selected_retry_queue));
+
+	foreach(lc, tasks)
+	{
+		QxCatalogTaskInfo *task = lfirst(lc);
+		QxCatalogAttemptInfo failed_attempt;
+		QxSchedulerQueueSnapshot retry_queue;
+
+		if (task->state != QX_TASK_STATE_QUEUED ||
+			!OidIsValid(task->lastattemptid) ||
+			OidIsValid(task->lastcheckpointid))
+			continue;
+		if (!qx_runtime_scheduler_worker_owns_task(task->oid,
+												   slot_index,
+												   slot_count))
+		{
+			if (stats != NULL)
+				stats->ownership_skipped++;
+			continue;
+		}
+
+		if (!QxCatalogLookupAttemptByOid(task->lastattemptid, &failed_attempt))
+			elog(ERROR, "cache lookup failed for QhapaqXian attempt %u",
+				 task->lastattemptid);
+
+		if (failed_attempt.state != QX_ATTEMPT_STATE_FAILED)
+		{
+			QxCatalogFreeAttemptInfo(&failed_attempt);
+			continue;
+		}
+
+		MemSet(&retry_queue, 0, sizeof(retry_queue));
+		if (!qx_runtime_latest_queue(queueledgerrel,
+									 task->oid,
+									 failed_attempt.oid,
+									 &retry_queue))
+		{
+			QxCatalogFreeAttemptInfo(&failed_attempt);
+			continue;
+		}
+
+		if (retry_queue.queue_kind != QX_SCHEDULER_QUEUE_RETRY ||
+			retry_queue.runnable_count <= 0 ||
+			retry_queue.blocked_count > 0)
+		{
+			qx_runtime_free_scheduler_queue_snapshot(&retry_queue);
+			QxCatalogFreeAttemptInfo(&failed_attempt);
+			continue;
+		}
+
+		if (now < retry_queue.eligible_at)
+		{
+			if (stats != NULL)
+			{
+				stats->queued_retry_tasks++;
+				stats->retry_waiting_tasks++;
+				stats->last_retry_backoff_ms =
+					(int32) ((retry_queue.eligible_at -
+							  retry_queue.enqueued_at) / USECS_PER_MSEC);
+				stats->max_retry_backoff_ms =
+					Max(stats->max_retry_backoff_ms,
+						stats->last_retry_backoff_ms);
+			}
+			qx_runtime_free_scheduler_queue_snapshot(&retry_queue);
+			QxCatalogFreeAttemptInfo(&failed_attempt);
+			continue;
+		}
+
+		if (stats != NULL)
+		{
+			stats->queued_retry_tasks++;
+			stats->retry_ready_tasks++;
+			stats->last_retry_backoff_ms =
+				(int32) ((retry_queue.eligible_at -
+						  retry_queue.enqueued_at) / USECS_PER_MSEC);
+			stats->max_retry_backoff_ms =
+				Max(stats->max_retry_backoff_ms,
+					stats->last_retry_backoff_ms);
+		}
+
+		if (!have_selected ||
+			qx_runtime_retry_candidate_better(task,
+											 &failed_attempt,
+											 &retry_queue,
+											 selected_task,
+											 &selected_failed_attempt,
+											 &selected_retry_queue))
+		{
+			if (have_selected)
+			{
+				qx_runtime_free_scheduler_queue_snapshot(&selected_retry_queue);
+				QxCatalogFreeAttemptInfo(&selected_failed_attempt);
+			}
+
+			selected_task = task;
+			selected_failed_attempt = failed_attempt;
+			selected_retry_queue = retry_queue;
+			MemSet(&failed_attempt, 0, sizeof(failed_attempt));
+			MemSet(&retry_queue, 0, sizeof(retry_queue));
+			have_selected = true;
+		}
+
+		qx_runtime_free_scheduler_queue_snapshot(&retry_queue);
+		QxCatalogFreeAttemptInfo(&failed_attempt);
+	}
+
+	if (have_selected)
+	{
+		(void) qx_runtime_dispatch_retry_task(taskrel,
+											  attemptrel,
+											  steprel,
+											  eventrel,
+											  tracerel,
+											  checkpointrel,
+											  queueledgerrel,
+											  leaseledgerrel,
+											  heartbeatledgerrel,
+											  selected_task,
+											  &selected_failed_attempt,
+											  &selected_retry_queue,
+											  MyBgworkerEntry != NULL ?
+											  MyBgworkerEntry->bgw_name :
+											  "qhapaqxian scheduler",
+											  stats);
+		qx_runtime_free_scheduler_queue_snapshot(&selected_retry_queue);
+		QxCatalogFreeAttemptInfo(&selected_failed_attempt);
+		if (stats != NULL && stats->retry_ready_tasks > 0)
+			stats->retry_waiting_tasks += stats->retry_ready_tasks - 1;
+	}
+
+	table_close(heartbeatledgerrel, RowExclusiveLock);
+	table_close(leaseledgerrel, RowExclusiveLock);
+	table_close(queueledgerrel, RowExclusiveLock);
+	table_close(checkpointrel, RowExclusiveLock);
+	table_close(tracerel, RowExclusiveLock);
+	table_close(eventrel, RowExclusiveLock);
+	table_close(steprel, RowExclusiveLock);
+	table_close(attemptrel, RowExclusiveLock);
+	table_close(taskrel, RowExclusiveLock);
+	QxCatalogFreeTaskInfoList(tasks);
+}
+
+static bool
+qx_runtime_dispatch_retry_task(Relation taskrel,
+							   Relation attemptrel,
+							   Relation steprel,
+							   Relation eventrel,
+							   Relation tracerel,
+							   Relation checkpointrel,
+							   Relation queueledgerrel,
+							   Relation leaseledgerrel,
+							   Relation heartbeatledgerrel,
+							   const QxCatalogTaskInfo *task,
+							   const QxCatalogAttemptInfo *failed_attempt,
+							   const QxSchedulerQueueSnapshot *retry_queue,
+							   const char *worker_name,
+							   QxRuntimeSchedulerCycleStats *stats)
+{
+	List	   *authorized_contracts = NIL;
+	const char *selected_contract;
+	QxSchedulerTaskEnvelope scheduler_envelope;
+	QxSchedulerQueueSnapshot *dispatch_queue_snapshot;
+	QxSchedulerLeaseSnapshot *lease_snapshot;
+	QxSchedulerHeartbeatSnapshot *heartbeat_snapshot;
+	QxSchedulerLeaseSnapshot *released_lease_snapshot;
+	QxSchedulerHeartbeatSnapshot *final_heartbeat_snapshot;
+	QxExternalToolResult tool_result;
+	QxSemanticExecutionMetadata semantic_meta;
+	char	   *payload;
+	char	   *checkpoint_data;
+	Oid			attemptoid;
+	Oid			stepoid;
+	Oid			checkpointoid;
+	Oid			queueoid;
+	Oid			leaseoid;
+	int16		nextattemptseqno;
+	int16		stepseqbase;
+
+	Assert(task != NULL);
+	Assert(failed_attempt != NULL);
+	Assert(retry_queue != NULL);
+
+	if (task->state != QX_TASK_STATE_QUEUED ||
+		failed_attempt->state != QX_ATTEMPT_STATE_FAILED)
+		return false;
+
+	authorized_contracts = qx_parse_task_authorized_contracts(task->authorized_tools);
+	selected_contract = authorized_contracts != NIL ?
+		strVal((Node *) linitial(authorized_contracts)) : NULL;
+	if (selected_contract == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("task %u has no authorized retry contract", task->oid)));
+
+	nextattemptseqno = failed_attempt->seqno + 1;
+	stepseqbase = qx_runtime_next_step_seqno(steprel, task->oid);
+	memset(&tool_result, 0, sizeof(tool_result));
+
+	attemptoid = qx_insert_attempt(attemptrel,
+								   task->sessionoid,
+								   task->oid,
+								   task->ownerid,
+								   InvalidOid,
+								   nextattemptseqno,
+								   QX_ATTEMPT_STATE_RUNNING,
+								   "retry");
+	CommandCounterIncrement();
+
+	qx_update_task_runtime(taskrel, task->oid, QX_TASK_STATE_RUNNING,
+						   attemptoid, true, InvalidOid, false);
+
+	qx_scheduler_fill_envelope(&scheduler_envelope,
+							   task->ownerid,
+							   task->sessionoid,
+							   task->agentoid,
+							   task->identityoid,
+							   task->namespacepolicyoid,
+							   task->oid,
+							   attemptoid,
+							   task->name,
+							   task->agent_name,
+							   task->identity_name,
+							   task->policy_name,
+							   task->priority,
+							   "stage8.after_capture",
+							   NULL,
+							   false,
+							   true,
+							   true,
+							   task->budget_tokens,
+							   task->budget_cost,
+							   task->estimated_tokens,
+							   task->estimated_cost,
+							   nextattemptseqno - 1,
+							   selected_contract);
+	dispatch_queue_snapshot =
+		QxSchedulerQueueSnapshotFromEnvelope(&scheduler_envelope);
+	dispatch_queue_snapshot->queue_kind = QX_SCHEDULER_QUEUE_RETRY;
+	dispatch_queue_snapshot->retry_count = nextattemptseqno - 1;
+	queueoid = qx_insert_scheduler_queue(queueledgerrel, dispatch_queue_snapshot);
+	CommandCounterIncrement();
+
+	payload = psprintf("retry_from_attempt=%d;retry_delay_ms=" INT64_FORMAT,
+					   failed_attempt->seqno,
+					   (int64) ((retry_queue->eligible_at - retry_queue->enqueued_at) /
+								USECS_PER_MSEC));
+	payload = qx_runtime_append_recovery_payload(payload);
+	payload = qx_scheduler_append_runtime_payload(payload,
+												  &scheduler_envelope,
+												  false);
+	(void) qx_insert_event(eventrel, task->sessionoid, task->oid, InvalidOid,
+						   task->ownerid, NULL, "TASK_RETRIED", payload);
+	(void) qx_insert_trace(tracerel, task->sessionoid, task->oid, InvalidOid,
+						   task->ownerid, NULL, "runtime.retry", payload);
+	pfree(payload);
+
+	stepoid = qx_insert_step(steprel, task->sessionoid, task->oid, stepseqbase,
+							 "stage8.retry_dispatch",
+							 "Attempt retried execution after stale no-checkpoint reclaim");
+	qx_charge_task_budget(taskrel, task->oid, 8, 14, "retry_dispatch");
+	payload = psprintf("attempt_opened;state=%c;retry_from_attempt=%d;identity=%s;namespace_policy=%s;tools=%d;budget_cost=%d;budget_tokens=%d",
+					   QX_TASK_STATE_RUNNING,
+					   failed_attempt->seqno,
+					   task->identity_name != NULL ? task->identity_name : "<unknown>",
+					   task->policy_name != NULL ? task->policy_name : "<unknown>",
+					   list_length(authorized_contracts),
+					   task->budget_cost,
+					   task->budget_tokens);
+	payload = qx_runtime_append_recovery_payload(payload);
+	payload = qx_scheduler_append_runtime_payload(payload,
+												  &scheduler_envelope,
+												  true);
+	lease_snapshot = QxSchedulerLeaseSnapshotFromEnvelope(&scheduler_envelope,
+														 InvalidOid,
+														 worker_name != NULL ?
+														 worker_name :
+														 "embedded-runtime");
+	leaseoid = qx_insert_scheduler_lease(leaseledgerrel, queueoid,
+										 lease_snapshot);
+	heartbeat_snapshot = QxSchedulerHeartbeatSnapshotFromLease(lease_snapshot);
+	(void) qx_insert_scheduler_heartbeat(heartbeatledgerrel, leaseoid,
+										 heartbeat_snapshot);
+	CommandCounterIncrement();
+	(void) qx_insert_event(eventrel, task->sessionoid, task->oid, stepoid,
+						   task->ownerid, NULL, "TASK_RETRY_DISPATCHED", payload);
+	(void) qx_insert_trace(tracerel, task->sessionoid, task->oid, stepoid,
+						   task->ownerid, NULL, "runtime.retry_dispatch", payload);
+	pfree(payload);
+
+	stepoid = qx_insert_step(steprel, task->sessionoid, task->oid,
+							 stepseqbase + 1,
+							 "stage15.authorize_tools",
+							 "Retry dispatch reused the stored runtime tool allowlist");
+	payload = psprintf("namespace_policy=%s;authorized_tools=%d;tool_tokens=%d;tool_cost=%d;retry_from_attempt=%d",
+					   task->policy_name != NULL ? task->policy_name : "<unknown>",
+					   list_length(authorized_contracts),
+					   task->authorized_tool_tokens,
+					   task->authorized_tool_cost,
+					   failed_attempt->seqno);
+	(void) qx_insert_event(eventrel, task->sessionoid, task->oid, stepoid,
+						   task->ownerid, NULL, "TASK_TOOLS_AUTHORIZED", payload);
+	(void) qx_insert_trace(tracerel, task->sessionoid, task->oid, stepoid,
+						   task->ownerid, NULL, "runtime.authorize_tools", payload);
+	pfree(payload);
+
+	stepoid = qx_insert_step(steprel, task->sessionoid, task->oid,
+							 stepseqbase + 2,
+							 "stage16.external_submit",
+							 "Retry attempt executed the selected tool through its principal program");
+	qx_execute_tool_contract(selected_contract, "submit", task->oid,
+							 task->goal != NULL ? task->goal : "",
+							 task->input != NULL,
+							 &tool_result);
+	qx_build_semantic_execution_metadata(&semantic_meta, &tool_result);
+	qx_charge_task_budget(taskrel, task->oid,
+						  tool_result.token_charge,
+						  tool_result.cost_charge,
+						  "external_submit");
+	payload = psprintf("phase=submit;tool=%s;principal=%s;principal_runtime=%s;provider=%s;provider_kind=%s;effective_sandbox=%s;profile=%s;env=%s;cwd=%s;process_limit=%d;timeout_ms=%d;receipt_schema=%s;receipt_alg=%s;receipt_nonce=%s;receipt_sig=%s;attestation=%s;tokens=%d;cost=%d;detail=%s",
+					   tool_result.tool_name != NULL ? tool_result.tool_name : "<unknown>",
+					   tool_result.principal_name != NULL ? tool_result.principal_name : "<unknown>",
+					   tool_result.principal_runtime != NULL ? tool_result.principal_runtime : "<unknown>",
+					   tool_result.provider_name != NULL ? tool_result.provider_name : "<unknown>",
+					   tool_result.provider_kind != NULL ? tool_result.provider_kind : "<unknown>",
+					   tool_result.sandbox_name != NULL ? tool_result.sandbox_name : "<unknown>",
+					   tool_result.profile_name != NULL ? tool_result.profile_name : "<unknown>",
+					   tool_result.environment_mode != NULL ? tool_result.environment_mode : "<unknown>",
+					   tool_result.workdir_name != NULL ? tool_result.workdir_name : "<unknown>",
+					   tool_result.process_limit,
+					   tool_result.timeout_ms,
+					   tool_result.receipt_schema != NULL ? tool_result.receipt_schema : "<unknown>",
+					   tool_result.receipt_alg != NULL ? tool_result.receipt_alg : "<unknown>",
+					   tool_result.receipt_nonce != NULL ? tool_result.receipt_nonce : "<unknown>",
+					   tool_result.receipt_signature != NULL ? "verified" : "missing",
+					   tool_result.attestation_mode != NULL ? tool_result.attestation_mode : "<unknown>",
+					   tool_result.token_charge,
+					   tool_result.cost_charge,
+					   tool_result.detail != NULL ? tool_result.detail : "<none>");
+	(void) qx_insert_event(eventrel, task->sessionoid, task->oid, stepoid,
+						   task->ownerid, &semantic_meta,
+						   "TASK_TOOL_EXECUTED", payload);
+	(void) qx_insert_trace(tracerel, task->sessionoid, task->oid, stepoid,
+						   task->ownerid, &semantic_meta,
+						   "runtime.external_submit", payload);
+	pfree(payload);
+
+	stepoid = qx_insert_step(steprel, task->sessionoid, task->oid,
+							 stepseqbase + 3,
+							 "stage8.capture_input",
+							 "Retry attempt captured task goal and raw input");
+	qx_charge_task_budget(taskrel, task->oid,
+						  task->input != NULL ? 24 : 8,
+						  13,
+						  "capture_input");
+	payload = psprintf("input_present=%s;task_name=%s",
+					   task->input != NULL ? "true" : "false",
+					   task->name != NULL ? task->name : "<anonymous>");
+	(void) qx_insert_event(eventrel, task->sessionoid, task->oid, stepoid,
+						   task->ownerid, NULL, "TASK_INPUT_CAPTURED", payload);
+	(void) qx_insert_trace(tracerel, task->sessionoid, task->oid, stepoid,
+						   task->ownerid, NULL, "runtime.capture_input", payload);
+	pfree(payload);
+
+	stepoid = qx_insert_step(steprel, task->sessionoid, task->oid,
+							 stepseqbase + 4,
+							 "stage8.checkpoint_barrier",
+							 "Retry attempt reached a resumable checkpoint barrier");
+	qx_charge_task_budget(taskrel, task->oid, 4, 14, "checkpoint_barrier");
+	payload = psprintf("checkpoint=stage8.after_capture;task_state=%c",
+					   QX_TASK_STATE_CHECKPOINTED);
+	(void) qx_insert_event(eventrel, task->sessionoid, task->oid, stepoid,
+						   task->ownerid, &semantic_meta,
+						   "TASK_CHECKPOINTED", payload);
+	(void) qx_insert_trace(tracerel, task->sessionoid, task->oid, stepoid,
+						   task->ownerid, &semantic_meta,
+						   "runtime.checkpoint", payload);
+
+	checkpoint_data = psprintf("task=%u;attempt=%u;session=%u;next_step=%d",
+							   task->oid,
+							   attemptoid,
+							   task->sessionoid,
+							   stepseqbase + 5);
+	checkpointoid = qx_insert_checkpoint(checkpointrel,
+										 task->sessionoid,
+										 task->oid,
+										 attemptoid,
+										 stepoid,
+										 task->ownerid,
+										 &semantic_meta,
+										 QX_TASK_STATE_CHECKPOINTED,
+										 stepseqbase + 5,
+										 "stage8.after_capture",
+										 checkpoint_data);
+	pfree(checkpoint_data);
+
+	qx_update_attempt_state(attemptrel, attemptoid, QX_ATTEMPT_STATE_CHECKPOINTED);
+	qx_update_task_runtime(taskrel, task->oid, QX_TASK_STATE_CHECKPOINTED,
+						   attemptoid, true, checkpointoid, true);
+	released_lease_snapshot = QxSchedulerReleaseLeaseSnapshot(lease_snapshot,
+															 false);
+	leaseoid = qx_insert_scheduler_lease(leaseledgerrel, queueoid,
+										 released_lease_snapshot);
+	final_heartbeat_snapshot =
+		QxSchedulerFinalizeHeartbeatSnapshot(released_lease_snapshot,
+											 "scheduler-release");
+	(void) qx_insert_scheduler_heartbeat(heartbeatledgerrel, leaseoid,
+										 final_heartbeat_snapshot);
+	CommandCounterIncrement();
+
+	(void) qx_insert_event(eventrel, task->sessionoid, task->oid, InvalidOid,
+						   task->ownerid, NULL,
+						   "TASK_READY_FOR_RESUME", payload);
+	(void) qx_insert_trace(tracerel, task->sessionoid, task->oid, InvalidOid,
+						   task->ownerid, NULL, "runtime.pause",
+						   "Task paused at durable checkpoint and awaits RESUME TASK");
+	pfree(payload);
+	qx_free_external_result(&tool_result);
+	if (authorized_contracts != NIL)
+		list_free_deep(authorized_contracts);
+
+	if (stats != NULL)
+	{
+		stats->retry_dispatches++;
+		stats->heartbeats_written += 2;
+	}
+
+	return true;
+}
+
+static void
+qx_runtime_log_scheduler_cycle(const char *worker_name,
+							   const QxRuntimeSchedulerCycleStats *stats)
+{
+	if (stats == NULL)
+		return;
+
+	if (stats->leases_renewed <= 0 &&
+		stats->leases_reclaimed <= 0 &&
+		stats->leases_repaired <= 0 &&
+		stats->recovery_requeued <= 0 &&
+		stats->retry_dispatches <= 0 &&
+		stats->retry_waiting_tasks <= 0 &&
+		stats->ownership_skipped <= 0)
+		return;
+
+	elog(DEBUG1,
+		 "%s: tasks=%d running=%d queued_retry=%d retry_ready=%d retry_waiting=%d skipped=%d leases=%d renewed=%d reclaimed=%d repaired=%d requeued=%d retry_dispatches=%d last_backoff_ms=%d max_backoff_ms=%d heartbeats=%d",
+		 worker_name != NULL ? worker_name : "qhapaqxian scheduler",
+		 stats->tasks_scanned,
+		 stats->running_tasks,
+		 stats->queued_retry_tasks,
+		 stats->retry_ready_tasks,
+		 stats->retry_waiting_tasks,
+		 stats->ownership_skipped,
+		 stats->leases_seen,
+		 stats->leases_renewed,
+		 stats->leases_reclaimed,
+		 stats->leases_repaired,
+		 stats->recovery_requeued,
+		 stats->retry_dispatches,
+		 stats->last_retry_backoff_ms,
+		 stats->max_retry_backoff_ms,
+		 stats->heartbeats_written);
 }
 
 static Oid
@@ -2176,37 +5160,834 @@ qx_runtime_insert_task(Relation taskrel, const QxRuntimeTaskRequest *request)
 	return taskoid;
 }
 
-static char *
-qx_fetch_checkpoint_label(HeapTuple checkpointtup)
-{
-	bool		isnull;
-	Datum		datum;
-
-	datum = SysCacheGetAttr(QXCHECKPOINTOID, checkpointtup,
-							Anum_pg_qx_checkpoint_qxcheckpointlabel,
-							&isnull);
-	if (isnull)
-		return NULL;
-
-	return TextDatumGetCString(datum);
-}
-
 static int16
 qx_fetch_attempt_seqno(Oid attemptoid)
 {
-	HeapTuple	attempttup;
-	Form_pg_qx_attempt attemptform;
+	QxCatalogAttemptInfo attempt;
 	int16		seqno;
 
-	attempttup = SearchSysCache1(QXATTEMPTOID, ObjectIdGetDatum(attemptoid));
-	if (!HeapTupleIsValid(attempttup))
+	if (!QxCatalogLookupAttemptByOid(attemptoid, &attempt))
 		elog(ERROR, "cache lookup failed for QhapaqXian attempt %u", attemptoid);
 
-	attemptform = (Form_pg_qx_attempt) GETSTRUCT(attempttup);
-	seqno = attemptform->qxattemptseqno;
-	ReleaseSysCache(attempttup);
+	seqno = attempt.seqno;
+	QxCatalogFreeAttemptInfo(&attempt);
 
 	return seqno;
+}
+
+Datum
+pg_qx_test_start_recovery_attempt(PG_FUNCTION_ARGS)
+{
+	Oid			taskoid = PG_GETARG_OID(0);
+	Relation	taskrel;
+	Relation	attemptrel;
+	Relation	queueledgerrel;
+	Relation	leaseledgerrel;
+	Relation	heartbeatledgerrel;
+	QxCatalogTaskInfo task;
+	QxSchedulerTaskEnvelope scheduler_envelope;
+	QxSchedulerQueueSnapshot *queue_snapshot;
+	QxSchedulerLeaseSnapshot *lease_snapshot;
+	QxSchedulerHeartbeatSnapshot *heartbeat_snapshot;
+	char	   *selected_contract;
+	char	   *checkpoint_label;
+	char	   *resume_label;
+	Oid			attemptoid;
+	Oid			queueoid;
+	Oid			leaseoid;
+	int16		nextattemptseqno;
+
+	/*
+	 * Internal regression hook: leave a real durable "backend crashed after
+	 * dispatch" shape without executing an external principal.
+	 */
+	if (!QxCatalogLookupTaskByOid(taskoid, &task))
+		elog(ERROR, "cache lookup failed for QhapaqXian task %u", taskoid);
+
+	if (task.ownerid != GetUserId())
+	{
+		QxCatalogFreeTaskInfo(&task);
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied for QhapaqXian task %u", taskoid)));
+	}
+
+	if (task.state != QX_TASK_STATE_CHECKPOINTED &&
+		task.state != QX_TASK_STATE_RUNNING)
+	{
+		QxCatalogFreeTaskInfo(&task);
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("task %u is not checkpointed or running", taskoid),
+				 errdetail("The recovery test hook requires a resumable durable task shape.")));
+	}
+
+	if (!OidIsValid(task.lastcheckpointid))
+	{
+		QxCatalogFreeTaskInfo(&task);
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("task %u has no durable checkpoint", taskoid)));
+	}
+
+	if (!OidIsValid(task.lastattemptid))
+	{
+		QxCatalogFreeTaskInfo(&task);
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("task %u has no previous attempt", taskoid)));
+	}
+
+	nextattemptseqno = qx_fetch_attempt_seqno(task.lastattemptid) + 1;
+	selected_contract = qx_runtime_recovery_selected_contract(&task, true);
+	checkpoint_label = qx_runtime_recovery_checkpoint_label(task.lastcheckpointid);
+	resume_label = checkpoint_label != NULL ? pstrdup(checkpoint_label) : NULL;
+
+	if (selected_contract == NULL)
+	{
+		if (checkpoint_label != NULL)
+			pfree(checkpoint_label);
+		if (resume_label != NULL)
+			pfree(resume_label);
+		QxCatalogFreeTaskInfo(&task);
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("task %u has no authorized resume contract", taskoid)));
+	}
+
+	taskrel = table_open(QxTaskRelationId, RowExclusiveLock);
+	attemptrel = table_open(QxAttemptRelationId, RowExclusiveLock);
+	queueledgerrel = table_open(QxSchedulerQueueRelationId, RowExclusiveLock);
+	leaseledgerrel = table_open(QxSchedulerLeaseRelationId, RowExclusiveLock);
+	heartbeatledgerrel = table_open(QxSchedulerHeartbeatRelationId,
+									RowExclusiveLock);
+
+	attemptoid = qx_insert_attempt(attemptrel,
+								   task.sessionoid,
+								   taskoid,
+								   task.ownerid,
+								   task.lastcheckpointid,
+								   nextattemptseqno,
+								   QX_ATTEMPT_STATE_RUNNING,
+								   "resume");
+	CommandCounterIncrement();
+
+	qx_update_task_runtime(taskrel, taskoid, QX_TASK_STATE_RUNNING,
+						   attemptoid, true, InvalidOid, false);
+
+	qx_runtime_fill_recovery_scheduler_envelope(&scheduler_envelope,
+												&task,
+												attemptoid,
+												Max((int32) nextattemptseqno - 1, 0),
+												checkpoint_label,
+												resume_label,
+												true,
+												true,
+												true,
+												selected_contract);
+	queue_snapshot = QxSchedulerQueueSnapshotFromEnvelope(&scheduler_envelope);
+	queueoid = qx_insert_scheduler_queue(queueledgerrel, queue_snapshot);
+	CommandCounterIncrement();
+
+	lease_snapshot = QxSchedulerLeaseSnapshotFromEnvelope(&scheduler_envelope,
+														  InvalidOid,
+														  "embedded-runtime");
+	leaseoid = qx_insert_scheduler_lease(leaseledgerrel, queueoid,
+										 lease_snapshot);
+	heartbeat_snapshot = QxSchedulerHeartbeatSnapshotFromLease(lease_snapshot);
+	(void) qx_insert_scheduler_heartbeat(heartbeatledgerrel, leaseoid,
+										 heartbeat_snapshot);
+	CommandCounterIncrement();
+
+	table_close(heartbeatledgerrel, RowExclusiveLock);
+	table_close(leaseledgerrel, RowExclusiveLock);
+	table_close(queueledgerrel, RowExclusiveLock);
+	table_close(attemptrel, RowExclusiveLock);
+	table_close(taskrel, RowExclusiveLock);
+
+	pfree(selected_contract);
+	if (checkpoint_label != NULL)
+		pfree(checkpoint_label);
+	if (resume_label != NULL)
+		pfree(resume_label);
+	QxCatalogFreeTaskInfo(&task);
+
+	PG_RETURN_OID(attemptoid);
+}
+
+static Oid
+qx_runtime_test_start_uncheckpointed_task(Oid sessionoid,
+										  const char *priority)
+{
+	QxCatalogSessionInfo session;
+	QxCatalogAgentInfo agent;
+	QxBudgetPolicy budget;
+	QxToolAuthorization authz;
+	QxRuntimeTaskRequest request;
+	Relation	taskrel;
+	Relation	attemptrel;
+	Relation	steprel;
+	Relation	eventrel;
+	Relation	tracerel;
+	Relation	queueledgerrel;
+	Relation	leaseledgerrel;
+	Relation	heartbeatledgerrel;
+	QxSchedulerTaskEnvelope scheduler_envelope;
+	QxSchedulerQueueSnapshot *queue_snapshot;
+	QxSchedulerLeaseSnapshot *lease_snapshot;
+	QxSchedulerHeartbeatSnapshot *heartbeat_snapshot;
+	List	   *tools = NIL;
+	char	   *agent_name = NULL;
+	char	   *payload = NULL;
+	const char *selected_contract;
+	Oid			taskoid;
+	Oid			attemptoid;
+	Oid			stepoid;
+	Oid			queueoid;
+	Oid			leaseoid;
+
+	MemSet(&session, 0, sizeof(session));
+	MemSet(&agent, 0, sizeof(agent));
+	MemSet(&budget, 0, sizeof(budget));
+	MemSet(&authz, 0, sizeof(authz));
+	MemSet(&request, 0, sizeof(request));
+
+	if (!QxCatalogLookupSessionByOid(sessionoid, &session))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("session %u does not exist", sessionoid)));
+
+	if (session.ownerid != GetUserId())
+	{
+		QxCatalogFreeSessionInfo(&session);
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied for QhapaqXian session %u", sessionoid)));
+	}
+
+	if (!QxCatalogLookupAgentByOid(session.agentoid, &agent))
+	{
+		QxCatalogFreeSessionInfo(&session);
+		elog(ERROR, "cache lookup failed for QhapaqXian agent %u",
+			 session.agentoid);
+	}
+
+	/*
+	 * Internal regression hook: create a real durable "task dispatched but no
+	 * checkpoint was ever written" shape so scheduler supervision can exercise
+	 * the non-resumable stale-attempt path.
+	 */
+	qx_runtime_ensure_startup_recovery_scan(session.ownerid);
+
+	QxBudgetPolicyFromSerialized(agent.budget, &budget);
+	tools = QxDeserializeToolList(agent.tools);
+	QxValidateToolList(tools);
+	QxAuthorizeToolsForNamespace(session.namespacepolicyoid,
+								 agent.namespaceoid,
+								 session.ownerid,
+								 tools,
+								 &authz);
+
+	request.sessionoid = session.oid;
+	request.agentoid = session.agentoid;
+	request.identityoid = session.identityoid;
+	request.namespace_policy_oid = session.namespacepolicyoid;
+	request.ownerid = session.ownerid;
+	request.task_name = "extract_uncheckpointed";
+	request.identity_name = session.identity_name;
+	request.namespace_policy_name = session.policy_name;
+	request.goal = "leave running without checkpoint";
+	request.input = NULL;
+	request.priority = qx_effective_priority_name(priority);
+	request.authorized_tools = authz.tool_contracts;
+	request.authorized_tool_oids = authz.tool_oids;
+	request.budget_tokens = budget.has_token_limit ? budget.token_limit : 1024;
+	request.budget_cost = budget.has_cost_limit ? budget.cost_limit : 128;
+	request.estimated_tokens = Max(authz.tool_token_cost * 4, 48);
+	request.estimated_cost = Max(authz.tool_cost_units * 4, 32);
+	request.authorized_tool_tokens = authz.tool_token_cost;
+	request.authorized_tool_cost = authz.tool_cost_units;
+
+	selected_contract = request.authorized_tools != NIL ?
+		strVal((Node *) linitial(request.authorized_tools)) : NULL;
+	if (selected_contract == NULL)
+	{
+		QxCatalogFreeAgentInfo(&agent);
+		QxCatalogFreeSessionInfo(&session);
+		if (tools != NIL)
+			list_free_deep(tools);
+		if (authz.tool_oids != NIL)
+			list_free(authz.tool_oids);
+		if (authz.tool_contracts != NIL)
+			list_free_deep(authz.tool_contracts);
+		if (authz.tool_runtime_classes != NIL)
+			list_free_deep(authz.tool_runtime_classes);
+		if (authz.tool_sandbox_ceilings != NIL)
+			list_free_deep(authz.tool_sandbox_ceilings);
+		if (authz.tool_capability_tags != NIL)
+			list_free_deep(authz.tool_capability_tags);
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("session %u has no authorized tool contract", sessionoid)));
+	}
+
+	taskrel = table_open(QxTaskRelationId, RowExclusiveLock);
+	attemptrel = table_open(QxAttemptRelationId, RowExclusiveLock);
+	steprel = table_open(QxStepRelationId, RowExclusiveLock);
+	eventrel = table_open(QxEventRelationId, RowExclusiveLock);
+	tracerel = table_open(QxTraceRelationId, RowExclusiveLock);
+	queueledgerrel = table_open(QxSchedulerQueueRelationId, RowExclusiveLock);
+	leaseledgerrel = table_open(QxSchedulerLeaseRelationId, RowExclusiveLock);
+	heartbeatledgerrel = table_open(QxSchedulerHeartbeatRelationId,
+									RowExclusiveLock);
+
+	taskoid = qx_runtime_insert_task(taskrel, &request);
+	CommandCounterIncrement();
+
+	attemptoid = qx_insert_attempt(attemptrel,
+								   request.sessionoid,
+								   taskoid,
+								   request.ownerid,
+								   InvalidOid,
+								   1,
+								   QX_ATTEMPT_STATE_RUNNING,
+								   "initial");
+	CommandCounterIncrement();
+
+	agent_name = qx_fetch_agent_name(request.agentoid);
+	qx_scheduler_fill_envelope(&scheduler_envelope,
+							   request.ownerid,
+							   request.sessionoid,
+							   request.agentoid,
+							   request.identityoid,
+							   request.namespace_policy_oid,
+							   taskoid,
+							   attemptoid,
+							   request.task_name,
+							   agent_name,
+							   request.identity_name,
+							   request.namespace_policy_name,
+							   request.priority,
+							   NULL,
+							   NULL,
+							   false,
+							   true,
+							   false,
+							   request.budget_tokens,
+							   request.budget_cost,
+							   request.estimated_tokens,
+							   request.estimated_cost,
+							   0,
+							   selected_contract);
+	pfree(agent_name);
+
+	queue_snapshot = QxSchedulerQueueSnapshotFromEnvelope(&scheduler_envelope);
+	queueoid = qx_insert_scheduler_queue(queueledgerrel, queue_snapshot);
+	CommandCounterIncrement();
+
+	payload = psprintf("goal=%s;priority=%s",
+					   request.goal,
+					   qx_effective_priority_name(request.priority));
+	payload = qx_runtime_append_recovery_payload(payload);
+	payload = qx_scheduler_append_runtime_payload(payload,
+												  &scheduler_envelope,
+												  false);
+	(void) qx_insert_event(eventrel, request.sessionoid, taskoid, InvalidOid,
+						   request.ownerid, NULL, "TASK_QUEUED", payload);
+	(void) qx_insert_trace(tracerel, request.sessionoid, taskoid, InvalidOid,
+						   request.ownerid, NULL, "runtime.queue", payload);
+	pfree(payload);
+
+	qx_update_task_runtime(taskrel, taskoid, QX_TASK_STATE_RUNNING,
+						   attemptoid, true, InvalidOid, false);
+
+	stepoid = qx_insert_step(steprel, request.sessionoid, taskoid, 1,
+							 "stage8.scheduler_admit",
+							 "Scheduler regression hook admitted an initial attempt without writing a durable checkpoint");
+	payload = psprintf("attempt_opened;state=%c;identity=%s;namespace_policy=%s;tools=%d;budget_cost=%d;budget_tokens=%d",
+					   QX_TASK_STATE_RUNNING,
+					   request.identity_name != NULL ? request.identity_name : "<unknown>",
+					   request.namespace_policy_name != NULL ? request.namespace_policy_name : "<unknown>",
+					   list_length(request.authorized_tools),
+					   request.budget_cost,
+					   request.budget_tokens);
+	payload = qx_runtime_append_recovery_payload(payload);
+	payload = qx_scheduler_append_runtime_payload(payload,
+												  &scheduler_envelope,
+												  true);
+	lease_snapshot = QxSchedulerLeaseSnapshotFromEnvelope(&scheduler_envelope,
+														 InvalidOid,
+														 "embedded-runtime");
+	leaseoid = qx_insert_scheduler_lease(leaseledgerrel, queueoid,
+										 lease_snapshot);
+	heartbeat_snapshot = QxSchedulerHeartbeatSnapshotFromLease(lease_snapshot);
+	(void) qx_insert_scheduler_heartbeat(heartbeatledgerrel, leaseoid,
+										 heartbeat_snapshot);
+	CommandCounterIncrement();
+	(void) qx_insert_event(eventrel, request.sessionoid, taskoid, stepoid,
+						   request.ownerid, NULL, "TASK_DISPATCHED", payload);
+	(void) qx_insert_trace(tracerel, request.sessionoid, taskoid, stepoid,
+						   request.ownerid, NULL, "runtime.dispatch", payload);
+	pfree(payload);
+
+	table_close(heartbeatledgerrel, RowExclusiveLock);
+	table_close(leaseledgerrel, RowExclusiveLock);
+	table_close(queueledgerrel, RowExclusiveLock);
+	table_close(tracerel, RowExclusiveLock);
+	table_close(eventrel, RowExclusiveLock);
+	table_close(steprel, RowExclusiveLock);
+	table_close(attemptrel, RowExclusiveLock);
+	table_close(taskrel, RowExclusiveLock);
+
+	QxCatalogFreeAgentInfo(&agent);
+	QxCatalogFreeSessionInfo(&session);
+	if (tools != NIL)
+		list_free_deep(tools);
+	if (authz.tool_oids != NIL)
+		list_free(authz.tool_oids);
+	if (authz.tool_contracts != NIL)
+		list_free_deep(authz.tool_contracts);
+	if (authz.tool_runtime_classes != NIL)
+		list_free_deep(authz.tool_runtime_classes);
+	if (authz.tool_sandbox_ceilings != NIL)
+		list_free_deep(authz.tool_sandbox_ceilings);
+	if (authz.tool_capability_tags != NIL)
+		list_free_deep(authz.tool_capability_tags);
+
+	return taskoid;
+}
+
+Datum
+pg_qx_test_start_uncheckpointed_task(PG_FUNCTION_ARGS)
+{
+	Oid			sessionoid = PG_GETARG_OID(0);
+
+	PG_RETURN_OID(qx_runtime_test_start_uncheckpointed_task(sessionoid,
+															"high"));
+}
+
+Datum
+pg_qx_test_start_uncheckpointed_task_priority(PG_FUNCTION_ARGS)
+{
+	Oid			sessionoid = PG_GETARG_OID(0);
+	text	   *priority_text = PG_GETARG_TEXT_PP(1);
+	char	   *priority = text_to_cstring(priority_text);
+	Oid			taskoid;
+
+	taskoid = qx_runtime_test_start_uncheckpointed_task(sessionoid, priority);
+	pfree(priority);
+
+	PG_RETURN_OID(taskoid);
+}
+
+Datum
+pg_qx_scheduler_worker_slot_count(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT32(qx_runtime_scheduler_slot_count());
+}
+
+Datum
+pg_qx_scheduler_owner_slot(PG_FUNCTION_ARGS)
+{
+	Oid			taskoid = PG_GETARG_OID(0);
+	int32		slot_count = qx_runtime_scheduler_slot_count();
+
+	PG_RETURN_INT32(qx_runtime_scheduler_owner_slot(taskoid, slot_count) + 1);
+}
+
+void
+QxRuntimeRegisterSchedulerBackgroundWorker(void)
+{
+	BackgroundWorker worker;
+
+	memset(&worker, 0, sizeof(worker));
+	worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
+		BGWORKER_BACKEND_DATABASE_CONNECTION;
+	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+	worker.bgw_restart_time = 1;
+	snprintf(worker.bgw_library_name, MAXPGPATH, "postgres");
+	snprintf(worker.bgw_function_name, BGW_MAXLEN,
+			 "QxRuntimeSchedulerLauncherMain");
+	snprintf(worker.bgw_name, BGW_MAXLEN, "qhapaqxian scheduler launcher");
+	snprintf(worker.bgw_type, BGW_MAXLEN, "qhapaqxian scheduler launcher");
+	worker.bgw_main_arg = Int32GetDatum(0);
+	worker.bgw_notify_pid = 0;
+
+	RegisterBackgroundWorker(&worker);
+}
+
+void
+QxRuntimeSchedulerLauncherMain(Datum main_arg)
+{
+	List	   *workers = NIL;
+	uint32		wait_event = 0;
+
+	(void) main_arg;
+
+	pqsignal(SIGHUP, SignalHandlerForConfigReload);
+	pqsignal(SIGTERM, die);
+	BackgroundWorkerUnblockSignals();
+	BackgroundWorkerInitializeConnection(NULL, NULL, 0);
+
+	for (;;)
+	{
+		List	   *targets;
+		List	   *alive_workers = NIL;
+		ListCell   *lc;
+		MemoryContext oldcontext;
+
+		SetCurrentStatementStartTimestamp();
+		StartTransactionCommand();
+		pgstat_report_activity(STATE_RUNNING,
+							   "qhapaqxian scheduler launcher");
+		targets = qx_runtime_scheduler_db_targets();
+
+		oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+		foreach(lc, workers)
+		{
+			QxRuntimeSchedulerDbWorker *worker = lfirst(lc);
+			ListCell   *target_lc;
+			BgwHandleStatus status;
+			pid_t		pid = 0;
+			bool		present = false;
+
+			status = GetBackgroundWorkerPid(worker->handle, &pid);
+			if (status == BGWH_POSTMASTER_DIED)
+			{
+				MemoryContextSwitchTo(oldcontext);
+				proc_exit(1);
+			}
+			if (status == BGWH_STOPPED)
+			{
+				if (worker->dbname != NULL)
+					pfree(worker->dbname);
+				pfree(worker->handle);
+				pfree(worker);
+				continue;
+			}
+
+			foreach(target_lc, targets)
+			{
+				QxRuntimeSchedulerDbTarget *target = lfirst(target_lc);
+				int32		slot_index;
+
+				if (target->dboid != worker->dboid)
+					continue;
+
+				for (slot_index = 0;
+					 slot_index < qx_runtime_scheduler_slot_count();
+					 slot_index++)
+				{
+					if (worker->slot_index == slot_index)
+					{
+						present = true;
+						break;
+					}
+				}
+				if (present)
+					break;
+			}
+
+			if (!present)
+			{
+				TerminateBackgroundWorker(worker->handle);
+				if (worker->dbname != NULL)
+					pfree(worker->dbname);
+				pfree(worker->handle);
+				pfree(worker);
+				continue;
+			}
+
+			alive_workers = lappend(alive_workers, worker);
+		}
+		list_free(workers);
+		workers = alive_workers;
+
+		foreach(lc, targets)
+		{
+			QxRuntimeSchedulerDbTarget *target = lfirst(lc);
+			int32		slot_index;
+
+			for (slot_index = 0;
+				 slot_index < qx_runtime_scheduler_slot_count();
+				 slot_index++)
+			{
+				QxRuntimeSchedulerDbWorker *worker;
+				BackgroundWorkerHandle *handle = NULL;
+
+				if (qx_runtime_find_scheduler_db_worker(workers,
+														target->dboid,
+														slot_index) != NULL)
+					continue;
+
+				if (!qx_runtime_launch_scheduler_db_worker(target->dboid,
+														   target->dbname,
+														   slot_index,
+														   qx_runtime_scheduler_slot_count(),
+														   &handle))
+				{
+					elog(WARNING,
+						 "qhapaqxian scheduler launcher could not start worker for database \"%s\" (%u) slot %d/%d",
+						 target->dbname,
+						 target->dboid,
+						 slot_index + 1,
+						 qx_runtime_scheduler_slot_count());
+					continue;
+				}
+
+				worker = MemoryContextAllocZero(TopMemoryContext, sizeof(*worker));
+				worker->dboid = target->dboid;
+				worker->dbname = MemoryContextStrdup(TopMemoryContext,
+													 target->dbname);
+				worker->slot_index = slot_index;
+				worker->slot_count = qx_runtime_scheduler_slot_count();
+				worker->handle = handle;
+				workers = lappend(workers, worker);
+			}
+		}
+		MemoryContextSwitchTo(oldcontext);
+
+		qx_runtime_free_scheduler_db_targets(targets);
+		CommitTransactionCommand();
+		pgstat_report_stat(true);
+		pgstat_report_activity(STATE_IDLE, NULL);
+
+		qx_runtime_scheduler_heartbeat_wait(&wait_event,
+											"QxSchedulerLauncher",
+											QX_SCHEDULER_LAUNCHER_NAPTIME_MS);
+	}
+}
+
+void
+QxRuntimeSchedulerDatabaseWorkerMain(Datum main_arg)
+{
+	QxRuntimeSchedulerCycleStats stats;
+	QxRuntimeSchedulerCycleStats retry_stats;
+	uint32		wait_event = 0;
+	Oid			dboid = InvalidOid;
+	QxRuntimeSchedulerWorkerKey key;
+	int32		slot_index = 0;
+	int32		slot_count = 1;
+
+	MemSet(&key, 0, sizeof(key));
+	if (DatumGetUInt32(main_arg) != 0)
+		dboid = DatumGetObjectId(main_arg);
+	memcpy(&key, MyBgworkerEntry->bgw_extra, sizeof(key));
+	if (!OidIsValid(dboid))
+		dboid = key.dboid;
+	if (key.slot_count > 0)
+	{
+		slot_index = key.slot_index;
+		slot_count = key.slot_count;
+	}
+	if (!OidIsValid(dboid))
+		elog(FATAL, "qhapaqxian scheduler worker missing database OID");
+
+	pqsignal(SIGHUP, SignalHandlerForConfigReload);
+	pqsignal(SIGTERM, die);
+	BackgroundWorkerUnblockSignals();
+	BackgroundWorkerInitializeConnectionByOid(dboid, InvalidOid, 0);
+
+	for (;;)
+	{
+		SetCurrentStatementStartTimestamp();
+		StartTransactionCommand();
+		pgstat_report_activity(STATE_RUNNING,
+							   "qhapaqxian scheduler supervision");
+		qx_runtime_run_scheduler_cycle(&stats, slot_index, slot_count);
+		CommitTransactionCommand();
+		pgstat_report_stat(true);
+		qx_runtime_log_scheduler_cycle(MyBgworkerEntry->bgw_name, &stats);
+
+		PG_TRY();
+		{
+			SetCurrentStatementStartTimestamp();
+			StartTransactionCommand();
+			pgstat_report_activity(STATE_RUNNING,
+								   "qhapaqxian scheduler retry intake");
+			MemSet(&retry_stats, 0, sizeof(retry_stats));
+			qx_runtime_run_scheduler_retry_cycle(&retry_stats,
+												slot_index,
+												slot_count);
+			CommitTransactionCommand();
+			pgstat_report_stat(true);
+			qx_runtime_log_scheduler_cycle(MyBgworkerEntry->bgw_name,
+										  &retry_stats);
+		}
+		PG_CATCH();
+		{
+			ErrorData  *edata;
+			MemoryContext oldcontext;
+			char	   *errmsg;
+
+			oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+			edata = CopyErrorData();
+			errmsg = pstrdup(edata->message != NULL ? edata->message : "<unknown>");
+			MemoryContextSwitchTo(oldcontext);
+			FlushErrorState();
+			AbortCurrentTransaction();
+			elog(WARNING,
+				 "qhapaqxian scheduler retry intake failed for database %u: %s",
+				 dboid,
+				 errmsg);
+			pfree(errmsg);
+			FreeErrorData(edata);
+		}
+		PG_END_TRY();
+
+		pgstat_report_activity(STATE_IDLE, NULL);
+
+		qx_runtime_scheduler_heartbeat_wait(&wait_event,
+											"QxSchedulerWorker",
+											QX_SCHEDULER_WORKER_NAPTIME_MS);
+	}
+}
+
+Datum
+pg_qx_test_run_scheduler_worker_tick(PG_FUNCTION_ARGS)
+{
+	List	   *tasks;
+	ListCell   *lc;
+	Relation	leaseledgerrel;
+	Relation	heartbeatledgerrel;
+	int32		tasks_scanned = 0;
+	int32		running_tasks = 0;
+	int32		leases_seen = 0;
+	int32		leases_renewed = 0;
+	int32		heartbeats_written = 0;
+	char	   *payload;
+
+	tasks = QxCatalogBuildTaskInfoList(MyDatabaseId, GetUserId());
+	leaseledgerrel = table_open(QxSchedulerLeaseRelationId, RowExclusiveLock);
+	heartbeatledgerrel = table_open(QxSchedulerHeartbeatRelationId,
+									RowExclusiveLock);
+
+	foreach(lc, tasks)
+	{
+		QxCatalogTaskInfo *task = lfirst(lc);
+		QxCatalogAttemptInfo attempt;
+		QxSchedulerLeaseSnapshot lease_snapshot;
+		QxSchedulerLeaseSnapshot *renewed_lease_snapshot;
+		QxSchedulerHeartbeatSnapshot *heartbeat_snapshot;
+		Oid			queueoid = InvalidOid;
+		Oid			leaseoid;
+		int32		lease_ttl_ms;
+
+		tasks_scanned++;
+		if (task->state != QX_TASK_STATE_RUNNING ||
+			!OidIsValid(task->lastattemptid))
+			continue;
+
+		running_tasks++;
+		if (!QxCatalogLookupAttemptByOid(task->lastattemptid, &attempt))
+			elog(ERROR, "cache lookup failed for QhapaqXian attempt %u",
+				 task->lastattemptid);
+
+		if (attempt.state != QX_ATTEMPT_STATE_RUNNING)
+		{
+			QxCatalogFreeAttemptInfo(&attempt);
+			continue;
+		}
+
+		MemSet(&lease_snapshot, 0, sizeof(lease_snapshot));
+		if (!qx_runtime_latest_lease(leaseledgerrel,
+									 task->oid,
+									 attempt.oid,
+									 &lease_snapshot,
+									 &queueoid))
+		{
+			QxCatalogFreeAttemptInfo(&attempt);
+			continue;
+		}
+
+		if (lease_snapshot.state != QX_SCHEDULER_LEASE_HELD)
+		{
+			qx_runtime_free_scheduler_lease_snapshot(&lease_snapshot);
+			QxCatalogFreeAttemptInfo(&attempt);
+			continue;
+		}
+
+		leases_seen++;
+		lease_ttl_ms = qx_runtime_lease_ttl_ms(&lease_snapshot);
+		renewed_lease_snapshot =
+			QxSchedulerRenewLeaseSnapshot(&lease_snapshot, lease_ttl_ms);
+		leaseoid = qx_insert_scheduler_lease(leaseledgerrel,
+											 queueoid,
+											 renewed_lease_snapshot);
+		heartbeat_snapshot =
+			QxSchedulerHeartbeatSnapshotFromLease(renewed_lease_snapshot);
+		qx_runtime_set_heartbeat_receipt(heartbeat_snapshot,
+										 "scheduler-renew");
+		(void) qx_insert_scheduler_heartbeat(heartbeatledgerrel,
+											 leaseoid,
+											 heartbeat_snapshot);
+		CommandCounterIncrement();
+
+		leases_renewed++;
+		heartbeats_written++;
+		qx_runtime_free_scheduler_lease_snapshot(&lease_snapshot);
+		QxCatalogFreeAttemptInfo(&attempt);
+	}
+
+	table_close(heartbeatledgerrel, RowExclusiveLock);
+	table_close(leaseledgerrel, RowExclusiveLock);
+	QxCatalogFreeTaskInfoList(tasks);
+
+	payload = psprintf("test=scheduler_worker_tick;tasks_scanned=%d;running_tasks=%d;leases_seen=%d;leases_renewed=%d;heartbeats_written=%d",
+					   tasks_scanned,
+					   running_tasks,
+					   leases_seen,
+					   leases_renewed,
+					   heartbeats_written);
+
+	PG_RETURN_TEXT_P(cstring_to_text(payload));
+}
+
+Datum
+pg_qx_test_run_startup_recovery(PG_FUNCTION_ARGS)
+{
+	char	   *payload;
+
+	qx_runtime_ensure_startup_recovery_scan(GetUserId());
+	payload = qx_runtime_append_recovery_payload(pstrdup("test=startup_recovery"));
+
+	PG_RETURN_TEXT_P(cstring_to_text(payload));
+}
+
+Datum
+pg_qx_test_run_failover_rebuild(PG_FUNCTION_ARGS)
+{
+	QxRecoveryFailoverRequest request;
+	QxRecoveryHooks hooks;
+	QxRecoveryReport *report;
+	QxRuntimeRecoveryHooksContext hook_context;
+	char	   *payload;
+
+	memset(&request, 0, sizeof(request));
+	request.databaseoid = MyDatabaseId;
+	request.ownerid = GetUserId();
+	request.rebuild_task_graph = true;
+	request.rebuild_attempt_graph = true;
+	request.rebuild_checkpoint_graph = true;
+	request.replay_semantic_log = true;
+	request.fence_orphaned_attempts = true;
+	request.requeue_checkpointed_tasks = true;
+
+	memset(&hooks, 0, sizeof(hooks));
+	memset(&hook_context, 0, sizeof(hook_context));
+	hook_context.ownerid = request.ownerid;
+	hooks.begin = qx_runtime_recovery_begin;
+	hooks.requeue_task = qx_runtime_recovery_requeue_task;
+	hooks.fence_attempt = qx_runtime_recovery_fence_attempt;
+	hooks.finish = qx_runtime_recovery_finish;
+	hooks.userdata = &hook_context;
+
+	report = QxRecoveryRunFailoverRebuild(&request, &hooks);
+	payload = qx_runtime_failover_recovery_payload(
+		pstrdup("test=failover_rebuild"), report);
+	QxRecoveryFreeReport(report);
+
+	PG_RETURN_TEXT_P(cstring_to_text(payload));
 }
 
 Oid
@@ -2218,14 +5999,29 @@ QxRuntimeSubmitTask(const QxRuntimeTaskRequest *request)
 	Relation	eventrel;
 	Relation	tracerel;
 	Relation	checkpointrel;
+	Relation	queueledgerrel;
+	Relation	leaseledgerrel;
+	Relation	heartbeatledgerrel;
 	Oid			taskoid;
 	Oid			attemptoid;
 	Oid			stepoid;
 	Oid			checkpointoid;
+	Oid			queueoid;
+	Oid			leaseoid;
 	const char *selected_contract;
 	char	   *payload;
 	char	   *checkpoint_data;
+	char	   *agent_name;
+	QxSchedulerTaskEnvelope scheduler_envelope;
+	QxSchedulerQueueSnapshot *queue_snapshot;
+	QxSchedulerLeaseSnapshot *lease_snapshot;
+	QxSchedulerHeartbeatSnapshot *heartbeat_snapshot;
+	QxSchedulerLeaseSnapshot *released_lease_snapshot;
+	QxSchedulerHeartbeatSnapshot *final_heartbeat_snapshot;
 	QxExternalToolResult tool_result;
+	QxSemanticExecutionMetadata semantic_meta;
+
+	qx_runtime_ensure_startup_recovery_scan(request->ownerid);
 
 	taskrel = table_open(QxTaskRelationId, RowExclusiveLock);
 	attemptrel = table_open(QxAttemptRelationId, RowExclusiveLock);
@@ -2233,6 +6029,9 @@ QxRuntimeSubmitTask(const QxRuntimeTaskRequest *request)
 	eventrel = table_open(QxEventRelationId, RowExclusiveLock);
 	tracerel = table_open(QxTraceRelationId, RowExclusiveLock);
 	checkpointrel = table_open(QxCheckpointRelationId, RowExclusiveLock);
+	queueledgerrel = table_open(QxSchedulerQueueRelationId, RowExclusiveLock);
+	leaseledgerrel = table_open(QxSchedulerLeaseRelationId, RowExclusiveLock);
+	heartbeatledgerrel = table_open(QxSchedulerHeartbeatRelationId, RowExclusiveLock);
 
 	taskoid = qx_runtime_insert_task(taskrel, request);
 	CommandCounterIncrement();
@@ -2247,13 +6046,49 @@ QxRuntimeSubmitTask(const QxRuntimeTaskRequest *request)
 								   "initial");
 	CommandCounterIncrement();
 
+	selected_contract = request->authorized_tools != NIL ?
+		strVal((Node *) linitial(request->authorized_tools)) : NULL;
+	agent_name = qx_fetch_agent_name(request->agentoid);
+	qx_scheduler_fill_envelope(&scheduler_envelope,
+							   request->ownerid,
+							   request->sessionoid,
+							   request->agentoid,
+							   request->identityoid,
+							   request->namespace_policy_oid,
+							   taskoid,
+							   attemptoid,
+							   request->task_name,
+							   agent_name,
+							   request->identity_name,
+							   request->namespace_policy_name,
+							   request->priority,
+							   "stage8.after_capture",
+							   NULL,
+							   false,
+							   true,
+							   false,
+							   request->budget_tokens,
+							   request->budget_cost,
+							   request->estimated_tokens,
+							   request->estimated_cost,
+							   0,
+							   selected_contract);
+	pfree(agent_name);
+	queue_snapshot = QxSchedulerQueueSnapshotFromEnvelope(&scheduler_envelope);
+	queueoid = qx_insert_scheduler_queue(queueledgerrel, queue_snapshot);
+	CommandCounterIncrement();
+
 	payload = psprintf("goal=%s;priority=%s",
 					   request->goal,
-					   request->priority != NULL ? request->priority : "normal");
+					   qx_effective_priority_name(request->priority));
+	payload = qx_runtime_append_recovery_payload(payload);
+	payload = qx_scheduler_append_runtime_payload(payload,
+												  &scheduler_envelope,
+												  false);
 	(void) qx_insert_event(eventrel, request->sessionoid, taskoid, InvalidOid,
-						   request->ownerid, "TASK_QUEUED", payload);
+						   request->ownerid, NULL, "TASK_QUEUED", payload);
 	(void) qx_insert_trace(tracerel, request->sessionoid, taskoid, InvalidOid,
-						   request->ownerid, "runtime.queue", payload);
+						   request->ownerid, NULL, "runtime.queue", payload);
 	pfree(payload);
 
 	qx_update_task_runtime(taskrel, taskoid, QX_TASK_STATE_RUNNING,
@@ -2261,7 +6096,7 @@ QxRuntimeSubmitTask(const QxRuntimeTaskRequest *request)
 
 	stepoid = qx_insert_step(steprel, request->sessionoid, taskoid, 1,
 							 "stage8.scheduler_admit",
-							 "Embedded scheduler admitted attempt 1 into runtime");
+							 "Stage 26 scheduler contract admitted attempt 1 into the embedded runtime");
 	qx_charge_task_budget(taskrel, taskoid, 16, 17, "scheduler_admit");
 	payload = psprintf("attempt_opened;state=%c;identity=%s;namespace_policy=%s;tools=%d;budget_cost=%d;budget_tokens=%d",
 					   QX_TASK_STATE_RUNNING,
@@ -2270,10 +6105,23 @@ QxRuntimeSubmitTask(const QxRuntimeTaskRequest *request)
 					   list_length(request->authorized_tools),
 					   request->budget_cost,
 					   request->budget_tokens);
+	payload = qx_runtime_append_recovery_payload(payload);
+	payload = qx_scheduler_append_runtime_payload(payload,
+												  &scheduler_envelope,
+												  true);
+	lease_snapshot = QxSchedulerLeaseSnapshotFromEnvelope(&scheduler_envelope,
+														 InvalidOid,
+														 "embedded-runtime");
+	leaseoid = qx_insert_scheduler_lease(leaseledgerrel, queueoid,
+										 lease_snapshot);
+	heartbeat_snapshot = QxSchedulerHeartbeatSnapshotFromLease(lease_snapshot);
+	(void) qx_insert_scheduler_heartbeat(heartbeatledgerrel, leaseoid,
+										 heartbeat_snapshot);
+	CommandCounterIncrement();
 	(void) qx_insert_event(eventrel, request->sessionoid, taskoid, stepoid,
-						   request->ownerid, "TASK_DISPATCHED", payload);
+						   request->ownerid, NULL, "TASK_DISPATCHED", payload);
 	(void) qx_insert_trace(tracerel, request->sessionoid, taskoid, stepoid,
-						   request->ownerid, "runtime.dispatch", payload);
+						   request->ownerid, NULL, "runtime.dispatch", payload);
 	pfree(payload);
 
 	stepoid = qx_insert_step(steprel, request->sessionoid, taskoid, 2,
@@ -2285,19 +6133,20 @@ QxRuntimeSubmitTask(const QxRuntimeTaskRequest *request)
 					   request->authorized_tool_tokens,
 					   request->authorized_tool_cost);
 	(void) qx_insert_event(eventrel, request->sessionoid, taskoid, stepoid,
-						   request->ownerid, "TASK_TOOLS_AUTHORIZED", payload);
+						   request->ownerid, NULL, "TASK_TOOLS_AUTHORIZED",
+						   payload);
 	(void) qx_insert_trace(tracerel, request->sessionoid, taskoid, stepoid,
-						   request->ownerid, "runtime.authorize_tools", payload);
+						   request->ownerid, NULL, "runtime.authorize_tools",
+						   payload);
 	pfree(payload);
 
 	stepoid = qx_insert_step(steprel, request->sessionoid, taskoid, 3,
 							 "stage16.external_submit",
 							 "Attempt 1 executed the selected tool through its principal program");
-	selected_contract = request->authorized_tools != NIL ?
-		strVal((Node *) linitial(request->authorized_tools)) : NULL;
 	qx_execute_tool_contract(selected_contract, "submit", taskoid,
 							 request->goal, request->input != NULL,
 							 &tool_result);
+	qx_build_semantic_execution_metadata(&semantic_meta, &tool_result);
 	qx_charge_task_budget(taskrel, taskoid,
 						  tool_result.token_charge,
 						  tool_result.cost_charge,
@@ -2323,9 +6172,11 @@ QxRuntimeSubmitTask(const QxRuntimeTaskRequest *request)
 					   tool_result.cost_charge,
 					   tool_result.detail != NULL ? tool_result.detail : "<none>");
 	(void) qx_insert_event(eventrel, request->sessionoid, taskoid, stepoid,
-						   request->ownerid, "TASK_TOOL_EXECUTED", payload);
+						   request->ownerid, &semantic_meta,
+						   "TASK_TOOL_EXECUTED", payload);
 	(void) qx_insert_trace(tracerel, request->sessionoid, taskoid, stepoid,
-						   request->ownerid, "runtime.external_submit", payload);
+						   request->ownerid, &semantic_meta,
+						   "runtime.external_submit", payload);
 	pfree(payload);
 
 	stepoid = qx_insert_step(steprel, request->sessionoid, taskoid, 4,
@@ -2339,9 +6190,11 @@ QxRuntimeSubmitTask(const QxRuntimeTaskRequest *request)
 					   request->input != NULL ? "true" : "false",
 					   request->task_name != NULL ? request->task_name : "<anonymous>");
 	(void) qx_insert_event(eventrel, request->sessionoid, taskoid, stepoid,
-						   request->ownerid, "TASK_INPUT_CAPTURED", payload);
+						   request->ownerid, NULL, "TASK_INPUT_CAPTURED",
+						   payload);
 	(void) qx_insert_trace(tracerel, request->sessionoid, taskoid, stepoid,
-						   request->ownerid, "runtime.capture_input", payload);
+						   request->ownerid, NULL, "runtime.capture_input",
+						   payload);
 	pfree(payload);
 
 	stepoid = qx_insert_step(steprel, request->sessionoid, taskoid, 5,
@@ -2351,9 +6204,11 @@ QxRuntimeSubmitTask(const QxRuntimeTaskRequest *request)
 	payload = psprintf("checkpoint=stage8.after_capture;task_state=%c",
 					   QX_TASK_STATE_CHECKPOINTED);
 	(void) qx_insert_event(eventrel, request->sessionoid, taskoid, stepoid,
-						   request->ownerid, "TASK_CHECKPOINTED", payload);
+						   request->ownerid, &semantic_meta,
+						   "TASK_CHECKPOINTED", payload);
 	(void) qx_insert_trace(tracerel, request->sessionoid, taskoid, stepoid,
-						   request->ownerid, "runtime.checkpoint", payload);
+						   request->ownerid, &semantic_meta,
+						   "runtime.checkpoint", payload);
 
 	checkpoint_data = psprintf("task=%u;attempt=%u;session=%u;next_step=%d",
 							   taskoid, attemptoid, request->sessionoid, 6);
@@ -2363,6 +6218,7 @@ QxRuntimeSubmitTask(const QxRuntimeTaskRequest *request)
 										 attemptoid,
 										 stepoid,
 										 request->ownerid,
+										 &semantic_meta,
 										 QX_TASK_STATE_CHECKPOINTED,
 										 6,
 										 "stage8.after_capture",
@@ -2372,15 +6228,29 @@ QxRuntimeSubmitTask(const QxRuntimeTaskRequest *request)
 	qx_update_attempt_state(attemptrel, attemptoid, QX_ATTEMPT_STATE_CHECKPOINTED);
 	qx_update_task_runtime(taskrel, taskoid, QX_TASK_STATE_CHECKPOINTED,
 						   attemptoid, true, checkpointoid, true);
+	released_lease_snapshot = QxSchedulerReleaseLeaseSnapshot(lease_snapshot,
+															 false);
+	leaseoid = qx_insert_scheduler_lease(leaseledgerrel, queueoid,
+										 released_lease_snapshot);
+	final_heartbeat_snapshot =
+		QxSchedulerFinalizeHeartbeatSnapshot(released_lease_snapshot,
+											 "scheduler-release");
+	(void) qx_insert_scheduler_heartbeat(heartbeatledgerrel, leaseoid,
+										 final_heartbeat_snapshot);
+	CommandCounterIncrement();
 
 	(void) qx_insert_event(eventrel, request->sessionoid, taskoid, InvalidOid,
-						   request->ownerid, "TASK_READY_FOR_RESUME", payload);
+						   request->ownerid, NULL,
+						   "TASK_READY_FOR_RESUME", payload);
 	(void) qx_insert_trace(tracerel, request->sessionoid, taskoid, InvalidOid,
-						   request->ownerid, "runtime.pause",
+						   request->ownerid, NULL, "runtime.pause",
 						   "Task paused at durable checkpoint and awaits RESUME TASK");
 	pfree(payload);
 	qx_free_external_result(&tool_result);
 
+	table_close(heartbeatledgerrel, RowExclusiveLock);
+	table_close(leaseledgerrel, RowExclusiveLock);
+	table_close(queueledgerrel, RowExclusiveLock);
 	table_close(checkpointrel, RowExclusiveLock);
 	table_close(tracerel, RowExclusiveLock);
 	table_close(eventrel, RowExclusiveLock);
@@ -2400,13 +6270,16 @@ QxRuntimeResumeTask(Oid taskoid, const char *checkpoint_label, Oid ownerid)
 	Relation	eventrel;
 	Relation	tracerel;
 	Relation	checkpointrel;
-	HeapTuple	tasktup;
-	Form_pg_qx_task taskform;
-	HeapTuple	checkpointtup;
-	Form_pg_qx_checkpoint checkpointform;
+	Relation	queueledgerrel;
+	Relation	leaseledgerrel;
+	Relation	heartbeatledgerrel;
+	QxCatalogTaskInfo task;
+	QxCatalogCheckpointInfo checkpoint;
 	Oid			attemptoid;
 	Oid			stepoid;
 	Oid			finalcheckpointoid;
+	Oid			queueoid;
+	Oid			leaseoid;
 	int16		nextattemptseqno;
 	int16		resume_stepseqno;
 	List	   *authorized_contracts;
@@ -2416,61 +6289,60 @@ QxRuntimeResumeTask(Oid taskoid, const char *checkpoint_label, Oid ownerid)
 	char	   *checkpoint_data;
 	char	   *goal_text;
 	bool		input_present;
+	QxSchedulerTaskEnvelope scheduler_envelope;
+	QxSchedulerQueueSnapshot *queue_snapshot;
+	QxSchedulerLeaseSnapshot *lease_snapshot;
+	QxSchedulerHeartbeatSnapshot *heartbeat_snapshot;
+	QxSchedulerLeaseSnapshot *released_lease_snapshot;
+	QxSchedulerHeartbeatSnapshot *final_heartbeat_snapshot;
 	QxExternalToolResult tool_result;
+	QxSemanticExecutionMetadata semantic_meta;
 
-	tasktup = SearchSysCache1(QXTASKOID, ObjectIdGetDatum(taskoid));
-	if (!HeapTupleIsValid(tasktup))
+	if (!QxCatalogLookupTaskByOid(taskoid, &task))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("task %u does not exist", taskoid)));
 
-	taskform = (Form_pg_qx_task) GETSTRUCT(tasktup);
-
-	if (!has_privs_of_role(ownerid, taskform->qxtaskowner))
+	if (!has_privs_of_role(ownerid, task.ownerid))
 	{
-		ReleaseSysCache(tasktup);
+		QxCatalogFreeTaskInfo(&task);
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("permission denied to resume task %u", taskoid),
 				 errdetail("Only the task owner or a member of that role may resume the task.")));
 	}
 
-	if (taskform->qxtaskstate != QX_TASK_STATE_CHECKPOINTED)
+	if (task.state != QX_TASK_STATE_CHECKPOINTED)
 	{
-		ReleaseSysCache(tasktup);
+		QxCatalogFreeTaskInfo(&task);
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("task %u is not resumable", taskoid),
 				 errdetail("RESUME TASK only accepts tasks in checkpointed state.")));
 	}
 
-	if (!OidIsValid(taskform->qxtasklastcheckpointid))
+	if (!OidIsValid(task.lastcheckpointid))
 	{
-		ReleaseSysCache(tasktup);
+		QxCatalogFreeTaskInfo(&task);
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("task %u has no checkpoint to resume from", taskoid)));
 	}
 
-	checkpointtup = SearchSysCache1(QXCHECKPOINTOID,
-									ObjectIdGetDatum(taskform->qxtasklastcheckpointid));
-	if (!HeapTupleIsValid(checkpointtup))
+	if (!QxCatalogLookupCheckpointByOid(task.lastcheckpointid, &checkpoint))
 	{
-		ReleaseSysCache(tasktup);
+		QxCatalogFreeTaskInfo(&task);
 		elog(ERROR, "cache lookup failed for QhapaqXian checkpoint %u",
-			 taskform->qxtasklastcheckpointid);
+			 task.lastcheckpointid);
 	}
 
-	checkpointform = (Form_pg_qx_checkpoint) GETSTRUCT(checkpointtup);
-	stored_label = qx_fetch_checkpoint_label(checkpointtup);
+	stored_label = checkpoint.label;
 
 	if (checkpoint_label != NULL &&
 		(stored_label == NULL || strcmp(checkpoint_label, stored_label) != 0))
 	{
-		if (stored_label != NULL)
-			pfree(stored_label);
-		ReleaseSysCache(checkpointtup);
-		ReleaseSysCache(tasktup);
+		QxCatalogFreeCheckpointInfo(&checkpoint);
+		QxCatalogFreeTaskInfo(&task);
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("checkpoint label \"%s\" does not match the current resumable checkpoint for task %u",
@@ -2478,9 +6350,9 @@ QxRuntimeResumeTask(Oid taskoid, const char *checkpoint_label, Oid ownerid)
 	}
 
 	nextattemptseqno = 1;
-	if (OidIsValid(taskform->qxtasklastattemptid))
-		nextattemptseqno = qx_fetch_attempt_seqno(taskform->qxtasklastattemptid) + 1;
-	resume_stepseqno = checkpointform->qxcheckpointnextstepseqno;
+	if (OidIsValid(task.lastattemptid))
+		nextattemptseqno = qx_fetch_attempt_seqno(task.lastattemptid) + 1;
+	resume_stepseqno = checkpoint.next_step_seqno;
 	if (resume_stepseqno <= 0)
 	{
 		ereport(ERROR,
@@ -2490,18 +6362,23 @@ QxRuntimeResumeTask(Oid taskoid, const char *checkpoint_label, Oid ownerid)
 				 errdetail("The checkpoint does not advertise a valid next step sequence.")));
 	}
 
+	qx_runtime_ensure_startup_recovery_scan(ownerid);
+
 	taskrel = table_open(QxTaskRelationId, RowExclusiveLock);
 	attemptrel = table_open(QxAttemptRelationId, RowExclusiveLock);
 	steprel = table_open(QxStepRelationId, RowExclusiveLock);
 	eventrel = table_open(QxEventRelationId, RowExclusiveLock);
 	tracerel = table_open(QxTraceRelationId, RowExclusiveLock);
 	checkpointrel = table_open(QxCheckpointRelationId, RowExclusiveLock);
+	queueledgerrel = table_open(QxSchedulerQueueRelationId, RowExclusiveLock);
+	leaseledgerrel = table_open(QxSchedulerLeaseRelationId, RowExclusiveLock);
+	heartbeatledgerrel = table_open(QxSchedulerHeartbeatRelationId, RowExclusiveLock);
 
 	attemptoid = qx_insert_attempt(attemptrel,
-								   taskform->qxtasksessionid,
+								   task.sessionoid,
 								   taskoid,
 								   ownerid,
-								   checkpointform->oid,
+								   checkpoint.oid,
 								   nextattemptseqno,
 								   QX_ATTEMPT_STATE_RUNNING,
 								   "resume");
@@ -2510,23 +6387,54 @@ QxRuntimeResumeTask(Oid taskoid, const char *checkpoint_label, Oid ownerid)
 	qx_update_task_runtime(taskrel, taskoid, QX_TASK_STATE_RUNNING,
 						   attemptoid, true, InvalidOid, false);
 
-	authorized_contracts = qx_fetch_task_authorized_contracts(tasktup);
+	authorized_contracts = qx_parse_task_authorized_contracts(task.authorized_tools);
 	selected_contract = authorized_contracts != NIL ?
 		strVal((Node *) llast(authorized_contracts)) : NULL;
-	goal_text = qx_fetch_task_goal(tasktup);
-	input_present = qx_task_input_present(tasktup);
+	goal_text = task.goal != NULL ? pstrdup(task.goal) : NULL;
+	input_present = task.input != NULL;
+	qx_scheduler_fill_envelope(&scheduler_envelope,
+							   ownerid,
+							   task.sessionoid,
+							   task.agentoid,
+							   task.identityoid,
+							   task.namespacepolicyoid,
+							   taskoid,
+							   attemptoid,
+							   task.name,
+							   task.agent_name,
+							   task.identity_name,
+							   task.policy_name,
+							   task.priority,
+							   "stage8.final",
+							   stored_label,
+							   false,
+							   true,
+							   true,
+							   task.budget_tokens,
+							   task.budget_cost,
+							   task.estimated_tokens,
+							   task.estimated_cost,
+							   nextattemptseqno - 1,
+							   selected_contract);
 	memset(&tool_result, 0, sizeof(tool_result));
+	queue_snapshot = QxSchedulerQueueSnapshotFromEnvelope(&scheduler_envelope);
+	queueoid = qx_insert_scheduler_queue(queueledgerrel, queue_snapshot);
+	CommandCounterIncrement();
 
 	payload = psprintf("checkpoint=%s;resume_requested;next_step=%d",
 					   stored_label != NULL ? stored_label : "<unnamed>",
-					   checkpointform->qxcheckpointnextstepseqno);
-	(void) qx_insert_event(eventrel, taskform->qxtasksessionid, taskoid,
-						   InvalidOid, ownerid, "TASK_RESUMED", payload);
-	(void) qx_insert_trace(tracerel, taskform->qxtasksessionid, taskoid,
-						   InvalidOid, ownerid, "runtime.resume", payload);
+					   checkpoint.next_step_seqno);
+	payload = qx_runtime_append_recovery_payload(payload);
+	payload = qx_scheduler_append_runtime_payload(payload,
+												  &scheduler_envelope,
+												  false);
+	(void) qx_insert_event(eventrel, task.sessionoid, taskoid,
+						   InvalidOid, ownerid, NULL, "TASK_RESUMED", payload);
+	(void) qx_insert_trace(tracerel, task.sessionoid, taskoid,
+						   InvalidOid, ownerid, NULL, "runtime.resume", payload);
 	pfree(payload);
 
-	stepoid = qx_insert_step(steprel, taskform->qxtasksessionid, taskoid,
+	stepoid = qx_insert_step(steprel, task.sessionoid, taskoid,
 							 resume_stepseqno,
 							 "stage8.resume_dispatch",
 							 "Attempt 2 resumed execution from the last durable checkpoint");
@@ -2534,18 +6442,34 @@ QxRuntimeResumeTask(Oid taskoid, const char *checkpoint_label, Oid ownerid)
 	payload = psprintf("resume_from=%s;state=%c",
 					   stored_label != NULL ? stored_label : "<unnamed>",
 					   QX_TASK_STATE_RUNNING);
-	(void) qx_insert_event(eventrel, taskform->qxtasksessionid, taskoid,
-						   stepoid, ownerid, "TASK_RESUME_DISPATCHED", payload);
-	(void) qx_insert_trace(tracerel, taskform->qxtasksessionid, taskoid,
-						   stepoid, ownerid, "runtime.resume_dispatch", payload);
+	payload = qx_runtime_append_recovery_payload(payload);
+	payload = qx_scheduler_append_runtime_payload(payload,
+												  &scheduler_envelope,
+												  true);
+	lease_snapshot = QxSchedulerLeaseSnapshotFromEnvelope(&scheduler_envelope,
+														 InvalidOid,
+														 "embedded-runtime");
+	leaseoid = qx_insert_scheduler_lease(leaseledgerrel, queueoid,
+										 lease_snapshot);
+	heartbeat_snapshot = QxSchedulerHeartbeatSnapshotFromLease(lease_snapshot);
+	(void) qx_insert_scheduler_heartbeat(heartbeatledgerrel, leaseoid,
+										 heartbeat_snapshot);
+	CommandCounterIncrement();
+	(void) qx_insert_event(eventrel, task.sessionoid, taskoid,
+						   stepoid, ownerid, NULL, "TASK_RESUME_DISPATCHED",
+						   payload);
+	(void) qx_insert_trace(tracerel, task.sessionoid, taskoid,
+						   stepoid, ownerid, NULL, "runtime.resume_dispatch",
+						   payload);
 	pfree(payload);
 
-	stepoid = qx_insert_step(steprel, taskform->qxtasksessionid, taskoid,
+	stepoid = qx_insert_step(steprel, task.sessionoid, taskoid,
 							 resume_stepseqno + 1,
 							 "stage16.external_resume",
 							 "Attempt 2 executed the selected tool through its principal program");
 	qx_execute_tool_contract(selected_contract, "resume", taskoid,
 							 goal_text, input_present, &tool_result);
+	qx_build_semantic_execution_metadata(&semantic_meta, &tool_result);
 	qx_charge_task_budget(taskrel, taskoid,
 						  tool_result.token_charge,
 						  tool_result.cost_charge,
@@ -2570,32 +6494,37 @@ QxRuntimeResumeTask(Oid taskoid, const char *checkpoint_label, Oid ownerid)
 					   tool_result.token_charge,
 					   tool_result.cost_charge,
 					   tool_result.detail != NULL ? tool_result.detail : "<none>");
-	(void) qx_insert_event(eventrel, taskform->qxtasksessionid, taskoid,
-						   stepoid, ownerid, "TASK_TOOL_EXECUTED", payload);
-	(void) qx_insert_trace(tracerel, taskform->qxtasksessionid, taskoid,
-						   stepoid, ownerid, "runtime.external_resume", payload);
+	(void) qx_insert_event(eventrel, task.sessionoid, taskoid,
+						   stepoid, ownerid, &semantic_meta,
+						   "TASK_TOOL_EXECUTED", payload);
+	(void) qx_insert_trace(tracerel, task.sessionoid, taskoid,
+						   stepoid, ownerid, &semantic_meta,
+						   "runtime.external_resume", payload);
 	pfree(payload);
 
-	stepoid = qx_insert_step(steprel, taskform->qxtasksessionid, taskoid,
+	stepoid = qx_insert_step(steprel, task.sessionoid, taskoid,
 							 resume_stepseqno + 2,
 							 "stage8.complete",
 							 "Attempt 2 completed the task after resuming");
 	qx_charge_task_budget(taskrel, taskoid, 4, 11, "final_checkpoint");
 	payload = psprintf("checkpoint=stage8.final;task_state=%c",
 					   QX_TASK_STATE_COMPLETED);
-	(void) qx_insert_event(eventrel, taskform->qxtasksessionid, taskoid,
-						   stepoid, ownerid, "TASK_CHECKPOINTED", payload);
-	(void) qx_insert_trace(tracerel, taskform->qxtasksessionid, taskoid,
-						   stepoid, ownerid, "runtime.final_checkpoint", payload);
+	(void) qx_insert_event(eventrel, task.sessionoid, taskoid,
+						   stepoid, ownerid, &semantic_meta,
+						   "TASK_CHECKPOINTED", payload);
+	(void) qx_insert_trace(tracerel, task.sessionoid, taskoid,
+						   stepoid, ownerid, &semantic_meta,
+						   "runtime.final_checkpoint", payload);
 
 	checkpoint_data = psprintf("task=%u;attempt=%u;session=%u;next_step=%d",
-							   taskoid, attemptoid, taskform->qxtasksessionid, 0);
+							   taskoid, attemptoid, task.sessionoid, 0);
 	finalcheckpointoid = qx_insert_checkpoint(checkpointrel,
-											  taskform->qxtasksessionid,
+											  task.sessionoid,
 											  taskoid,
 											  attemptoid,
 											  stepoid,
 											  ownerid,
+											  &semantic_meta,
 											  QX_TASK_STATE_COMPLETED,
 											  0,
 											  "stage8.final",
@@ -2605,11 +6534,23 @@ QxRuntimeResumeTask(Oid taskoid, const char *checkpoint_label, Oid ownerid)
 	qx_update_attempt_state(attemptrel, attemptoid, QX_ATTEMPT_STATE_COMPLETED);
 	qx_update_task_runtime(taskrel, taskoid, QX_TASK_STATE_COMPLETED,
 						   attemptoid, true, finalcheckpointoid, true);
+	released_lease_snapshot = QxSchedulerReleaseLeaseSnapshot(lease_snapshot,
+															 false);
+	leaseoid = qx_insert_scheduler_lease(leaseledgerrel, queueoid,
+										 released_lease_snapshot);
+	final_heartbeat_snapshot =
+		QxSchedulerFinalizeHeartbeatSnapshot(released_lease_snapshot,
+											 "scheduler-release");
+	(void) qx_insert_scheduler_heartbeat(heartbeatledgerrel, leaseoid,
+										 final_heartbeat_snapshot);
+	CommandCounterIncrement();
 
-	(void) qx_insert_event(eventrel, taskform->qxtasksessionid, taskoid,
-						   InvalidOid, ownerid, "TASK_COMPLETED", payload);
-	(void) qx_insert_trace(tracerel, taskform->qxtasksessionid, taskoid,
-						   InvalidOid, ownerid, "runtime.complete",
+	(void) qx_insert_event(eventrel, task.sessionoid, taskoid,
+						   InvalidOid, ownerid, &semantic_meta,
+						   "TASK_COMPLETED", payload);
+	(void) qx_insert_trace(tracerel, task.sessionoid, taskoid,
+						   InvalidOid, ownerid, &semantic_meta,
+						   "runtime.complete",
 						   "Task completed after resumable attempt handoff");
 	pfree(payload);
 	if (goal_text != NULL)
@@ -2617,12 +6558,11 @@ QxRuntimeResumeTask(Oid taskoid, const char *checkpoint_label, Oid ownerid)
 	if (authorized_contracts != NIL)
 		list_free_deep(authorized_contracts);
 	qx_free_external_result(&tool_result);
-
-	if (stored_label != NULL)
-		pfree(stored_label);
-
-	ReleaseSysCache(checkpointtup);
-	ReleaseSysCache(tasktup);
+	QxCatalogFreeCheckpointInfo(&checkpoint);
+	QxCatalogFreeTaskInfo(&task);
+	table_close(heartbeatledgerrel, RowExclusiveLock);
+	table_close(leaseledgerrel, RowExclusiveLock);
+	table_close(queueledgerrel, RowExclusiveLock);
 	table_close(checkpointrel, RowExclusiveLock);
 	table_close(tracerel, RowExclusiveLock);
 	table_close(eventrel, RowExclusiveLock);

@@ -2,4 +2,6 @@
 
 backend_sources += files(
   'qx_runtime.c',
+  'qx_container_backend.c',
+  'qx_microvm_backend.c',
 )

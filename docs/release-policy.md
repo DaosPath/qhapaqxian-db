@@ -1,5 +1,7 @@
 # Release Policy
 
+This file owns versioning, compatibility, and release-shape policy only. Operational publishability lives in `docs/release-bootstrap.md`; test gating lives in `docs/testing-bootstrap.md`.
+
 Initial release shape:
 - `alpha`: upstream import + bootstrap docs + CI + subsystem scaffold
 - `beta`: parser/catalog/runtime vertical slice
@@ -13,3 +15,5 @@ Versioning rule:
 Compatibility rule:
 - preserve PostgreSQL SQL and protocol compatibility where agent semantics are not involved
 - document every intentional incompatibility
+- release notes must state which real backend lanes were validated: Docker,
+  QEMU/TCG, and QEMU/KVM when available

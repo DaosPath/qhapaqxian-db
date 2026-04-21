@@ -21,6 +21,8 @@ Short summary:
 - product identity is QhapaqXian DB, not PostgreSQL as a product name
 - staged implementation work is tracked in `STATUS.md`, not duplicated here
 - the documentation tree is mapped in `docs/README.md`
+- real container/microVM backend setup and validation live in
+  `docs/real-runtime-backends.md`
 - stage 2 language contract and stage 4 engine-catalog docs now exist to close the historical bootstrap-doc gap
 
 What this repository is:
