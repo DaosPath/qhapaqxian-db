@@ -80,6 +80,50 @@ ALTER PRINCIPAL public.search_runner
   VERSION 'v1'
   POLICY loopback_attest;
 
+CREATE PROVIDER public.bad_partial_attestation_provider
+  KIND 'container'
+  ENDPOINT 'container://bad/partial'
+  USING 'ed25519'
+  RECEIPT KEY $$-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEATQR0xvmOgsHyUp6bWkQ7xlKHg40piOubNdB+Ew80TOs=
+-----END PUBLIC KEY-----$$
+  ATTESTATION PROFILE 'container.partial'
+  VERSION 'v1'
+  ATTESTATION ENABLE;
+
+CREATE PROVIDER public.bad_missing_attestation_provider
+  KIND 'microvm'
+  ENDPOINT 'microvm://bad/missing'
+  USING 'ed25519'
+  RECEIPT KEY $$-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEATQR0xvmOgsHyUp6bWkQ7xlKHg40piOubNdB+Ew80TOs=
+-----END PUBLIC KEY-----$$;
+
+CREATE PRINCIPAL public.bad_attestation_runner
+  PROGRAM 'qhapaqxian-tool-runner'
+  SANDBOX 'isolated'
+  RUNTIME 'microvm'
+  PROVIDER public.microvm_provider
+  SIGNER 'qx_remote_ed25519_private.pem'
+  ATTESTATION PROFILE 'container.broker'
+  VERSION 'v1'
+  POLICY microvm_attest;
+
+BEGIN;
+CREATE PRINCIPAL public.inherited_container_runner
+  PROGRAM 'qhapaqxian-tool-runner'
+  SANDBOX 'isolated'
+  RUNTIME 'container'
+  PROVIDER public.container_provider
+  SIGNER 'qx_remote_ed25519_private.pem';
+
+SELECT qxprincipalattestationprofile::text = 'container.broker' AS inherited_profile,
+       qxprincipalattestationversion::text = 'v1' AS inherited_version,
+       qxprincipalattestationpolicy::text = 'container_attest' AS inherited_policy
+FROM pg_qx_principal
+WHERE qxprincipalname = 'inherited_container_runner';
+ROLLBACK;
+
 CREATE TOOL public.extract
   HANDLER 'builtin.extract'
   SANDBOX 'isolated'
@@ -1072,6 +1116,46 @@ SELECT 'urgent'::text AS task_bucket,
 FROM pg_qx_attempt
 WHERE qxattempttaskid = :qx_fair_urgent_task_oid
 ORDER BY task_bucket, qxattemptseqno;
+
+SELECT pg_qx_test_start_exhausted_retry_task(:qx_container_session_oid) AS qx_deadletter_task_oid \gset
+
+SELECT pg_sleep(6);
+
+SELECT qxtaskstate AS deadletter_state,
+       qxtasklastcheckpointid = 0 AS no_checkpoint,
+       EXISTS (
+         SELECT 1
+         FROM pg_qx_attempt
+         WHERE qxattempttaskid = :qx_deadletter_task_oid
+           AND qxattemptseqno = 1
+           AND qxattemptstate = 'f'
+       ) AS failed_attempt_recorded,
+       EXISTS (
+         SELECT 1
+         FROM pg_qx_trace
+         WHERE qxtracetaskid = :qx_deadletter_task_oid
+           AND qxtracename = 'runtime.dead_letter'
+       ) AS saw_dead_letter_trace,
+       NOT EXISTS (
+         SELECT 1
+         FROM pg_qx_trace
+         WHERE qxtracetaskid = :qx_deadletter_task_oid
+           AND qxtracename = 'runtime.retry_dispatch'
+       ) AS retry_dispatch_blocked
+FROM pg_qx_task
+WHERE oid = :qx_deadletter_task_oid;
+
+SELECT count(*) AS deadletter_queue_rows
+FROM pg_stat_qx_scheduler_ledger_queues
+WHERE task_oid = :qx_deadletter_task_oid
+  AND queue_kind = 3
+  AND runnable_count = 0
+  AND blocked_count = 1
+  AND retry_count = 3;
+
+SELECT task_state, has_checkpoint
+FROM pg_stat_qx_tasks
+WHERE task_oid = :qx_deadletter_task_oid;
 
 CREATE ROLE qx_observer LOGIN;
 

@@ -20,13 +20,16 @@ What landed:
 - runtime-owned scheduler bgworkers now append durable lease-renewal and
   `scheduler-renew` heartbeat snapshots, then reclaim and repair a stale
   checkpoint-backed running attempt before startup/failover hooks run.
+- stale no-checkpoint tasks now either re-enter through autonomous retry after
+  durable backoff or, when retry count reaches the max policy, move to a
+  durable dead-letter state with a blocked `MAINTENANCE` queue row.
 - completed tasks are not requeued solely because they still have older
   durable checkpoints.
 - failover rebuild can now be invoked through a runtime-owned internal hook
   that reuses the same real scheduler ledger write path as startup recovery.
 - `qx_stage3_agentic` now validates autonomous lease renewal, checkpoint-backed
-  reclaim repair, startup recovery, and failover rebuild through a fresh
-  backend with real scheduler ledger writes.
+  reclaim repair, no-checkpoint retry, retry dead-letter, startup recovery, and
+  failover rebuild through a fresh backend with real scheduler ledger writes.
 
 Recovery responsibilities defined by this stage:
 - reconstruct task state from `pg_qx_task`;
@@ -48,12 +51,14 @@ Crash/failover assumptions:
 - startup/failover recovery can now encounter work that an autonomous
   scheduler worker already renewed, reclaimed, and repaired back to
   `checkpointed`;
+- startup/failover recovery can also encounter no-checkpoint work that was
+  already repaired into queued retry state or failed closed into dead-letter
+  by the scheduler;
 - recovery still does not replay semantic logs by itself.
 
 Integration points to come:
-- extend startup/failover recovery from checkpoint-backed repair into broader
-  task/attempt state transitions for non-checkpointed or externally failed
-  work;
+- extend startup/failover recovery from the current checkpoint/retry/dead-letter
+  transitions into externally failed work and richer semantic replay;
 - semantic replication should eventually feed a richer replay path into the
   failover rebuild hook set;
 - observability should later expose the recovery report so operators can see
@@ -64,12 +69,13 @@ Known gaps:
   entrypoints;
 - the scanner is catalog-driven only and still assumes the catalogs are the
   authoritative reconstruction source;
-- repeated startup/failover passes can still append additional recovery queue
-  snapshots for already repaired work until broader dedupe policy lands.
+- recovery dedupe is still ledger-local and should grow richer semantic
+  idempotence once replay enters the path.
 
 Validation plan:
 - keep `qx_stage3_agentic` as the real-backend recovery regression for
   autonomous lease renewal, startup checkpoint requeue, checkpoint-backed
-  stale-running reclaim repair, and failover rebuild;
+  stale-running reclaim repair, no-checkpoint retry, max-retry dead-letter, and
+  failover rebuild;
 - add richer failover coverage once semantic replication replay grows a deeper
   orchestration path.

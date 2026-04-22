@@ -12221,5 +12221,9 @@
   proname => 'pg_qx_scheduler_owner_slot', provolatile => 'i',
   proparallel => 's', proisstrict => 't', prorettype => 'int4',
   proargtypes => 'oid', prosrc => 'pg_qx_scheduler_owner_slot' },
+{ oid => '9209', descr => 'internal QX exhausted retry task test hook',
+  proname => 'pg_qx_test_start_exhausted_retry_task', provolatile => 'v',
+  proparallel => 'u', proisstrict => 't', prorettype => 'oid',
+  proargtypes => 'oid', prosrc => 'pg_qx_test_start_exhausted_retry_task' },
 
 ]

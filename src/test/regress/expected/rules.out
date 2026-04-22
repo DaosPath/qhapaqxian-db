@@ -2491,6 +2491,7 @@ pg_stat_qx_scheduler_queues| WITH latest_queue AS (
                     WHEN 'r'::"char" THEN 'running'::text
                     WHEN 'k'::"char" THEN 'checkpointed'::text
                     WHEN 'c'::"char" THEN 'completed'::text
+                    WHEN 'f'::"char" THEN 'failed'::text
                     ELSE 'other'::text
                 END AS task_state,
             lq.queue_name,
@@ -2619,6 +2620,7 @@ pg_stat_qx_scheduler_worker_balance| WITH latest_queue AS (
                     WHEN 'r'::"char" THEN 'running'::text
                     WHEN 'k'::"char" THEN 'checkpointed'::text
                     WHEN 'c'::"char" THEN 'completed'::text
+                    WHEN 'f'::"char" THEN 'failed'::text
                     ELSE 'other'::text
                 END AS task_state,
             lq.queue_name,
@@ -2711,6 +2713,7 @@ pg_stat_qx_scheduler_workers| WITH latest_queue AS (
                     WHEN 'r'::"char" THEN 'running'::text
                     WHEN 'k'::"char" THEN 'checkpointed'::text
                     WHEN 'c'::"char" THEN 'completed'::text
+                    WHEN 'f'::"char" THEN 'failed'::text
                     ELSE 'other'::text
                 END AS task_state,
             ll.worker_name,
@@ -2793,6 +2796,7 @@ pg_stat_qx_tasks| SELECT t.oid AS task_oid,
             WHEN 'r'::"char" THEN 'running'::text
             WHEN 'k'::"char" THEN 'checkpointed'::text
             WHEN 'c'::"char" THEN 'completed'::text
+            WHEN 'f'::"char" THEN 'failed'::text
             ELSE 'unknown'::text
         END AS task_state,
     t.qxtaskbudgettokens AS budget_tokens,

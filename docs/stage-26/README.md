@@ -28,7 +28,12 @@ What landed:
 - a focused worker tick now renews held leases by appending durable lease and
   `scheduler-renew` heartbeat snapshots;
 - postmaster startup now registers a static scheduler launcher bgworker, and
-  that launcher spawns one dynamic scheduler worker per connectable database;
+  that launcher spawns a bounded slot set of dynamic scheduler workers per
+  connectable database;
+- scheduler worker slot count is configurable through
+  `QX_SCHEDULER_DB_WORKER_SLOTS` at postmaster startup, clamped to 1..8, with
+  default `2`; the launcher reconciles workers when the effective slot count
+  changes inside the postmaster environment;
 - pg_regress temp clusters constrain the autonomous launcher to the canonical
   `regression` database so scheduler workers do not hold connections to
   short-lived core-test databases such as `regression_utf8`;
@@ -38,6 +43,10 @@ What landed:
 - checkpoint-backed stale running attempts are now repaired in place by moving
   task and attempt state back to `checkpointed` before startup/failover hooks
   see them;
+- retry attempts that reach the max retry policy now fail closed into a durable
+  dead-letter state: the task becomes `failed`, the latest attempt remains
+  `failed`, a `MAINTENANCE` queue row with blocked work is appended, and
+  `runtime.dead_letter` / `TASK_DEAD_LETTERED` evidence is emitted;
 - the integrated real-backend regression now exercises both checkpointed-task
   startup requeue, autonomous lease renewal, checkpoint-backed stale-running
   reclaim repair, and failover rebuild against durable scheduler ledger rows;
@@ -77,16 +86,16 @@ Acceptance criteria for the scaffold:
 - the phase document says what is real and what is still deferred.
 
 Known gaps:
-- no worker assignment loop yet;
-- no queue fairness or preemption policy yet;
-- no multi-worker ownership, balancing, or contention model yet;
+- slot count is configurable, but not yet load-adaptive;
+- no queue preemption policy yet;
+- no distributed contention model beyond deterministic per-database ownership;
 - no dedicated scheduler stats collector or daemon-owned dashboard yet.
 
 Integration debt left for later phases:
 - teach recovery to consume the durable scheduler ledger directly;
-- extend the current autonomous renew/reclaim loop into fuller fairness,
-  duplicate-suppression, and broader failure lifecycle transitions;
+- extend the current autonomous renew/reclaim/retry/dead-letter loop into
+  fuller preemption and broader failure lifecycle transitions;
 - connect retries, heartbeats, and reclaims to richer worker-lane ownership
-  instead of a single embedded-runtime lane;
+  beyond the current per-database slot model;
 - move the current SQL rollups toward a dedicated scheduler-owned stats plane
   when the operator surface needs lower-latency or lower-cost reporting.

@@ -77,6 +77,7 @@
 #include <openssl/pem.h>
 #endif
 
+#include <errno.h>
 #include <sys/stat.h>
 
 #ifndef WIN32
@@ -171,6 +172,7 @@ typedef struct QxRuntimeSchedulerCycleStats
 	int32		leases_repaired;
 	int32		recovery_requeued;
 	int32		retry_dispatches;
+	int32		dead_lettered_tasks;
 	int32		heartbeats_written;
 	int32		last_retry_backoff_ms;
 	int32		max_retry_backoff_ms;
@@ -206,7 +208,10 @@ static QxRuntimeRecoverySnapshot qx_runtime_recovery_snapshot = {0};
 #define QX_MICROVM_TIMEOUT_FLOOR_MS 120000
 #define QX_SCHEDULER_LAUNCHER_NAPTIME_MS 3000
 #define QX_SCHEDULER_WORKER_NAPTIME_MS 1000
-#define QX_SCHEDULER_DB_WORKER_SLOTS 2
+#define QX_SCHEDULER_DB_WORKER_SLOTS_DEFAULT 2
+#define QX_SCHEDULER_DB_WORKER_SLOTS_MIN 1
+#define QX_SCHEDULER_DB_WORKER_SLOTS_MAX 8
+#define QX_SCHEDULER_MAX_RETRIES 3
 
 #ifndef USECS_PER_MSEC
 #define USECS_PER_MSEC 1000
@@ -387,6 +392,7 @@ static bool qx_runtime_latest_lease(
 	Oid *queueoid);
 static int32 qx_runtime_lease_ttl_ms(
 	const QxSchedulerLeaseSnapshot *snapshot);
+static int32 qx_runtime_scheduler_max_retries(void);
 static int32 qx_runtime_scheduler_slot_count(void);
 static int32 qx_runtime_scheduler_owner_slot(Oid taskoid, int32 slot_count);
 static bool qx_runtime_scheduler_worker_owns_task(Oid taskoid,
@@ -422,6 +428,7 @@ static void qx_runtime_scheduler_heartbeat_wait(uint32 *wait_event,
 												long timeout_ms);
 static Oid qx_runtime_test_start_uncheckpointed_task(Oid sessionoid,
 													 const char *priority);
+static Oid qx_runtime_test_start_exhausted_retry_task(Oid sessionoid);
 static void qx_runtime_run_scheduler_cycle(QxRuntimeSchedulerCycleStats *stats,
 										   int32 slot_index,
 										   int32 slot_count);
@@ -450,6 +457,17 @@ static bool qx_runtime_dispatch_retry_task(
 	Relation queueledgerrel,
 	Relation leaseledgerrel,
 	Relation heartbeatledgerrel,
+	const QxCatalogTaskInfo *task,
+	const QxCatalogAttemptInfo *failed_attempt,
+	const QxSchedulerQueueSnapshot *retry_queue,
+	const char *worker_name,
+	QxRuntimeSchedulerCycleStats *stats);
+static bool qx_runtime_dead_letter_retry_task(
+	Relation taskrel,
+	Relation attemptrel,
+	Relation eventrel,
+	Relation tracerel,
+	Relation queueledgerrel,
 	const QxCatalogTaskInfo *task,
 	const QxCatalogAttemptInfo *failed_attempt,
 	const QxSchedulerQueueSnapshot *retry_queue,
@@ -691,7 +709,7 @@ qx_scheduler_fill_envelope(QxSchedulerTaskEnvelope *envelope,
 	envelope->estimated_tokens = estimated_tokens;
 	envelope->estimated_cost = estimated_cost;
 	envelope->retry_count = retry_count;
-	envelope->max_retries = 3;
+	envelope->max_retries = qx_runtime_scheduler_max_retries();
 	envelope->queue_name = QxSchedulerBuildQueueKey(
 		envelope->namespace_policy_name,
 		envelope->priority,
@@ -4044,9 +4062,33 @@ qx_runtime_free_scheduler_queue_snapshot(QxSchedulerQueueSnapshot *snapshot)
 }
 
 static int32
+qx_runtime_scheduler_max_retries(void)
+{
+	return QX_SCHEDULER_MAX_RETRIES;
+}
+
+static int32
 qx_runtime_scheduler_slot_count(void)
 {
-	return QX_SCHEDULER_DB_WORKER_SLOTS;
+	const char *slot_env;
+	char	   *endptr;
+	long		slot_count;
+
+	slot_env = getenv("QX_SCHEDULER_DB_WORKER_SLOTS");
+	if (slot_env == NULL || slot_env[0] == '\0')
+		return QX_SCHEDULER_DB_WORKER_SLOTS_DEFAULT;
+
+	errno = 0;
+	slot_count = strtol(slot_env, &endptr, 10);
+	if (errno != 0 || endptr == slot_env || *endptr != '\0')
+		return QX_SCHEDULER_DB_WORKER_SLOTS_DEFAULT;
+
+	if (slot_count < QX_SCHEDULER_DB_WORKER_SLOTS_MIN)
+		return QX_SCHEDULER_DB_WORKER_SLOTS_MIN;
+	if (slot_count > QX_SCHEDULER_DB_WORKER_SLOTS_MAX)
+		return QX_SCHEDULER_DB_WORKER_SLOTS_MAX;
+
+	return (int32) slot_count;
 }
 
 static int32
@@ -4757,6 +4799,25 @@ qx_runtime_run_scheduler_retry_cycle(QxRuntimeSchedulerCycleStats *stats,
 					stats->last_retry_backoff_ms);
 		}
 
+		if (retry_queue.retry_count >= qx_runtime_scheduler_max_retries())
+		{
+			(void) qx_runtime_dead_letter_retry_task(taskrel,
+													 attemptrel,
+													 eventrel,
+													 tracerel,
+													 queueledgerrel,
+													 task,
+													 &failed_attempt,
+													 &retry_queue,
+													 MyBgworkerEntry != NULL ?
+													 MyBgworkerEntry->bgw_name :
+													 "qhapaqxian scheduler",
+													 stats);
+			qx_runtime_free_scheduler_queue_snapshot(&retry_queue);
+			QxCatalogFreeAttemptInfo(&failed_attempt);
+			continue;
+		}
+
 		if (!have_selected ||
 			qx_runtime_retry_candidate_better(task,
 											 &failed_attempt,
@@ -4817,6 +4878,71 @@ qx_runtime_run_scheduler_retry_cycle(QxRuntimeSchedulerCycleStats *stats,
 	table_close(attemptrel, RowExclusiveLock);
 	table_close(taskrel, RowExclusiveLock);
 	QxCatalogFreeTaskInfoList(tasks);
+}
+
+static bool
+qx_runtime_dead_letter_retry_task(Relation taskrel,
+								  Relation attemptrel,
+								  Relation eventrel,
+								  Relation tracerel,
+								  Relation queueledgerrel,
+								  const QxCatalogTaskInfo *task,
+								  const QxCatalogAttemptInfo *failed_attempt,
+								  const QxSchedulerQueueSnapshot *retry_queue,
+								  const char *worker_name,
+								  QxRuntimeSchedulerCycleStats *stats)
+{
+	QxSchedulerQueueSnapshot dead_queue;
+	TimestampTz	now;
+	char	   *payload;
+	Oid			queueoid;
+
+	Assert(task != NULL);
+	Assert(failed_attempt != NULL);
+	Assert(retry_queue != NULL);
+
+	if (task->state != QX_TASK_STATE_QUEUED ||
+		failed_attempt->state != QX_ATTEMPT_STATE_FAILED)
+		return false;
+
+	now = GetCurrentTimestamp();
+	dead_queue = *retry_queue;
+	dead_queue.queue_kind = QX_SCHEDULER_QUEUE_MAINTENANCE;
+	dead_queue.runnable_count = 0;
+	dead_queue.leased_count = 0;
+	dead_queue.blocked_count = 1;
+	dead_queue.eligible_at = now;
+	dead_queue.updated_at = now;
+	queueoid = qx_insert_scheduler_queue(queueledgerrel, &dead_queue);
+	CommandCounterIncrement();
+
+	qx_update_attempt_state(attemptrel, failed_attempt->oid,
+							QX_ATTEMPT_STATE_FAILED);
+	qx_update_task_runtime(taskrel, task->oid,
+						   QX_TASK_STATE_FAILED,
+						   failed_attempt->oid,
+						   true,
+						   InvalidOid,
+						   true);
+
+	payload = psprintf("retry_count=%d;max_retries=%d;queueoid=%u;worker=%s;task_state=%c;queue_kind=%d",
+					   retry_queue->retry_count,
+					   qx_runtime_scheduler_max_retries(),
+					   queueoid,
+					   worker_name != NULL ? worker_name : "qhapaqxian scheduler",
+					   QX_TASK_STATE_FAILED,
+					   (int) QX_SCHEDULER_QUEUE_MAINTENANCE);
+	payload = qx_runtime_append_recovery_payload(payload);
+	(void) qx_insert_event(eventrel, task->sessionoid, task->oid, InvalidOid,
+						   task->ownerid, NULL, "TASK_DEAD_LETTERED", payload);
+	(void) qx_insert_trace(tracerel, task->sessionoid, task->oid, InvalidOid,
+						   task->ownerid, NULL, "runtime.dead_letter", payload);
+	pfree(payload);
+
+	if (stats != NULL)
+		stats->dead_lettered_tasks++;
+
+	return true;
 }
 
 static bool
@@ -5119,12 +5245,13 @@ qx_runtime_log_scheduler_cycle(const char *worker_name,
 		stats->leases_repaired <= 0 &&
 		stats->recovery_requeued <= 0 &&
 		stats->retry_dispatches <= 0 &&
+		stats->dead_lettered_tasks <= 0 &&
 		stats->retry_waiting_tasks <= 0 &&
 		stats->ownership_skipped <= 0)
 		return;
 
 	elog(DEBUG1,
-		 "%s: tasks=%d running=%d queued_retry=%d retry_ready=%d retry_waiting=%d skipped=%d leases=%d renewed=%d reclaimed=%d repaired=%d requeued=%d retry_dispatches=%d last_backoff_ms=%d max_backoff_ms=%d heartbeats=%d",
+		 "%s: tasks=%d running=%d queued_retry=%d retry_ready=%d retry_waiting=%d skipped=%d leases=%d renewed=%d reclaimed=%d repaired=%d requeued=%d retry_dispatches=%d dead_lettered=%d last_backoff_ms=%d max_backoff_ms=%d heartbeats=%d",
 		 worker_name != NULL ? worker_name : "qhapaqxian scheduler",
 		 stats->tasks_scanned,
 		 stats->running_tasks,
@@ -5138,6 +5265,7 @@ qx_runtime_log_scheduler_cycle(const char *worker_name,
 		 stats->leases_repaired,
 		 stats->recovery_requeued,
 		 stats->retry_dispatches,
+		 stats->dead_lettered_tasks,
 		 stats->last_retry_backoff_ms,
 		 stats->max_retry_backoff_ms,
 		 stats->heartbeats_written);
@@ -5626,6 +5754,97 @@ qx_runtime_test_start_uncheckpointed_task(Oid sessionoid,
 	return taskoid;
 }
 
+static Oid
+qx_runtime_test_start_exhausted_retry_task(Oid sessionoid)
+{
+	Oid			taskoid;
+	QxCatalogTaskInfo task;
+	QxCatalogAttemptInfo attempt;
+	QxSchedulerTaskEnvelope scheduler_envelope;
+	QxSchedulerQueueSnapshot *retry_queue;
+	Relation	taskrel;
+	Relation	attemptrel;
+	Relation	eventrel;
+	Relation	tracerel;
+	Relation	queueledgerrel;
+	char	   *selected_contract;
+	char	   *payload;
+	Oid			queueoid;
+
+	taskoid = qx_runtime_test_start_uncheckpointed_task(sessionoid, "low");
+	if (!QxCatalogLookupTaskByOid(taskoid, &task))
+		elog(ERROR, "cache lookup failed for QhapaqXian task %u", taskoid);
+	if (!QxCatalogLookupAttemptByOid(task.lastattemptid, &attempt))
+	{
+		QxCatalogFreeTaskInfo(&task);
+		elog(ERROR, "cache lookup failed for QhapaqXian attempt %u",
+			 task.lastattemptid);
+	}
+
+	selected_contract = qx_runtime_recovery_selected_contract(&task, false);
+	qx_runtime_fill_recovery_scheduler_envelope(&scheduler_envelope,
+												&task,
+												attempt.oid,
+												qx_runtime_scheduler_max_retries(),
+												NULL,
+												NULL,
+												false,
+												true,
+												true,
+												selected_contract);
+	retry_queue = QxSchedulerQueueSnapshotFromEnvelope(&scheduler_envelope);
+	retry_queue->queue_kind = QX_SCHEDULER_QUEUE_RETRY;
+	retry_queue->retry_count = qx_runtime_scheduler_max_retries();
+	retry_queue->runnable_count = 1;
+	retry_queue->leased_count = 0;
+	retry_queue->blocked_count = 0;
+	retry_queue->eligible_at = retry_queue->enqueued_at;
+	retry_queue->updated_at = retry_queue->enqueued_at;
+
+	taskrel = table_open(QxTaskRelationId, RowExclusiveLock);
+	attemptrel = table_open(QxAttemptRelationId, RowExclusiveLock);
+	eventrel = table_open(QxEventRelationId, RowExclusiveLock);
+	tracerel = table_open(QxTraceRelationId, RowExclusiveLock);
+	queueledgerrel = table_open(QxSchedulerQueueRelationId, RowExclusiveLock);
+
+	qx_update_attempt_state(attemptrel, attempt.oid, QX_ATTEMPT_STATE_FAILED);
+	qx_update_task_runtime(taskrel, taskoid, QX_TASK_STATE_QUEUED,
+						   attempt.oid, true, InvalidOid, true);
+	queueoid = qx_insert_scheduler_queue(queueledgerrel, retry_queue);
+	CommandCounterIncrement();
+
+	payload = psprintf("test=exhausted_retry;retry_count=%d;max_retries=%d;queueoid=%u",
+					   retry_queue->retry_count,
+					   qx_runtime_scheduler_max_retries(),
+					   queueoid);
+	payload = qx_runtime_append_recovery_payload(payload);
+	payload = qx_scheduler_append_runtime_payload(payload,
+												  &scheduler_envelope,
+												  false);
+	(void) qx_insert_event(eventrel, task.sessionoid, taskoid, InvalidOid,
+						   task.ownerid, NULL,
+						   "TASK_RETRY_EXHAUSTED_FIXTURE", payload);
+	(void) qx_insert_trace(tracerel, task.sessionoid, taskoid, InvalidOid,
+						   task.ownerid, NULL,
+						   "runtime.retry_exhausted_fixture", payload);
+	pfree(payload);
+
+	table_close(queueledgerrel, RowExclusiveLock);
+	table_close(tracerel, RowExclusiveLock);
+	table_close(eventrel, RowExclusiveLock);
+	table_close(attemptrel, RowExclusiveLock);
+	table_close(taskrel, RowExclusiveLock);
+
+	qx_runtime_free_scheduler_queue_snapshot(retry_queue);
+	pfree(retry_queue);
+	if (selected_contract != NULL)
+		pfree(selected_contract);
+	QxCatalogFreeAttemptInfo(&attempt);
+	QxCatalogFreeTaskInfo(&task);
+
+	return taskoid;
+}
+
 Datum
 pg_qx_test_start_uncheckpointed_task(PG_FUNCTION_ARGS)
 {
@@ -5647,6 +5866,14 @@ pg_qx_test_start_uncheckpointed_task_priority(PG_FUNCTION_ARGS)
 	pfree(priority);
 
 	PG_RETURN_OID(taskoid);
+}
+
+Datum
+pg_qx_test_start_exhausted_retry_task(PG_FUNCTION_ARGS)
+{
+	Oid			sessionoid = PG_GETARG_OID(0);
+
+	PG_RETURN_OID(qx_runtime_test_start_exhausted_retry_task(sessionoid));
 }
 
 Datum
@@ -5704,12 +5931,14 @@ QxRuntimeSchedulerLauncherMain(Datum main_arg)
 		List	   *alive_workers = NIL;
 		ListCell   *lc;
 		MemoryContext oldcontext;
+		int32		current_slot_count;
 
 		SetCurrentStatementStartTimestamp();
 		StartTransactionCommand();
 		pgstat_report_activity(STATE_RUNNING,
 							   "qhapaqxian scheduler launcher");
 		targets = qx_runtime_scheduler_db_targets();
+		current_slot_count = qx_runtime_scheduler_slot_count();
 
 		oldcontext = MemoryContextSwitchTo(TopMemoryContext);
 		foreach(lc, workers)
@@ -5744,10 +5973,11 @@ QxRuntimeSchedulerLauncherMain(Datum main_arg)
 					continue;
 
 				for (slot_index = 0;
-					 slot_index < qx_runtime_scheduler_slot_count();
+					 slot_index < current_slot_count;
 					 slot_index++)
 				{
-					if (worker->slot_index == slot_index)
+					if (worker->slot_index == slot_index &&
+						worker->slot_count == current_slot_count)
 					{
 						present = true;
 						break;
@@ -5778,7 +6008,7 @@ QxRuntimeSchedulerLauncherMain(Datum main_arg)
 			int32		slot_index;
 
 			for (slot_index = 0;
-				 slot_index < qx_runtime_scheduler_slot_count();
+				 slot_index < current_slot_count;
 				 slot_index++)
 			{
 				QxRuntimeSchedulerDbWorker *worker;
@@ -5792,7 +6022,7 @@ QxRuntimeSchedulerLauncherMain(Datum main_arg)
 				if (!qx_runtime_launch_scheduler_db_worker(target->dboid,
 														   target->dbname,
 														   slot_index,
-														   qx_runtime_scheduler_slot_count(),
+														   current_slot_count,
 														   &handle))
 				{
 					elog(WARNING,
@@ -5800,7 +6030,7 @@ QxRuntimeSchedulerLauncherMain(Datum main_arg)
 						 target->dbname,
 						 target->dboid,
 						 slot_index + 1,
-						 qx_runtime_scheduler_slot_count());
+						 current_slot_count);
 					continue;
 				}
 
@@ -5809,7 +6039,7 @@ QxRuntimeSchedulerLauncherMain(Datum main_arg)
 				worker->dbname = MemoryContextStrdup(TopMemoryContext,
 													 target->dbname);
 				worker->slot_index = slot_index;
-				worker->slot_count = qx_runtime_scheduler_slot_count();
+				worker->slot_count = current_slot_count;
 				worker->handle = handle;
 				workers = lappend(workers, worker);
 			}

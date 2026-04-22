@@ -19,8 +19,9 @@ Current state:
 - failover rebuild scans can now be driven through a runtime-owned internal hook
   that uses the same real queue/lease/heartbeat ledger write path.
 - postmaster now registers a runtime-owned scheduler launcher bgworker, and
-  that launcher spawns a fixed slot set of scheduler database workers per
-  connectable database (currently 2 slots).
+  that launcher spawns a bounded slot set of scheduler database workers per
+  connectable database. `QX_SCHEDULER_DB_WORKER_SLOTS` configures the slot
+  count at postmaster startup, clamped to 1..8, with default `2`.
 - in pg_regress temp clusters, the launcher intentionally limits autonomous
   scheduler workers to the canonical `regression` database; this keeps the
   daemon real for QX tests without holding persistent connections to transient
@@ -44,6 +45,9 @@ Current state:
 - retry backoff is now priority-aware and exponential with deterministic jitter
   so `urgent` retries re-enter earlier than `high`, while repeated failures
   still stretch the durable eligibility window.
+- exhausted retries now fail closed into durable dead-letter state: the task is
+  marked `failed`, the last attempt remains `failed`, the scheduler appends a
+  blocked `MAINTENANCE` queue row, and trace/event evidence is emitted.
 - the focused scheduler worker tick remains as a narrow regression hook, but
   the main path is now the autonomous bgworker loop.
 - `qx_stage3_agentic` now exercises startup checkpoint requeue, autonomous
@@ -62,10 +66,10 @@ Current state:
 Integration debt:
 - scheduler/recovery ownership is still converging with the active runtime path;
 - runtime now writes normal release snapshots, autonomous renewal/reclaim
-  snapshots, checkpoint-backed repair writes, and non-checkpoint fail-closed
-  retry writes plus autonomous retry dispatch after backoff, but it still lacks
-  adaptive retry/dead-letter policy, broader dedupe policy across
-  startup/failover/autonomous paths, dynamic slot scaling, and explicit
+  snapshots, checkpoint-backed repair writes, non-checkpoint fail-closed retry
+  writes, autonomous retry dispatch after backoff, and max-retry dead-letter
+  writes; remaining scheduler debt is load-adaptive slot scaling, broader
+  dedupe policy across startup/failover/autonomous paths, and explicit
   external-process cleanup ownership beyond the current runner behavior;
 - Docker/QEMU launch is real, but deeper OCI policy, VM lifecycle supervision,
   and self-hosted KVM CI coverage remain active hardening work.

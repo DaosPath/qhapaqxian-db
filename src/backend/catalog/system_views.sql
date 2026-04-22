@@ -1472,6 +1472,7 @@ CREATE VIEW pg_stat_qx_tasks WITH (security_barrier) AS
             WHEN 'r' THEN 'running'
             WHEN 'k' THEN 'checkpointed'
             WHEN 'c' THEN 'completed'
+            WHEN 'f' THEN 'failed'
             ELSE 'unknown'
         END AS task_state,
         t.qxtaskbudgettokens AS budget_tokens,
@@ -1556,6 +1557,7 @@ CREATE VIEW pg_stat_qx_scheduler_queues WITH (security_barrier) AS
                 WHEN 'r' THEN 'running'
                 WHEN 'k' THEN 'checkpointed'
                 WHEN 'c' THEN 'completed'
+                WHEN 'f' THEN 'failed'
                 ELSE 'other'
             END AS task_state,
             lq.queue_name,
@@ -1665,6 +1667,7 @@ CREATE VIEW pg_stat_qx_scheduler_workers WITH (security_barrier) AS
                 WHEN 'r' THEN 'running'
                 WHEN 'k' THEN 'checkpointed'
                 WHEN 'c' THEN 'completed'
+                WHEN 'f' THEN 'failed'
                 ELSE 'other'
             END AS task_state,
             ll.worker_name,
@@ -2022,6 +2025,7 @@ CREATE VIEW pg_stat_qx_scheduler_worker_balance WITH (security_barrier) AS
                 WHEN 'r' THEN 'running'
                 WHEN 'k' THEN 'checkpointed'
                 WHEN 'c' THEN 'completed'
+                WHEN 'f' THEN 'failed'
                 ELSE 'other'
             END AS task_state,
             lq.queue_name,

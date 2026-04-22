@@ -20,6 +20,8 @@ What landed:
 - `pg_stat_qx_scheduler_activity` now rolls the durable scheduler ledger into
   an operator-facing queue/runtime/provider surface with live task counts plus
   renew/reclaim/release/retry activity counters;
+- `pg_stat_qx_tasks` now maps dead-lettered task state to `failed`, so
+  exhausted retries remain visible through the normal task stats surface;
 - provider/principal/runtime-class stats are modeled as explicit structures so
   future catalog-backed reporting does not need to reopen the shape debate.
 
@@ -60,5 +62,6 @@ Validation target:
     renewal, startup recovery, failover rebuild, and live reads from
     `pg_stat_qx_*` plus `SHOW TRACE`
   - focused real `qx_stage3_agentic` assertions that the container scheduler
-    activity row reports renew/reclaim/release/retry history and stays hidden
-    from an unprivileged observer role
+    activity row reports renew/reclaim/release/retry history, exhausted retry
+    work appears as `failed` in `pg_stat_qx_tasks`, and scheduler stats stay
+    hidden from an unprivileged observer role

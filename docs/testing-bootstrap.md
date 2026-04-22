@@ -119,9 +119,15 @@ Non-simulated pass criteria:
   durable `runtime.retry_dispatch` trace must belong to the `urgent` task.
 - the same focused lane should also assert multi-worker ownership and richer
   retry policy evidence: `pg_qx_scheduler_worker_slot_count()` should expose
-  the fixed worker-slot count, `pg_stat_qx_scheduler_retry_backoff` should show
-  the stale high-priority retry row with positive durable delay, and reclaim
-  lease/heartbeat rows should carry the slotted scheduler worker name.
+  the effective worker-slot count, defaulting to `2` unless
+  `QX_SCHEDULER_DB_WORKER_SLOTS` is set at postmaster startup;
+  `pg_stat_qx_scheduler_retry_backoff` should show the stale high-priority
+  retry row with positive durable delay, and reclaim lease/heartbeat rows
+  should carry the slotted scheduler worker name.
+- the same focused lane should also assert the retry dead-letter path: a task
+  whose retry queue already reached max retries becomes `failed`, keeps no
+  synthesized checkpoint, emits `runtime.dead_letter`, does not dispatch
+  another retry attempt, and appends a blocked `MAINTENANCE` queue row.
 - the same focused lane should also assert the aggregated operator view:
   `pg_stat_qx_scheduler_activity` must expose the container queue/runtime/
   provider row with positive renew/reclaim/release/retry counts and renewed/
@@ -174,6 +180,9 @@ Focused local command shape:
 - Stage 31 follow-up validation also ran the full `regress/regress` suite in
   the Windows temp cluster and passed all 225 subtests after the scheduler
   launcher stopped targeting transient core-test databases.
+- Stage 31 under-32 completion added real attestation contract permutation
+  coverage and autonomous retry dead-letter coverage to the same focused
+  `qx_stage3_agentic` lane.
 
 Validated real-backend sweep on 2026-04-20:
 - Windows: `meson compile -C build-stage4-codex -j 2`

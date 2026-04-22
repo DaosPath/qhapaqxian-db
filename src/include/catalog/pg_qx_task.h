@@ -25,6 +25,7 @@
 #define QX_TASK_STATE_RUNNING 'r'
 #define QX_TASK_STATE_CHECKPOINTED 'k'
 #define QX_TASK_STATE_COMPLETED 'c'
+#define QX_TASK_STATE_FAILED 'f'
 
 /* ----------------
  *		pg_qx_task definition.  cpp turns this into

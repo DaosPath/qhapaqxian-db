@@ -19,6 +19,10 @@ the backend can reject incomplete contracts early.
   - container and microVM provider kinds require attestation metadata
   - principal attestation must stay aligned with provider attestation when a
     provider exposes one
+- The integrated regression now covers negative and inheritance permutations:
+  partial provider bundles, missing container/microVM provider attestation,
+  provider/principal attestation mismatch, and principal inheritance of an
+  explicit provider attestation bundle.
 
 ## What this stage did not claim at landing time
 
@@ -47,10 +51,9 @@ the backend can reject incomplete contracts early.
   concrete launch / attestation protocol.
 - Receipts should eventually become provenance artifacts emitted by the
   runtime backend, not just validated input strings.
-- Principals should inherit provider attestation defaults only when the
-  provider contract is explicit and stable.
-- Future work should add broader regression coverage for provider/principal
-  contract permutations without changing the shared schedules.
+- Principals inherit provider attestation defaults only when the provider
+  contract is explicit and stable; this is now covered in
+  `qx_stage3_agentic`.
 
 ## Compatibility notes
 
@@ -63,7 +66,8 @@ the backend can reject incomplete contracts early.
 
 ## Validation
 
-- No dedicated stage-local regression harness was added at landing time.
-- Current validation is indirect through the integrated `qx_stage3_agentic`
-  regression and the real-backend smoke lanes documented in
-  `../testing-bootstrap.md`.
+- Current validation is through the integrated `qx_stage3_agentic` regression
+  and the real-backend smoke lanes documented in `../testing-bootstrap.md`.
+- The regression checks strict DDL rejection for malformed attestation
+  contracts and positive inheritance for a container principal bound to an
+  attested provider.
