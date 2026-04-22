@@ -44,6 +44,8 @@ static int	qx_sandbox_rank(const char *sandbox_name);
 static const char *qx_default_runtime_for_provider_kind(const char *provider_kind);
 static char *qx_join_string_list(List *values, const char *separator);
 static List *qx_split_capability_tags(const char *serialized);
+static bool qx_string_list_contains(List *values, const char *needle);
+static char *qx_policy_contract_value(const char *contract, const char *key);
 static List *qx_default_capability_tags(const char *tool_name,
 									   const char *handler_name,
 									   const char *tool_sandbox,
@@ -68,6 +70,9 @@ static char *qx_tool_contract_for_info(const QxCatalogToolInfo *tool,
 									   const char *tool_runtime_class,
 									   const char *tool_sandbox_ceiling,
 									   const char *tool_capability_tags);
+static void qx_validate_tool_capability_policy(const QxCatalogNamespacePolicyInfo *policy,
+											   const char *tool_name,
+											   const char *tool_capability_tags);
 
 static void
 qx_security_set_text(Datum *values, bool *nulls, AttrNumber attnum,
@@ -170,6 +175,83 @@ qx_split_capability_tags(const char *serialized)
 
 	pfree(copy);
 	return tags;
+}
+
+static bool
+qx_string_list_contains(List *values, const char *needle)
+{
+	ListCell   *lc;
+
+	if (needle == NULL)
+		return false;
+
+	foreach(lc, values)
+	{
+		Node	   *node = lfirst(lc);
+
+		if (IsA(node, String) && strcmp(strVal(node), needle) == 0)
+			return true;
+	}
+
+	return false;
+}
+
+static char *
+qx_policy_contract_value(const char *contract, const char *key)
+{
+	char	   *copy;
+	char	   *cursor;
+	char	   *result = NULL;
+	size_t		key_len;
+
+	if (contract == NULL || contract[0] == '\0' ||
+		key == NULL || key[0] == '\0')
+		return NULL;
+
+	copy = pstrdup(contract);
+	cursor = copy;
+	key_len = strlen(key);
+	while (cursor != NULL && *cursor != '\0')
+	{
+		char	   *separator;
+		char	   *entry;
+		char	   *end;
+
+		separator = strchr(cursor, ';');
+		if (separator != NULL)
+			*separator = '\0';
+
+		entry = cursor;
+		while (*entry != '\0' && isspace((unsigned char) *entry))
+			entry++;
+		end = entry + strlen(entry);
+		while (end > entry && isspace((unsigned char) *(end - 1)))
+			*(--end) = '\0';
+
+		if (strlen(entry) > key_len &&
+			strncmp(entry, key, key_len) == 0 &&
+			entry[key_len] == '=')
+		{
+			char	   *value = entry + key_len + 1;
+			char	   *value_end;
+
+			while (*value != '\0' && isspace((unsigned char) *value))
+				value++;
+			value_end = value + strlen(value);
+			while (value_end > value &&
+				   isspace((unsigned char) *(value_end - 1)))
+				*(--value_end) = '\0';
+			result = pstrdup(value);
+			break;
+		}
+
+		if (separator == NULL)
+			break;
+		cursor = separator + 1;
+	}
+
+	pfree(copy);
+	return result;
 }
 
 static List *
@@ -417,6 +499,82 @@ qx_tool_contract_for_info(const QxCatalogToolInfo *tool,
 
 	pfree(provider_oid);
 	return contract;
+}
+
+static void
+qx_validate_tool_capability_policy(const QxCatalogNamespacePolicyInfo *policy,
+								   const char *tool_name,
+								   const char *tool_capability_tags)
+{
+	char	   *required_serialized;
+	char	   *denied_serialized;
+	List	   *tool_tags;
+	List	   *required_tags;
+	List	   *denied_tags;
+	ListCell   *lc;
+	const char *policy_name;
+	const char *authorized_tags;
+
+	Assert(policy != NULL);
+
+	required_serialized =
+		qx_policy_contract_value(policy->policy, "require_capabilities");
+	if (required_serialized == NULL)
+		required_serialized =
+			qx_policy_contract_value(policy->policy, "require_capability");
+	denied_serialized =
+		qx_policy_contract_value(policy->policy, "deny_capabilities");
+	if (denied_serialized == NULL)
+		denied_serialized =
+			qx_policy_contract_value(policy->policy, "deny_capability");
+
+	if (required_serialized == NULL && denied_serialized == NULL)
+		return;
+
+	policy_name = policy->name != NULL ? policy->name : "<unknown>";
+	authorized_tags = tool_capability_tags != NULL &&
+		tool_capability_tags[0] != '\0' ? tool_capability_tags : "<none>";
+	tool_tags = qx_split_capability_tags(tool_capability_tags);
+	required_tags = qx_split_capability_tags(required_serialized);
+	denied_tags = qx_split_capability_tags(denied_serialized);
+
+	foreach(lc, required_tags)
+	{
+		const char *tag = strVal(lfirst(lc));
+
+		if (!qx_string_list_contains(tool_tags, tag))
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("tool \"%s\" does not satisfy capability requirement \"%s\" in namespace policy \"%s\"",
+							tool_name != NULL ? tool_name : "<unknown>",
+							tag,
+							policy_name),
+					 errdetail("Authorized capability tags: %s.",
+							   authorized_tags)));
+	}
+
+	foreach(lc, denied_tags)
+	{
+		const char *tag = strVal(lfirst(lc));
+
+		if (qx_string_list_contains(tool_tags, tag))
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("tool \"%s\" uses denied capability \"%s\" in namespace policy \"%s\"",
+							tool_name != NULL ? tool_name : "<unknown>",
+							tag,
+							policy_name),
+					 errdetail("Authorized capability tags: %s.",
+							   authorized_tags)));
+	}
+
+	list_free_deep(tool_tags);
+	list_free_deep(required_tags);
+	list_free_deep(denied_tags);
+	if (required_serialized != NULL)
+		pfree(required_serialized);
+	if (denied_serialized != NULL)
+		pfree(denied_serialized);
 }
 
 void
@@ -1025,6 +1183,9 @@ QxAuthorizeToolsForNamespace(Oid namespacepolicyoid, Oid namespaceoid,
 											 tool.principal_receipt_signer,
 											 tool.provider_receipt_alg,
 											 "namespace tool authorization");
+		qx_validate_tool_capability_policy(&policy,
+										   tool_name,
+										   tool_capability_tags);
 
 		contract = qx_tool_contract_for_info(&tool,
 											 tool_runtime_class,

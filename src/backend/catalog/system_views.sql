@@ -1384,7 +1384,7 @@ CREATE VIEW pg_stat_qx_agents WITH (security_barrier) AS
         a.qxagentname AS agent_name,
         pg_get_userbyid(a.qxagentowner) AS owner_name,
         a.qxidentity AS identity_name,
-        qxn.qxnamespacepolicy AS namespace_policy_name,
+        qxn.qxnamespacepolicyname AS namespace_policy_name,
         a.qxmodeluri AS model_uri,
         a.qxmemoryprofile AS memory_profile,
         a.qxpolicy AS policy_name,
@@ -1422,7 +1422,7 @@ CREATE VIEW pg_stat_qx_sessions WITH (security_barrier) AS
         a.qxagentname AS agent_name,
         pg_get_userbyid(s.qxsessionowner) AS owner_name,
         qxi.qxidentityname AS identity_name,
-        qxn.qxnamespacepolicy AS namespace_policy_name,
+        qxn.qxnamespacepolicyname AS namespace_policy_name,
         CASE s.qxsessionstatus
             WHEN 'a' THEN 'active'
             ELSE 'unknown'
@@ -1462,7 +1462,7 @@ CREATE VIEW pg_stat_qx_tasks WITH (security_barrier) AS
         a.qxagentname AS agent_name,
         pg_get_userbyid(t.qxtaskowner) AS owner_name,
         qxi.qxidentityname AS identity_name,
-        qxn.qxnamespacepolicy AS namespace_policy_name,
+        qxn.qxnamespacepolicyname AS namespace_policy_name,
         t.qxtaskname AS task_name,
         t.qxtaskgoal AS goal,
         t.qxtaskpriority AS priority,

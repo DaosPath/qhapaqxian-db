@@ -2661,6 +2661,7 @@ typedef struct CreateNamespacePolicyStmt
 	char	   *schema_name;
 	RoleSpec   *auth_role;
 	List	   *allowed_tools;	/* list of String */
+	char	   *policy_contract;
 	bool		require_known_tools;
 	bool		enforce_budgets;
 	ParseLoc	location;
@@ -2677,6 +2678,8 @@ typedef struct AlterNamespacePolicyStmt
 	bool		set_auth_role;
 	List	   *allowed_tools;	/* list of String */
 	bool		set_allowed_tools;
+	char	   *policy_contract;
+	bool		set_policy_contract;
 	bool		require_known_tools;
 	bool		set_require_known_tools;
 	bool		enforce_budgets;

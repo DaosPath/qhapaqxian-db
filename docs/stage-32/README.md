@@ -51,7 +51,7 @@ It is a consolidation step, not a new runtime feature by itself.
   open-code raw `position('key=value;')` matching against trace contracts;
 - the microVM asset resolver now prefers the stable
   `initramfs-qx-microvm.cpio.gz` before the legacy `microvm2` fallback;
-- the real microVM execution profile now uses the 60000 ms brokered timeout
+- the real microVM execution profile now uses the 120000 ms brokered timeout
   floor end to end so Windows QEMU `microvm` with TCG can boot and shut down
   cleanly without weakening host/container sandbox profiles;
 - build wiring so the catalog helper layer is part of the fork-owned `src/backend/qx` boundary.
@@ -134,7 +134,7 @@ It is a consolidation step, not a new runtime feature by itself.
 - `pg_stat_qx_providers`, `pg_stat_qx_principals`, and
   `pg_stat_qx_runtime_classes` now call `pg_qx_trace_detail_value()` instead of
   repeating raw `position(...)` contract parsing inside each view.
-- Windows QEMU/TCG microVM execution is validated with the 60000 ms brokered
+- Windows QEMU/TCG microVM execution is validated with the 120000 ms brokered
   microVM timeout floor; an earlier child-side timeout could still kill the
   wrapper even after a successful guest boot marker under real TCG.
 - the Windows launcher now skips `CREATE_SUSPENDED` for real

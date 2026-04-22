@@ -1260,7 +1260,8 @@ CreateNamespacePolicyCommand(CreateNamespacePolicyStmt *stmt)
 		BoolGetDatum(stmt->enforce_budgets);
 	qxpolicy_set_text(values, nulls,
 					  Anum_pg_qx_namespace_qxnamespacepolicy,
-					  stmt->policy_name);
+					  stmt->policy_contract != NULL ?
+					  stmt->policy_contract : stmt->policy_name);
 	qxpolicy_set_nodetree(values, nulls,
 						  Anum_pg_qx_namespace_qxallowedtools,
 						  stmt->allowed_tools);
@@ -1293,6 +1294,7 @@ AlterNamespacePolicyCommand(AlterNamespacePolicyStmt *stmt)
 
 	if (!stmt->set_auth_role &&
 		!stmt->set_allowed_tools &&
+		!stmt->set_policy_contract &&
 		!stmt->set_require_known_tools &&
 		!stmt->set_enforce_budgets)
 		ereport(ERROR,
@@ -1361,6 +1363,14 @@ AlterNamespacePolicyCommand(AlterNamespacePolicyStmt *stmt)
 							  Anum_pg_qx_namespace_qxallowedtools,
 							  stmt->allowed_tools);
 		replaces[Anum_pg_qx_namespace_qxallowedtools - 1] = true;
+	}
+
+	if (stmt->set_policy_contract)
+	{
+		qxpolicy_set_text(values, nulls,
+						  Anum_pg_qx_namespace_qxnamespacepolicy,
+						  stmt->policy_contract);
+		replaces[Anum_pg_qx_namespace_qxnamespacepolicy - 1] = true;
 	}
 
 	if (stmt->set_require_known_tools)

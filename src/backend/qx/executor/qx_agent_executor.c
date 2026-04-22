@@ -11,11 +11,15 @@
  */
 #include "postgres.h"
 
+#include "nodes/value.h"
 #include "qx/qx_agent_executor.h"
 #include "qx/qx_runtime.h"
 
 static bool qx_plan_runtime_binding_is_valid(const char *provider_kind,
 											 const char *principal_runtime_class);
+static int	qx_plan_route_rank(const QxAgentPlanToolDecision *decision);
+static const char *qx_resolve_plan_phase_contract(const QxAgentPlan *plan,
+												 bool prefer_resume);
 static void qx_validate_agent_plan_capabilities(const QxAgentPlan *plan);
 
 static bool
@@ -40,6 +44,111 @@ qx_plan_runtime_binding_is_valid(const char *provider_kind,
 }
 
 static void
+qx_validate_agent_plan_contract_alignment(const QxAgentPlan *plan)
+{
+	if (list_length(plan->tool_decisions) != list_length(plan->authorized_tools))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("agent plan capability decisions do not align with authorized tools"),
+				 errdetail("Stage 29 phase routing requires one structured tool decision per authorized contract.")));
+}
+
+static int
+qx_plan_route_rank(const QxAgentPlanToolDecision *decision)
+{
+	const char *capability_class;
+	const char *provider_kind;
+	const char *runtime_class;
+
+	if (decision == NULL)
+		return 1;
+
+	capability_class = decision->capability_class;
+	provider_kind = decision->provider_kind;
+	runtime_class = decision->principal_runtime_class;
+
+	if (capability_class != NULL)
+	{
+		if (strcmp(capability_class, "host-local") == 0)
+			return 0;
+		if (strcmp(capability_class, "remote-brokered") == 0)
+			return 1;
+		if (strcmp(capability_class, "container-brokered") == 0)
+			return 2;
+		if (strcmp(capability_class, "microvm-brokered") == 0)
+			return 3;
+	}
+
+	if (runtime_class != NULL)
+	{
+		if (strcmp(runtime_class, "host") == 0)
+			return 0;
+		if (strcmp(runtime_class, "container") == 0)
+			return 2;
+		if (strcmp(runtime_class, "microvm") == 0)
+			return 3;
+	}
+
+	if (provider_kind != NULL)
+	{
+		if (strcmp(provider_kind, "loopback") == 0)
+			return 0;
+		if (strcmp(provider_kind, "remote") == 0)
+			return 1;
+		if (strcmp(provider_kind, "container") == 0)
+			return 2;
+		if (strcmp(provider_kind, "microvm") == 0)
+			return 3;
+	}
+
+	return 1;
+}
+
+static const char *
+qx_resolve_plan_phase_contract(const QxAgentPlan *plan, bool prefer_resume)
+{
+	ListCell   *decision_lc;
+	ListCell   *contract_lc;
+	const char *selected_contract = NULL;
+	int			selected_rank = prefer_resume ? PG_INT32_MIN : PG_INT32_MAX;
+	int			selected_index = prefer_resume ? PG_INT32_MIN : PG_INT32_MAX;
+	int			index = 0;
+
+	if (plan == NULL || plan->tool_decisions == NIL || plan->authorized_tools == NIL)
+		return NULL;
+
+	qx_validate_agent_plan_contract_alignment(plan);
+
+	forboth(decision_lc, plan->tool_decisions, contract_lc, plan->authorized_tools)
+	{
+		QxAgentPlanToolDecision *decision = lfirst(decision_lc);
+		const char *contract = strVal(lfirst(contract_lc));
+		int			rank = qx_plan_route_rank(decision);
+		bool		better;
+
+		if (selected_contract == NULL)
+			better = true;
+		else if (prefer_resume)
+			better = (rank > selected_rank ||
+					  (rank == selected_rank && index > selected_index));
+		else
+			better = (rank < selected_rank ||
+					  (rank == selected_rank && index < selected_index));
+
+		if (better)
+		{
+			selected_contract = contract;
+			selected_rank = rank;
+			selected_index = index;
+		}
+
+		index++;
+	}
+
+	return selected_contract;
+}
+
+static void
 qx_validate_agent_plan_capabilities(const QxAgentPlan *plan)
 {
 	ListCell   *lc;
@@ -60,6 +169,8 @@ qx_validate_agent_plan_capabilities(const QxAgentPlan *plan)
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("agent plan does not contain a runtime execution surface"),
 				 errdetail("Stage 29 requires a planner-populated execution surface summary before execution.")));
+
+	qx_validate_agent_plan_contract_alignment(plan);
 
 	foreach(lc, plan->tool_decisions)
 	{
@@ -125,6 +236,10 @@ QxExecuteAgentPlan(const QxAgentPlan *plan)
 				request.priority = plan->priority;
 				request.authorized_tools = plan->authorized_tools;
 				request.authorized_tool_oids = plan->authorized_tool_oids;
+				request.submit_contract =
+					qx_resolve_plan_phase_contract(plan, false);
+				request.resume_contract =
+					qx_resolve_plan_phase_contract(plan, true);
 				request.budget_tokens = plan->budget_tokens;
 				request.budget_cost = plan->budget_cost;
 				request.estimated_tokens = plan->estimated_tokens;

@@ -366,6 +366,8 @@ static int qx_parse_memory_scope(char *scope, int location,
 				qx_opt_agent_memory_profile qx_opt_agent_policy
 				qx_opt_task_name qx_opt_task_priority
 				qx_opt_resume_checkpoint qx_opt_memory_match
+				qx_opt_namespace_policy_contract
+				qx_opt_alter_namespace_policy_contract
 				qx_opt_provider_kind qx_opt_provider_endpoint
 				qx_opt_provider_receipt_alg
 				qx_opt_provider_receipt_key
@@ -2052,6 +2054,7 @@ CreateNamespacePolicyStmt:
 			CREATE NAMESPACE POLICY name FOR SCHEMA name
 			qx_opt_namespace_auth_role
 			qx_namespace_allowed_tools
+			qx_opt_namespace_policy_contract
 			qx_namespace_known_tools_mode
 			qx_namespace_budget_mode
 				{
@@ -2061,8 +2064,9 @@ CreateNamespacePolicyStmt:
 					n->schema_name = $7;
 					n->auth_role = $8;
 					n->allowed_tools = $9;
-					n->require_known_tools = ($10 != 0);
-					n->enforce_budgets = ($11 != 0);
+					n->policy_contract = $10;
+					n->require_known_tools = ($11 != 0);
+					n->enforce_budgets = ($12 != 0);
 					n->location = @1;
 					$$ = (Node *) n;
 				}
@@ -2072,6 +2076,7 @@ AlterNamespacePolicyStmt:
 			ALTER NAMESPACE POLICY name FOR SCHEMA name
 			qx_opt_alter_namespace_auth_role
 			qx_opt_alter_namespace_tools
+			qx_opt_alter_namespace_policy_contract
 			qx_opt_alter_namespace_known_tools
 			qx_opt_alter_namespace_budget
 				{
@@ -2083,10 +2088,12 @@ AlterNamespacePolicyStmt:
 					n->set_auth_role = ($8 != NULL);
 					n->allowed_tools = $9;
 					n->set_allowed_tools = ($9 != NIL);
-					n->require_known_tools = ($10 > 0);
-					n->set_require_known_tools = ($10 >= 0);
-					n->enforce_budgets = ($11 > 0);
-					n->set_enforce_budgets = ($11 >= 0);
+					n->policy_contract = $10;
+					n->set_policy_contract = ($10 != NULL);
+					n->require_known_tools = ($11 > 0);
+					n->set_require_known_tools = ($11 >= 0);
+					n->enforce_budgets = ($12 > 0);
+					n->set_enforce_budgets = ($12 >= 0);
 					n->location = @1;
 					$$ = (Node *) n;
 				}
@@ -2287,6 +2294,11 @@ qx_namespace_allowed_tools:
 			| /* EMPTY */							{ $$ = NIL; }
 		;
 
+qx_opt_namespace_policy_contract:
+			USING Sconst							{ $$ = $2; }
+			| /* EMPTY */							{ $$ = NULL; }
+		;
+
 qx_namespace_known_tools_mode:
 			KNOWN TOOLS ENABLE_P					{ $$ = 1; }
 			| KNOWN TOOLS DISABLE_P				{ $$ = 0; }
@@ -2302,6 +2314,11 @@ qx_namespace_budget_mode:
 qx_opt_alter_namespace_tools:
 			SET TOOLS '(' name_list ')'			{ $$ = $4; }
 			| /* EMPTY */							{ $$ = NIL; }
+		;
+
+qx_opt_alter_namespace_policy_contract:
+			USING Sconst							{ $$ = $2; }
+			| /* EMPTY */							{ $$ = NULL; }
 		;
 
 qx_opt_alter_namespace_known_tools:

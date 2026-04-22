@@ -78,7 +78,7 @@ Real backend validation:
 - Windows correctness runs should validate Docker plus QEMU/TCG. WSL/Linux
   acceleration runs should validate QEMU/KVM and may call Docker Desktop through
   Windows `docker.exe` plus `DOCKER_HOST=npipe:////./pipe/dockerDesktopLinuxEngine`.
-- Real microVM regressions expect the runtime's 60000 ms brokered timeout
+- Real microVM regressions expect the runtime's 120000 ms brokered timeout
   floor. The runner uses the same value for its QEMU process wait, avoiding an
   earlier child-side timeout while preserving the smaller host/container
   profile values.
@@ -153,6 +153,9 @@ Focused local command shape:
 - On Windows, direct focused `pg_regress` also needs `%SystemRoot%\\System32`
   preserved in `PATH`; otherwise the bootstrap copy step cannot find
   `robocopy` and fails before `postgresql.conf` is patched.
+- On Windows, direct focused `pg_regress` also needs a real `diff.exe` in
+  `PATH` (for example `C:\\Program Files\\Git\\usr\\bin`); otherwise the test
+  body may run successfully but result comparison still aborts at the end.
 - A direct focused run still requires real microVM assets. On Windows/TCG, set
   `QX_MICROVM_ACCEL=tcg`, `QX_MICROVM_KERNEL=<kernel>`, and
   `QX_MICROVM_INITRD=<initrd>`. On WSL/Linux/KVM, set `QX_MICROVM_ACCEL=kvm`

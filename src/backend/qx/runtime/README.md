@@ -8,6 +8,9 @@ Current state:
 - runtime owns the current agent/task launch and external provider boundary.
 - runtime submit/resume now persist scheduler queue/lease/heartbeat ledger rows
   alongside the existing task/attempt/event/trace/checkpoint catalogs.
+- runtime submit now also persists explicit `submit` and `resume` contracts on
+  each task, so later resume/retry/recovery paths can reuse the planned
+  capability route instead of guessing from allowlist order.
 - checkpoint and complete paths now append durable lease-release and
   scheduler-release heartbeat rows for the finished worker handoff.
 - startup recovery scans now append durable recovery-queue rows for

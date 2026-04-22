@@ -17,7 +17,7 @@ Documentation hierarchy:
 - `docs/stage-*/README.md` = stage-local landed contracts and notes
 
 Snapshot date:
-- `2026-04-20`
+- `2026-04-22`
 
 Last validated test sweep:
 - Windows: `meson compile -C build-stage4-codex -j 2`
@@ -30,7 +30,8 @@ Last validated test sweep:
   fairness assertions (`urgent` retry dispatch before `high` on the durable
   trace order), deterministic multi-worker slot ownership, priority-aware
   retry backoff, worker-balance visibility, and
-  `pg_stat_qx_scheduler_activity` observability assertions
+  `pg_stat_qx_scheduler_activity` observability assertions, plus Stage 30
+  namespace policy `USING` require/deny capability checks at `CREATE AGENT`
 - WSL Ubuntu 24.04: direct QEMU/KVM boot marker `QX-MICROVM-BOOT-OK`
 - WSL Ubuntu 24.04: runner smoke with `microvm_accel=kvm`
 - WSL Ubuntu 24.04: `meson compile -C build-kvm -j 4`
@@ -76,8 +77,8 @@ Status legend:
 | 26 scheduler scaffold | yes | yes | yes | partial | durable queue/lease/heartbeat catalogs, release snapshots, autonomous launcher/database bgworkers, deterministic two-slot per-database ownership, lease renewal, reclaim snapshots, checkpoint-backed task/attempt repair, non-checkpoint stale-attempt fail-closed retry repair (`failed` attempt + durable `RETRY` queue + queued backoff), autonomous retry intake that now ranks eligible retry candidates by priority/eligibility order before re-running real submit work, priority-aware exponential retry backoff with deterministic jitter, failover rebuild snapshots, and ledger-backed queue/worker/activity/backoff/balance views now exist, but dynamic slot scaling and a dedicated scheduler stats plane remain future work |
 | 27 recovery scanner scaffold | yes | yes | yes | partial | startup recovery, failover rebuild, and the autonomous scheduler supervisor now drive real scheduler requeue/reclaim writes, repeated scans suppress duplicate recovery queue/reclaimed-lease evidence when the latest durable scheduler ledger already reflects the repair, and stale no-checkpoint attempts now fail closed into queued retry state before a later autonomous retry dispatch; deeper semantic replay, adaptive retry/dead-letter policy, and broader supervision policy remain future work |
 | 28 observability scaffold | yes | yes | partial | partial | `qx_observe` now backs `SHOW TRACE` summaries, the scheduler durable ledger plus `pg_stat_qx_scheduler_activity`, `pg_stat_qx_scheduler_retry_backoff`, and `pg_stat_qx_scheduler_worker_balance` exist, and focused `qx_stage3_agentic` covers renew/reclaim/release/retry aggregation plus slot/backoff/balance assertions, but there is still no dedicated stats collector or standalone observability test suite |
-| 29 capability-aware planner/executor | yes | partial | no | partial | structured capability decisions exist, but runtime handoff still uses existing contract strings |
-| 30 security/tool capability contract | yes | yes | no | partial | capability tags and ceilings flow through authorization, but policy compilation and OS-level enforcement are still separate concerns |
+| 29 capability-aware planner/executor | yes | yes | yes | yes | planner/executor now materialize explicit submit/resume capability routes, persist them in `pg_qx_task`, and runtime/retry/recovery consume those routes instead of first/last contract heuristics |
+| 30 security/tool capability contract | yes | yes | yes | yes | namespace policy `USING` contracts now enforce required/denied capability tags during tool authorization and `CREATE AGENT`; OS-level OCI/VM policy compilation and stronger provenance remain future hardening |
 | 31 semantic payload v2 | yes | yes | yes | yes | v2 payloads cover verified execution events, but the replication surface is still logical-message text rather than a deeper WAL family |
 | 32 catalog snapshot helper layer | yes | yes | partial | partial | recovery, planner, security authorization/validation, selected runtime reads plus budget validation, command authorization reads, and the main `pg_stat_qx_*` contract extractors now consume shared helpers through `qx_catalog`/`qx_observe`; runtime write paths, scheduler, and broader observability aggregation still need migration and helper coverage remains indirect |
 

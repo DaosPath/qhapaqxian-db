@@ -84,6 +84,7 @@ CreateAgentCommand(CreateAgentStmt *stmt)
 	List	   *names;
 	char	   *agentname;
 	HeapTuple	tup;
+	QxToolAuthorization authz;
 
 	ownerid = GetUserId();
 	names = list_make1(makeString(pstrdup(stmt->agent_name)));
@@ -119,6 +120,8 @@ CreateAgentCommand(CreateAgentStmt *stmt)
 	namespacepolicyoid = QxLookupNamespacePolicy(namespaceoid,
 												 stmt->policy_name,
 												 false);
+	QxAuthorizeToolsForNamespace(namespacepolicyoid, namespaceoid, ownerid,
+								 stmt->tools, &authz);
 	identityoid = QxEnsureOperationalIdentity(namespaceoid, ownerid,
 											  stmt->identity_name,
 											  ownerid,

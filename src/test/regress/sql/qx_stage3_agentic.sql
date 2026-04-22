@@ -277,6 +277,14 @@ SELECT qxtaskname::text AS task_name,
 FROM pg_qx_task
 ORDER BY oid;
 
+SELECT qxtasksubmitcontract::text LIKE '%tool=search%' AS submit_route_is_search,
+       qxtasksubmitcontract::text LIKE '%principal_runtime=host%' AS submit_route_is_host,
+       qxtaskresumecontract::text LIKE '%tool=summarize%' AS resume_route_is_summarize,
+       qxtaskresumecontract::text LIKE '%principal_runtime=microvm%' AS resume_route_is_microvm,
+       qxtasksubmitcontract <> qxtaskresumecontract AS routes_diverge
+FROM pg_qx_task
+WHERE oid = :qx_task_oid;
+
 SELECT qxattemptseqno AS seqno,
        qxattemptstate AS state,
        qxattemptresumecheckpointid = 0 AS starts_fresh,
@@ -1104,6 +1112,32 @@ SELECT count(*) FROM pg_qx_memory;
 RESET SESSION AUTHORIZATION;
 
 DROP ROLE qx_observer;
+
+CREATE NAMESPACE POLICY host_runtime_only FOR SCHEMA public
+  TOOLS (summarize)
+  USING 'require_capabilities=runtime:host'
+  KNOWN TOOLS ENABLE
+  BUDGET ENABLE;
+
+CREATE AGENT host_runtime_probe
+  IDENTITY imperial
+  MODEL 'openai:gpt-5.4-mini'
+  TOOLS (summarize)
+  POLICY host_runtime_only
+  BUDGET (tokens 256, cost 32);
+
+CREATE NAMESPACE POLICY no_microvm_runtime FOR SCHEMA public
+  TOOLS (summarize)
+  USING 'deny_capabilities=runtime:microvm'
+  KNOWN TOOLS ENABLE
+  BUDGET ENABLE;
+
+CREATE AGENT no_microvm_probe
+  IDENTITY imperial
+  MODEL 'openai:gpt-5.4-mini'
+  TOOLS (summarize)
+  POLICY no_microvm_runtime
+  BUDGET (tokens 256, cost 32);
 
 START SESSION FOR AGENT archivist
   RETURNING SESSION;

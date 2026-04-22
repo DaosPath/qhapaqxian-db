@@ -58,6 +58,8 @@ CATALOG(pg_qx_task,9532,QxTaskRelationId)
 	pg_node_tree qxtaskinput BKI_FORCE_NULL;	/* serialized raw input expr */
 	text		qxtaskpriority BKI_FORCE_NULL;	/* priority label */
 	pg_node_tree qxtaskauthorizedtools BKI_FORCE_NULL;	/* serialized List<String> */
+	text		qxtasksubmitcontract BKI_FORCE_NULL;	/* explicit submit-phase route */
+	text		qxtaskresumecontract BKI_FORCE_NULL;	/* explicit resume-phase route */
 #endif
 } FormData_pg_qx_task;
 

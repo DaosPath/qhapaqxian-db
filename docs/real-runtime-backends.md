@@ -229,9 +229,9 @@ room to start real provider processes. The microVM runner also consumes the
 same brokered timeout value, so QEMU is not killed earlier than the parent
 profile allows.
 
-For microVM providers the runtime applies a 60000 ms timeout floor to the
+For microVM providers the runtime applies a 120000 ms timeout floor to the
 brokered execution profile. This is intentionally higher than the small
 `isolated` profile default because Windows QEMU `microvm` with TCG can boot,
 print `QX-MICROVM-BOOT-OK`, and shut down cleanly while still exceeding a
-20000 ms parent wait on slower local runs. Host and container execution keep
+60000 ms parent wait on slower local runs. Host and container execution keep
 their normal profile-specific timeout values.

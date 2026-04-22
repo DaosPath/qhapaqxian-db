@@ -203,7 +203,7 @@ static QxRuntimeRecoverySnapshot qx_runtime_recovery_snapshot = {0};
 #define QX_RECEIPT_SIG_HEX_LEN	((PG_SHA256_DIGEST_LENGTH * 2) + 1)
 #define QX_ED25519_SIG_BYTES	64
 #define QX_ED25519_SIG_HEX_LEN	((QX_ED25519_SIG_BYTES * 2) + 1)
-#define QX_MICROVM_TIMEOUT_FLOOR_MS 60000
+#define QX_MICROVM_TIMEOUT_FLOOR_MS 120000
 #define QX_SCHEDULER_LAUNCHER_NAPTIME_MS 3000
 #define QX_SCHEDULER_WORKER_NAPTIME_MS 1000
 #define QX_SCHEDULER_DB_WORKER_SLOTS 2
@@ -298,6 +298,9 @@ static void qx_execute_tool_contract(const char *contract,
 									 bool input_present,
 									 QxExternalToolResult *result);
 static List *qx_parse_task_authorized_contracts(const char *serialized);
+static const char *qx_runtime_request_phase_contract(
+	const QxRuntimeTaskRequest *request,
+	bool prefer_resume);
 static const char *qx_safe_runtime_text(const char *value);
 static const char *qx_bool_literal(bool value);
 static const char *qx_effective_priority_name(const char *priority);
@@ -336,6 +339,8 @@ extern bool QxSchedulerLeaseNeedsReclaim(const QxSchedulerLeaseSnapshot *lease,
 										 TimestampTz now);
 static char *qx_runtime_recovery_selected_contract(const QxCatalogTaskInfo *task,
 												   bool prefer_resume);
+static char *qx_runtime_task_phase_contract(const QxCatalogTaskInfo *task,
+											bool prefer_resume);
 static char *qx_runtime_recovery_checkpoint_label(Oid checkpointoid);
 static void qx_runtime_fill_recovery_scheduler_envelope(
 	QxSchedulerTaskEnvelope *envelope,
@@ -775,26 +780,7 @@ static char *
 qx_runtime_recovery_selected_contract(const QxCatalogTaskInfo *task,
 									  bool prefer_resume)
 {
-	List	   *authorized_contracts;
-	Node	   *selected_node;
-	char	   *selected_contract = NULL;
-
-	if (task == NULL)
-		return NULL;
-
-	authorized_contracts = qx_parse_task_authorized_contracts(task->authorized_tools);
-	if (authorized_contracts != NIL)
-	{
-		selected_node = prefer_resume ?
-			(Node *) llast(authorized_contracts) :
-			(Node *) linitial(authorized_contracts);
-		selected_contract = pstrdup(strVal(selected_node));
-	}
-
-	if (authorized_contracts != NIL)
-		list_free_deep(authorized_contracts);
-
-	return selected_contract;
+	return qx_runtime_task_phase_contract(task, prefer_resume);
 }
 
 static char *
@@ -3194,6 +3180,61 @@ qx_parse_task_authorized_contracts(const char *serialized)
 	return castNode(List, node);
 }
 
+static const char *
+qx_runtime_request_phase_contract(const QxRuntimeTaskRequest *request,
+								  bool prefer_resume)
+{
+	const char *selected_contract;
+
+	if (request == NULL)
+		return NULL;
+
+	selected_contract = prefer_resume ?
+		request->resume_contract :
+		request->submit_contract;
+	if (selected_contract != NULL && selected_contract[0] != '\0')
+		return selected_contract;
+
+	if (request->authorized_tools == NIL)
+		return NULL;
+
+	return strVal((Node *) (prefer_resume ?
+							llast(request->authorized_tools) :
+							linitial(request->authorized_tools)));
+}
+
+static char *
+qx_runtime_task_phase_contract(const QxCatalogTaskInfo *task, bool prefer_resume)
+{
+	List	   *authorized_contracts;
+	Node	   *selected_node;
+	const char *selected_contract;
+	char	   *copied_contract = NULL;
+
+	if (task == NULL)
+		return NULL;
+
+	selected_contract = prefer_resume ?
+		task->resume_contract :
+		task->submit_contract;
+	if (selected_contract != NULL && selected_contract[0] != '\0')
+		return pstrdup(selected_contract);
+
+	authorized_contracts = qx_parse_task_authorized_contracts(task->authorized_tools);
+	if (authorized_contracts != NIL)
+	{
+		selected_node = prefer_resume ?
+			(Node *) llast(authorized_contracts) :
+			(Node *) linitial(authorized_contracts);
+		copied_contract = pstrdup(strVal(selected_node));
+	}
+
+	if (authorized_contracts != NIL)
+		list_free_deep(authorized_contracts);
+
+	return copied_contract;
+}
+
 static void
 qx_update_task_runtime(Relation taskrel, Oid taskoid, char state,
 					   Oid lastattemptid, bool replace_attempt,
@@ -4777,7 +4818,7 @@ qx_runtime_dispatch_retry_task(Relation taskrel,
 							   QxRuntimeSchedulerCycleStats *stats)
 {
 	List	   *authorized_contracts = NIL;
-	const char *selected_contract;
+	char	   *selected_contract;
 	QxSchedulerTaskEnvelope scheduler_envelope;
 	QxSchedulerQueueSnapshot *dispatch_queue_snapshot;
 	QxSchedulerLeaseSnapshot *lease_snapshot;
@@ -4805,8 +4846,7 @@ qx_runtime_dispatch_retry_task(Relation taskrel,
 		return false;
 
 	authorized_contracts = qx_parse_task_authorized_contracts(task->authorized_tools);
-	selected_contract = authorized_contracts != NIL ?
-		strVal((Node *) linitial(authorized_contracts)) : NULL;
+	selected_contract = qx_runtime_task_phase_contract(task, false);
 	if (selected_contract == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -5035,6 +5075,8 @@ qx_runtime_dispatch_retry_task(Relation taskrel,
 						   "Task paused at durable checkpoint and awaits RESUME TASK");
 	pfree(payload);
 	qx_free_external_result(&tool_result);
+	if (selected_contract != NULL)
+		pfree(selected_contract);
 	if (authorized_contracts != NIL)
 		list_free_deep(authorized_contracts);
 
@@ -5092,9 +5134,13 @@ qx_runtime_insert_task(Relation taskrel, const QxRuntimeTaskRequest *request)
 	Oid			taskoid;
 	ObjectAddress myself;
 	ObjectAddress referenced;
+	const char *submit_contract;
+	const char *resume_contract;
 
 	memset(values, 0, sizeof(values));
 	memset(nulls, false, sizeof(nulls));
+	submit_contract = qx_runtime_request_phase_contract(request, false);
+	resume_contract = qx_runtime_request_phase_contract(request, true);
 
 	taskoid = GetNewOidWithIndex(taskrel, QxTaskOidIndexId,
 								 Anum_pg_qx_task_oid);
@@ -5139,6 +5185,12 @@ qx_runtime_insert_task(Relation taskrel, const QxRuntimeTaskRequest *request)
 	qx_set_nodetree_datum(values, nulls,
 						  Anum_pg_qx_task_qxtaskauthorizedtools,
 						  request->authorized_tools);
+	qx_set_text_datum(values, nulls,
+					  Anum_pg_qx_task_qxtasksubmitcontract,
+					  submit_contract);
+	qx_set_text_datum(values, nulls,
+					  Anum_pg_qx_task_qxtaskresumecontract,
+					  resume_contract);
 
 	tup = heap_form_tuple(RelationGetDescr(taskrel), values, nulls);
 	CatalogTupleInsert(taskrel, tup);
@@ -5408,8 +5460,7 @@ qx_runtime_test_start_uncheckpointed_task(Oid sessionoid,
 	request.authorized_tool_tokens = authz.tool_token_cost;
 	request.authorized_tool_cost = authz.tool_cost_units;
 
-	selected_contract = request.authorized_tools != NIL ?
-		strVal((Node *) linitial(request.authorized_tools)) : NULL;
+	selected_contract = qx_runtime_request_phase_contract(&request, false);
 	if (selected_contract == NULL)
 	{
 		QxCatalogFreeAgentInfo(&agent);
@@ -6046,8 +6097,7 @@ QxRuntimeSubmitTask(const QxRuntimeTaskRequest *request)
 								   "initial");
 	CommandCounterIncrement();
 
-	selected_contract = request->authorized_tools != NIL ?
-		strVal((Node *) linitial(request->authorized_tools)) : NULL;
+	selected_contract = qx_runtime_request_phase_contract(request, false);
 	agent_name = qx_fetch_agent_name(request->agentoid);
 	qx_scheduler_fill_envelope(&scheduler_envelope,
 							   request->ownerid,
@@ -6283,7 +6333,7 @@ QxRuntimeResumeTask(Oid taskoid, const char *checkpoint_label, Oid ownerid)
 	int16		nextattemptseqno;
 	int16		resume_stepseqno;
 	List	   *authorized_contracts;
-	const char *selected_contract;
+	char	   *selected_contract;
 	char	   *stored_label;
 	char	   *payload;
 	char	   *checkpoint_data;
@@ -6388,8 +6438,7 @@ QxRuntimeResumeTask(Oid taskoid, const char *checkpoint_label, Oid ownerid)
 						   attemptoid, true, InvalidOid, false);
 
 	authorized_contracts = qx_parse_task_authorized_contracts(task.authorized_tools);
-	selected_contract = authorized_contracts != NIL ?
-		strVal((Node *) llast(authorized_contracts)) : NULL;
+	selected_contract = qx_runtime_task_phase_contract(&task, true);
 	goal_text = task.goal != NULL ? pstrdup(task.goal) : NULL;
 	input_present = task.input != NULL;
 	qx_scheduler_fill_envelope(&scheduler_envelope,
@@ -6555,6 +6604,8 @@ QxRuntimeResumeTask(Oid taskoid, const char *checkpoint_label, Oid ownerid)
 	pfree(payload);
 	if (goal_text != NULL)
 		pfree(goal_text);
+	if (selected_contract != NULL)
+		pfree(selected_contract);
 	if (authorized_contracts != NIL)
 		list_free_deep(authorized_contracts);
 	qx_free_external_result(&tool_result);

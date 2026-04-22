@@ -167,6 +167,8 @@ typedef struct QxCatalogTaskInfo
 	char	   *input;
 	char	   *priority;
 	char	   *authorized_tools;
+	char	   *submit_contract;
+	char	   *resume_contract;
 	char	   *agent_name;
 	char	   *identity_name;
 	char	   *policy_name;

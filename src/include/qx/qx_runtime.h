@@ -29,6 +29,8 @@ typedef struct QxRuntimeTaskRequest
 	const char *priority;
 	List	   *authorized_tools;
 	List	   *authorized_tool_oids;
+	const char *submit_contract;
+	const char *resume_contract;
 	int32		budget_tokens;
 	int32		budget_cost;
 	int32		estimated_tokens;

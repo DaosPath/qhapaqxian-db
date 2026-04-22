@@ -722,6 +722,12 @@ qx_catalog_fill_task_info(HeapTuple tup, QxCatalogTaskInfo *info)
 	info->authorized_tools = QxCatalogTextAttr(tup,
 											  Anum_pg_qx_task_qxtaskauthorizedtools,
 											  QXTASKOID);
+	info->submit_contract = QxCatalogTextAttr(tup,
+											  Anum_pg_qx_task_qxtasksubmitcontract,
+											  QXTASKOID);
+	info->resume_contract = QxCatalogTextAttr(tup,
+											  Anum_pg_qx_task_qxtaskresumecontract,
+											  QXTASKOID);
 
 	if (OidIsValid(info->agentoid) &&
 		QxCatalogLookupAgentByOid(info->agentoid, &agent))
@@ -871,6 +877,8 @@ QxCatalogFreeTaskInfo(QxCatalogTaskInfo *info)
 	QxCatalogFreeString(&info->input);
 	QxCatalogFreeString(&info->priority);
 	QxCatalogFreeString(&info->authorized_tools);
+	QxCatalogFreeString(&info->submit_contract);
+	QxCatalogFreeString(&info->resume_contract);
 	QxCatalogFreeString(&info->agent_name);
 	QxCatalogFreeString(&info->identity_name);
 	QxCatalogFreeString(&info->policy_name);
