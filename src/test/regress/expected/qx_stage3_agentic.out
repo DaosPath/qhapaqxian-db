@@ -909,7 +909,9 @@ ORDER BY attempt_seqno, queue_kind, retry_count;
 
 SELECT task_oid = :qx_container_task_oid AS task_match,
        attempt_seqno,
-       worker_name::text AS worker_name,
+       regexp_replace(worker_name::text,
+                      'slot [0-9]+/[0-9]+$',
+                      'slot <slot>/<slots>') AS worker_name,
        queue_name::text AS queue_name,
        runtime_class::text AS runtime_class,
        provider_name::text AS provider_name,
@@ -921,18 +923,20 @@ SELECT task_oid = :qx_container_task_oid AS task_match,
 FROM pg_stat_qx_scheduler_ledger_leases
 WHERE task_oid = :qx_container_task_oid
 ORDER BY attempt_seqno, lease_state, renewal_count, worker_name, provider_name;
- task_match | attempt_seqno |                 worker_name                 |       queue_name       | runtime_class |   provider_name    | provider_kind | lease_state | renewal_count | needs_recovery | lease_expired 
-------------+---------------+---------------------------------------------+------------------------+---------------+--------------------+---------------+-------------+---------------+----------------+---------------
- t          |             1 | embedded-runtime                            | guarded:high:extractor | container     | container_provider | container     |           1 |             0 | f              | t
- t          |             1 | embedded-runtime                            | guarded:high:extractor | container     | container_provider | container     |           3 |             0 | f              | f
- t          |             2 | embedded-runtime                            | guarded:high:extractor | container     | container_provider | container     |           1 |             0 | f              | t
- t          |             2 | embedded-runtime                            | guarded:high:extractor | container     | container_provider | container     |           1 |             1 | f              | t
- t          |             2 | qhapaqxian scheduler db regression slot 2/2 | guarded:high:extractor | container     | container_provider | container     |           4 |             1 | t              | f
+ task_match | attempt_seqno |                      worker_name                       |       queue_name       | runtime_class |   provider_name    | provider_kind | lease_state | renewal_count | needs_recovery | lease_expired 
+------------+---------------+--------------------------------------------------------+------------------------+---------------+--------------------+---------------+-------------+---------------+----------------+---------------
+ t          |             1 | embedded-runtime                                       | guarded:high:extractor | container     | container_provider | container     |           1 |             0 | f              | t
+ t          |             1 | embedded-runtime                                       | guarded:high:extractor | container     | container_provider | container     |           3 |             0 | f              | f
+ t          |             2 | embedded-runtime                                       | guarded:high:extractor | container     | container_provider | container     |           1 |             0 | f              | t
+ t          |             2 | embedded-runtime                                       | guarded:high:extractor | container     | container_provider | container     |           1 |             1 | f              | t
+ t          |             2 | qhapaqxian scheduler db regression slot <slot>/<slots> | guarded:high:extractor | container     | container_provider | container     |           4 |             1 | t              | f
 (5 rows)
 
 SELECT task_oid = :qx_container_task_oid AS task_match,
        attempt_seqno,
-       worker_name::text AS worker_name,
+       regexp_replace(worker_name::text,
+                      'slot [0-9]+/[0-9]+$',
+                      'slot <slot>/<slots>') AS worker_name,
        queue_name::text AS queue_name,
        runtime_class::text AS runtime_class,
        provider_kind::text AS provider_kind,
@@ -944,13 +948,13 @@ SELECT task_oid = :qx_container_task_oid AS task_match,
 FROM pg_stat_qx_scheduler_ledger_heartbeats
 WHERE task_oid = :qx_container_task_oid
 ORDER BY attempt_seqno, receipt_mode, worker_name, provider_kind;
- task_match | attempt_seqno |                 worker_name                 |       queue_name       | runtime_class | provider_kind |   receipt_mode    | heartbeat_state | lag_ms | stale | needs_attention 
-------------+---------------+---------------------------------------------+------------------------+---------------+---------------+-------------------+-----------------+--------+-------+-----------------
- t          |             1 | embedded-runtime                            | guarded:high:extractor | container     | container     | scheduler-ledger  |               0 |      0 | f     | f
- t          |             1 | embedded-runtime                            | guarded:high:extractor | container     | container     | scheduler-release |               0 |      0 | f     | f
- t          |             2 | embedded-runtime                            | guarded:high:extractor | container     | container     | scheduler-ledger  |               0 |      0 | f     | f
- t          |             2 | qhapaqxian scheduler db regression slot 2/2 | guarded:high:extractor | container     | container     | scheduler-reclaim |               3 |   1500 | t     | f
- t          |             2 | embedded-runtime                            | guarded:high:extractor | container     | container     | scheduler-renew   |               0 |      0 | f     | f
+ task_match | attempt_seqno |                      worker_name                       |       queue_name       | runtime_class | provider_kind |   receipt_mode    | heartbeat_state | lag_ms | stale | needs_attention 
+------------+---------------+--------------------------------------------------------+------------------------+---------------+---------------+-------------------+-----------------+--------+-------+-----------------
+ t          |             1 | embedded-runtime                                       | guarded:high:extractor | container     | container     | scheduler-ledger  |               0 |      0 | f     | f
+ t          |             1 | embedded-runtime                                       | guarded:high:extractor | container     | container     | scheduler-release |               0 |      0 | f     | f
+ t          |             2 | embedded-runtime                                       | guarded:high:extractor | container     | container     | scheduler-ledger  |               0 |      0 | f     | f
+ t          |             2 | qhapaqxian scheduler db regression slot <slot>/<slots> | guarded:high:extractor | container     | container     | scheduler-reclaim |               3 |   1500 | t     | f
+ t          |             2 | embedded-runtime                                       | guarded:high:extractor | container     | container     | scheduler-renew   |               0 |      0 | f     | f
 (5 rows)
 
 SELECT agent_name::text AS agent_name,
@@ -1043,7 +1047,9 @@ ORDER BY queue_name;
  guarded:high:extractor | guarded               |          2 |              80 | container     | container_provider | container     |          1 |                 0 |                  0 |                       1 |                    0 |                   1 |           3 |                  1500 |         4500
 (2 rows)
 
-SELECT worker_name::text AS worker_name,
+SELECT regexp_replace(worker_name::text,
+                      'slot [0-9]+/[0-9]+$',
+                      'slot <slot>/<slots>') AS worker_name,
        runtime_class::text AS runtime_class,
        provider_name::text AS provider_name,
        provider_kind::text AS provider_kind,
@@ -1059,10 +1065,10 @@ SELECT worker_name::text AS worker_name,
        heartbeat_state
 FROM pg_stat_qx_scheduler_workers
 ORDER BY worker_name, runtime_class, provider_name;
-                 worker_name                 | runtime_class |   provider_name    | provider_kind | dispatched_task_count | queue_count | running_task_count | checkpointed_task_count | completed_task_count | retrying_task_count | expired_lease_count | stale_heartbeat_count | lease_state | heartbeat_state 
----------------------------------------------+---------------+--------------------+---------------+-----------------------+-------------+--------------------+-------------------------+----------------------+---------------------+---------------------+-----------------------+-------------+-----------------
- embedded-runtime                            | microvm       | microvm_provider   | microvm       |                     1 |           1 |                  0 |                       0 |                    1 |                   1 |                   0 |                     0 |           3 |               0
- qhapaqxian scheduler db regression slot 2/2 | container     | container_provider | container     |                     1 |           1 |                  0 |                       1 |                    0 |                   1 |                   0 |                     1 |           4 |               3
+                      worker_name                       | runtime_class |   provider_name    | provider_kind | dispatched_task_count | queue_count | running_task_count | checkpointed_task_count | completed_task_count | retrying_task_count | expired_lease_count | stale_heartbeat_count | lease_state | heartbeat_state 
+--------------------------------------------------------+---------------+--------------------+---------------+-----------------------+-------------+--------------------+-------------------------+----------------------+---------------------+---------------------+-----------------------+-------------+-----------------
+ embedded-runtime                                       | microvm       | microvm_provider   | microvm       |                     1 |           1 |                  0 |                       0 |                    1 |                   1 |                   0 |                     0 |           3 |               0
+ qhapaqxian scheduler db regression slot <slot>/<slots> | container     | container_provider | container     |                     1 |           1 |                  0 |                       1 |                    0 |                   1 |                   0 |                     1 |           4 |               3
 (2 rows)
 
 SELECT task_oid = :qx_task_oid AS task_match,
@@ -1091,7 +1097,9 @@ ORDER BY attempt_seqno, queue_name, queue_kind, retry_count, runtime_class, prov
 
 SELECT task_oid = :qx_task_oid AS task_match,
        attempt_seqno,
-       worker_name::text AS worker_name,
+       regexp_replace(worker_name::text,
+                      'slot [0-9]+/[0-9]+$',
+                      'slot <slot>/<slots>') AS worker_name,
        queue_name::text AS queue_name,
        runtime_class::text AS runtime_class,
        provider_name::text AS provider_name,
@@ -1102,22 +1110,24 @@ SELECT task_oid = :qx_task_oid AS task_match,
        lease_expired
 FROM pg_stat_qx_scheduler_ledger_leases
 ORDER BY attempt_seqno, lease_state, renewal_count, worker_name, provider_name;
- task_match | attempt_seqno |                 worker_name                 |       queue_name       | runtime_class |   provider_name    | provider_kind | lease_state | renewal_count | needs_recovery | lease_expired 
-------------+---------------+---------------------------------------------+------------------------+---------------+--------------------+---------------+-------------+---------------+----------------+---------------
- f          |             1 | embedded-runtime                            | guarded:high:extractor | container     | container_provider | container     |           1 |             0 | f              | t
- t          |             1 | embedded-runtime                            | guarded:high:archivist | host          | loopback_provider  | loopback      |           1 |             0 | f              | t
- f          |             1 | embedded-runtime                            | guarded:high:extractor | container     | container_provider | container     |           3 |             0 | f              | f
- t          |             1 | embedded-runtime                            | guarded:high:archivist | host          | loopback_provider  | loopback      |           3 |             0 | f              | f
- f          |             2 | embedded-runtime                            | guarded:high:extractor | container     | container_provider | container     |           1 |             0 | f              | t
- t          |             2 | embedded-runtime                            | guarded:high:archivist | microvm       | microvm_provider   | microvm       |           1 |             0 | f              | t
- f          |             2 | embedded-runtime                            | guarded:high:extractor | container     | container_provider | container     |           1 |             1 | f              | t
- t          |             2 | embedded-runtime                            | guarded:high:archivist | microvm       | microvm_provider   | microvm       |           3 |             0 | f              | f
- f          |             2 | qhapaqxian scheduler db regression slot 2/2 | guarded:high:extractor | container     | container_provider | container     |           4 |             1 | t              | f
+ task_match | attempt_seqno |                      worker_name                       |       queue_name       | runtime_class |   provider_name    | provider_kind | lease_state | renewal_count | needs_recovery | lease_expired 
+------------+---------------+--------------------------------------------------------+------------------------+---------------+--------------------+---------------+-------------+---------------+----------------+---------------
+ f          |             1 | embedded-runtime                                       | guarded:high:extractor | container     | container_provider | container     |           1 |             0 | f              | t
+ t          |             1 | embedded-runtime                                       | guarded:high:archivist | host          | loopback_provider  | loopback      |           1 |             0 | f              | t
+ f          |             1 | embedded-runtime                                       | guarded:high:extractor | container     | container_provider | container     |           3 |             0 | f              | f
+ t          |             1 | embedded-runtime                                       | guarded:high:archivist | host          | loopback_provider  | loopback      |           3 |             0 | f              | f
+ f          |             2 | embedded-runtime                                       | guarded:high:extractor | container     | container_provider | container     |           1 |             0 | f              | t
+ t          |             2 | embedded-runtime                                       | guarded:high:archivist | microvm       | microvm_provider   | microvm       |           1 |             0 | f              | t
+ f          |             2 | embedded-runtime                                       | guarded:high:extractor | container     | container_provider | container     |           1 |             1 | f              | t
+ t          |             2 | embedded-runtime                                       | guarded:high:archivist | microvm       | microvm_provider   | microvm       |           3 |             0 | f              | f
+ f          |             2 | qhapaqxian scheduler db regression slot <slot>/<slots> | guarded:high:extractor | container     | container_provider | container     |           4 |             1 | t              | f
 (9 rows)
 
 SELECT task_oid = :qx_task_oid AS task_match,
        attempt_seqno,
-       worker_name::text AS worker_name,
+       regexp_replace(worker_name::text,
+                      'slot [0-9]+/[0-9]+$',
+                      'slot <slot>/<slots>') AS worker_name,
        queue_name::text AS queue_name,
        runtime_class::text AS runtime_class,
        provider_kind::text AS provider_kind,
@@ -1128,17 +1138,17 @@ SELECT task_oid = :qx_task_oid AS task_match,
        needs_attention AND stale AS needs_attention
 FROM pg_stat_qx_scheduler_ledger_heartbeats
 ORDER BY attempt_seqno, receipt_mode, worker_name, provider_kind;
- task_match | attempt_seqno |                 worker_name                 |       queue_name       | runtime_class | provider_kind |   receipt_mode    | heartbeat_state | lag_ms | stale | needs_attention 
-------------+---------------+---------------------------------------------+------------------------+---------------+---------------+-------------------+-----------------+--------+-------+-----------------
- f          |             1 | embedded-runtime                            | guarded:high:extractor | container     | container     | scheduler-ledger  |               0 |      0 | f     | f
- t          |             1 | embedded-runtime                            | guarded:high:archivist | host          | loopback      | scheduler-ledger  |               0 |      0 | f     | f
- f          |             1 | embedded-runtime                            | guarded:high:extractor | container     | container     | scheduler-release |               0 |      0 | f     | f
- t          |             1 | embedded-runtime                            | guarded:high:archivist | host          | loopback      | scheduler-release |               0 |      0 | f     | f
- f          |             2 | embedded-runtime                            | guarded:high:extractor | container     | container     | scheduler-ledger  |               0 |      0 | f     | f
- t          |             2 | embedded-runtime                            | guarded:high:archivist | microvm       | microvm       | scheduler-ledger  |               0 |      0 | f     | f
- f          |             2 | qhapaqxian scheduler db regression slot 2/2 | guarded:high:extractor | container     | container     | scheduler-reclaim |               3 |   1500 | t     | f
- t          |             2 | embedded-runtime                            | guarded:high:archivist | microvm       | microvm       | scheduler-release |               0 |      0 | f     | f
- f          |             2 | embedded-runtime                            | guarded:high:extractor | container     | container     | scheduler-renew   |               0 |      0 | f     | f
+ task_match | attempt_seqno |                      worker_name                       |       queue_name       | runtime_class | provider_kind |   receipt_mode    | heartbeat_state | lag_ms | stale | needs_attention 
+------------+---------------+--------------------------------------------------------+------------------------+---------------+---------------+-------------------+-----------------+--------+-------+-----------------
+ f          |             1 | embedded-runtime                                       | guarded:high:extractor | container     | container     | scheduler-ledger  |               0 |      0 | f     | f
+ t          |             1 | embedded-runtime                                       | guarded:high:archivist | host          | loopback      | scheduler-ledger  |               0 |      0 | f     | f
+ f          |             1 | embedded-runtime                                       | guarded:high:extractor | container     | container     | scheduler-release |               0 |      0 | f     | f
+ t          |             1 | embedded-runtime                                       | guarded:high:archivist | host          | loopback      | scheduler-release |               0 |      0 | f     | f
+ f          |             2 | embedded-runtime                                       | guarded:high:extractor | container     | container     | scheduler-ledger  |               0 |      0 | f     | f
+ t          |             2 | embedded-runtime                                       | guarded:high:archivist | microvm       | microvm       | scheduler-ledger  |               0 |      0 | f     | f
+ f          |             2 | qhapaqxian scheduler db regression slot <slot>/<slots> | guarded:high:extractor | container     | container     | scheduler-reclaim |               3 |   1500 | t     | f
+ t          |             2 | embedded-runtime                                       | guarded:high:archivist | microvm       | microvm       | scheduler-release |               0 |      0 | f     | f
+ f          |             2 | embedded-runtime                                       | guarded:high:extractor | container     | container     | scheduler-renew   |               0 |      0 | f     | f
 (9 rows)
 
 SELECT provider_name::text AS provider_name,

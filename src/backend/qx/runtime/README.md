@@ -21,6 +21,10 @@ Current state:
 - postmaster now registers a runtime-owned scheduler launcher bgworker, and
   that launcher spawns a fixed slot set of scheduler database workers per
   connectable database (currently 2 slots).
+- in pg_regress temp clusters, the launcher intentionally limits autonomous
+  scheduler workers to the canonical `regression` database; this keeps the
+  daemon real for QX tests without holding persistent connections to transient
+  upstream regression databases that are created and dropped inside core tests.
 - each scheduler database worker now wakes periodically, scans running tasks
   against the durable lease ledger, renews a held lease once, then reclaims
   stale checkpoint-backed work, repairs task/attempt state back to

@@ -2088,6 +2088,663 @@ pg_stat_qx_agents| SELECT a.oid AS agent_oid,
      LEFT JOIN pg_namespace n ON ((n.oid = a.qxagentnamespace)))
      LEFT JOIN pg_qx_namespace qxn ON ((qxn.oid = a.qxnamespacepolicyid)))
   WHERE (pg_has_role(SESSION_USER, a.qxagentowner, 'USAGE'::text) OR pg_has_role(SESSION_USER, 'pg_read_all_stats'::name, 'MEMBER'::text));
+pg_stat_qx_principals| SELECT p.oid AS principal_oid,
+    n.nspname AS schemaname,
+    p.qxprincipalname AS principal_name,
+    pg_get_userbyid(p.qxprincipalowner) AS owner_name,
+    p.qxprincipalprovider AS provider_name,
+    prov.qxproviderkind AS provider_kind,
+    p.qxprincipalruntimeclass AS runtime_class,
+    p.qxprincipalsandbox AS sandbox_name,
+    p.qxprincipalprogram AS program_name,
+    p.qxprincipalreceiptsigner AS receipt_signer,
+    p.qxprincipalenabled AS enabled,
+    (p.qxprincipalreceiptsigner IS NOT NULL) AS has_signer,
+    ( SELECT count(DISTINCT tr.qxtracetaskid) AS count
+           FROM pg_qx_trace tr
+          WHERE ((tr.qxtracename = ANY (ARRAY['runtime.external_submit'::text, 'runtime.external_resume'::text])) AND (pg_qx_trace_detail_value(tr.qxtracedetail, 'principal'::text) = p.qxprincipalname))) AS task_count,
+    ( SELECT count(*) AS count
+           FROM pg_qx_trace tr
+          WHERE ((tr.qxtracename = 'runtime.external_submit'::text) AND (pg_qx_trace_detail_value(tr.qxtracedetail, 'principal'::text) = p.qxprincipalname))) AS submit_count,
+    ( SELECT count(*) AS count
+           FROM pg_qx_trace tr
+          WHERE ((tr.qxtracename = 'runtime.external_resume'::text) AND (pg_qx_trace_detail_value(tr.qxtracedetail, 'principal'::text) = p.qxprincipalname))) AS resume_count,
+    ( SELECT count(*) AS count
+           FROM pg_qx_trace tr
+          WHERE ((tr.qxtracename = ANY (ARRAY['runtime.external_submit'::text, 'runtime.external_resume'::text])) AND (pg_qx_trace_detail_value(tr.qxtracedetail, 'principal'::text) = p.qxprincipalname) AND (pg_qx_trace_detail_value(tr.qxtracedetail, 'receipt_sig'::text) = 'verified'::text))) AS verified_receipt_count
+   FROM ((pg_qx_principal p
+     LEFT JOIN pg_namespace n ON ((n.oid = p.qxprincipalnamespace)))
+     LEFT JOIN pg_qx_provider prov ON ((prov.oid = p.qxprincipalproviderid)))
+  WHERE (pg_has_role(SESSION_USER, p.qxprincipalowner, 'USAGE'::text) OR pg_has_role(SESSION_USER, 'pg_read_all_stats'::name, 'MEMBER'::text));
+pg_stat_qx_providers| SELECT p.oid AS provider_oid,
+    n.nspname AS schemaname,
+    p.qxprovidername AS provider_name,
+    pg_get_userbyid(p.qxproviderowner) AS owner_name,
+    p.qxproviderkind AS provider_kind,
+    p.qxproviderendpoint AS provider_endpoint,
+    p.qxproviderreceiptalg AS receipt_alg,
+    p.qxproviderenabled AS enabled,
+    p.qxproviderattestationrequired AS attestation_required,
+    ( SELECT count(*) AS count
+           FROM pg_qx_principal pr
+          WHERE (pr.qxprincipalproviderid = p.oid)) AS principal_count,
+    ( SELECT count(DISTINCT tr.qxtracetaskid) AS count
+           FROM pg_qx_trace tr
+          WHERE ((tr.qxtracename = ANY (ARRAY['runtime.external_submit'::text, 'runtime.external_resume'::text])) AND (pg_qx_trace_detail_value(tr.qxtracedetail, 'provider'::text) = p.qxprovidername))) AS task_count,
+    ( SELECT count(*) AS count
+           FROM pg_qx_trace tr
+          WHERE ((tr.qxtracename = 'runtime.external_submit'::text) AND (pg_qx_trace_detail_value(tr.qxtracedetail, 'provider'::text) = p.qxprovidername))) AS submit_count,
+    ( SELECT count(*) AS count
+           FROM pg_qx_trace tr
+          WHERE ((tr.qxtracename = 'runtime.external_resume'::text) AND (pg_qx_trace_detail_value(tr.qxtracedetail, 'provider'::text) = p.qxprovidername))) AS resume_count,
+    ( SELECT count(*) AS count
+           FROM pg_qx_trace tr
+          WHERE ((tr.qxtracename = ANY (ARRAY['runtime.external_submit'::text, 'runtime.external_resume'::text])) AND (pg_qx_trace_detail_value(tr.qxtracedetail, 'provider'::text) = p.qxprovidername) AND (pg_qx_trace_detail_value(tr.qxtracedetail, 'receipt_sig'::text) = 'verified'::text))) AS verified_receipt_count
+   FROM (pg_qx_provider p
+     LEFT JOIN pg_namespace n ON ((n.oid = p.qxprovidernamespace)))
+  WHERE (pg_has_role(SESSION_USER, p.qxproviderowner, 'USAGE'::text) OR pg_has_role(SESSION_USER, 'pg_read_all_stats'::name, 'MEMBER'::text));
+pg_stat_qx_runtime_classes| SELECT qxprincipalruntimeclass AS runtime_class,
+    count(*) AS principal_count,
+    count(DISTINCT qxprincipalproviderid) AS provider_count,
+    ( SELECT count(DISTINCT tr.qxtracetaskid) AS count
+           FROM pg_qx_trace tr
+          WHERE ((tr.qxtracename = ANY (ARRAY['runtime.external_submit'::text, 'runtime.external_resume'::text])) AND (pg_qx_trace_detail_value(tr.qxtracedetail, 'principal_runtime'::text) = p.qxprincipalruntimeclass))) AS task_count,
+    ( SELECT count(*) AS count
+           FROM pg_qx_trace tr
+          WHERE ((tr.qxtracename = 'runtime.external_submit'::text) AND (pg_qx_trace_detail_value(tr.qxtracedetail, 'principal_runtime'::text) = p.qxprincipalruntimeclass))) AS submit_count,
+    ( SELECT count(*) AS count
+           FROM pg_qx_trace tr
+          WHERE ((tr.qxtracename = 'runtime.external_resume'::text) AND (pg_qx_trace_detail_value(tr.qxtracedetail, 'principal_runtime'::text) = p.qxprincipalruntimeclass))) AS resume_count,
+    ( SELECT count(*) AS count
+           FROM pg_qx_trace tr
+          WHERE ((tr.qxtracename = ANY (ARRAY['runtime.external_submit'::text, 'runtime.external_resume'::text])) AND (pg_qx_trace_detail_value(tr.qxtracedetail, 'principal_runtime'::text) = p.qxprincipalruntimeclass) AND (pg_qx_trace_detail_value(tr.qxtracedetail, 'receipt_sig'::text) = 'verified'::text))) AS verified_receipt_count
+   FROM pg_qx_principal p
+  WHERE (pg_has_role(SESSION_USER, qxprincipalowner, 'USAGE'::text) OR pg_has_role(SESSION_USER, 'pg_read_all_stats'::name, 'MEMBER'::text))
+  GROUP BY qxprincipalruntimeclass;
+pg_stat_qx_scheduler_activity| WITH visible_queue AS (
+         SELECT q.oid,
+            q.qxqueueledgerdbid,
+            q.qxqueueledgerowner,
+            q.qxqueueledgernamespaceid,
+            q.qxqueueledgeragentid,
+            q.qxqueueledgersessionid,
+            q.qxqueueledgertaskid,
+            q.qxqueueledgerattemptid,
+            q.qxqueueledgerkind,
+            q.qxqueueledgerrunnablecount,
+            q.qxqueueledgerleasedcount,
+            q.qxqueueledgerblockedcount,
+            q.qxqueueledgerretrycount,
+            q.qxqueueledgerenqueuedat,
+            q.qxqueueledgereligibleat,
+            q.qxqueueledgerupdatedat,
+            q.qxqueueledgername,
+            q.qxqueueledgeragentname,
+            q.qxqueueledgeridentityname,
+            q.qxqueueledgernamespacepolicyname,
+            q.qxqueueledgerpriority,
+            q.qxqueueledgerprincipalname,
+            q.qxqueueledgerprovidername,
+            q.qxqueueledgerproviderkind,
+            q.qxqueueledgerprincipalruntime
+           FROM pg_qx_scheduler_queue q
+          WHERE (pg_has_role(SESSION_USER, q.qxqueueledgerowner, 'USAGE'::text) OR pg_has_role(SESSION_USER, 'pg_read_all_stats'::name, 'MEMBER'::text))
+        ), visible_lease AS (
+         SELECT l.oid,
+            l.qxleaseledgerdbid,
+            l.qxleaseledgerowner,
+            l.qxleaseledgerqueueid,
+            l.qxleaseledgerworkerid,
+            l.qxleaseledgersessionid,
+            l.qxleaseledgertaskid,
+            l.qxleaseledgerattemptid,
+            l.qxleaseledgerstate,
+            l.qxleaseledgeracquiredat,
+            l.qxleaseledgerrenewedat,
+            l.qxleaseledgerexpiresat,
+            l.qxleaseledgerlastheartbeatat,
+            l.qxleaseledgerrenewalcount,
+            l.qxleaseledgerneedsrecovery,
+            l.qxleaseledgerqueuename,
+            l.qxleaseledgerworkername,
+            l.qxleaseledgerleasetoken,
+            l.qxleaseledgerprincipalname,
+            l.qxleaseledgerprovidername,
+            l.qxleaseledgerproviderkind,
+            l.qxleaseledgerprincipalruntime
+           FROM pg_qx_scheduler_lease l
+          WHERE (pg_has_role(SESSION_USER, l.qxleaseledgerowner, 'USAGE'::text) OR pg_has_role(SESSION_USER, 'pg_read_all_stats'::name, 'MEMBER'::text))
+        ), visible_heartbeat AS (
+         SELECT h.oid,
+            h.qxheartbeatledgerdbid,
+            h.qxheartbeatledgerowner,
+            h.qxheartbeatledgerleaseid,
+            h.qxheartbeatledgerworkerid,
+            h.qxheartbeatledgersessionid,
+            h.qxheartbeatledgertaskid,
+            h.qxheartbeatledgerattemptid,
+            h.qxheartbeatledgerstate,
+            h.qxheartbeatledgerlagms,
+            h.qxheartbeatledgerobservedat,
+            h.qxheartbeatledgerexpectedbefore,
+            h.qxheartbeatledgerstale,
+            h.qxheartbeatledgerworkername,
+            h.qxheartbeatledgerqueuename,
+            h.qxheartbeatledgerprincipalruntime,
+            h.qxheartbeatledgerproviderkind,
+            h.qxheartbeatledgerreceiptmode
+           FROM pg_qx_scheduler_heartbeat h
+          WHERE (pg_has_role(SESSION_USER, h.qxheartbeatledgerowner, 'USAGE'::text) OR pg_has_role(SESSION_USER, 'pg_read_all_stats'::name, 'MEMBER'::text))
+        ), latest_queue AS (
+         SELECT DISTINCT ON (q.qxqueueledgertaskid) q.qxqueueledgertaskid AS task_oid,
+            q.qxqueueledgername AS queue_name,
+            q.qxqueueledgerprincipalruntime AS runtime_class,
+            q.qxqueueledgerprovidername AS provider_name,
+            q.qxqueueledgerproviderkind AS provider_kind,
+            q.qxqueueledgerkind AS queue_kind,
+            q.qxqueueledgerrunnablecount AS runnable_count,
+            q.qxqueueledgerblockedcount AS blocked_count,
+            q.qxqueueledgerretrycount AS retry_count,
+            q.qxqueueledgereligibleat AS eligible_at,
+            q.qxqueueledgerupdatedat AS updated_at
+           FROM (visible_queue q
+             LEFT JOIN pg_qx_attempt a ON ((a.oid = q.qxqueueledgerattemptid)))
+          ORDER BY q.qxqueueledgertaskid, a.qxattemptseqno DESC, q.oid DESC
+        ), latest_lease AS (
+         SELECT DISTINCT ON (l.qxleaseledgertaskid) l.qxleaseledgertaskid AS task_oid,
+            l.qxleaseledgerqueuename AS queue_name,
+            l.qxleaseledgerprincipalruntime AS runtime_class,
+            l.qxleaseledgerprovidername AS provider_name,
+            l.qxleaseledgerproviderkind AS provider_kind,
+            l.qxleaseledgerstate AS lease_state,
+            l.qxleaseledgerexpiresat AS expires_at,
+            l.qxleaseledgerlastheartbeatat AS last_heartbeat_at,
+            l.qxleaseledgerrenewedat AS renewed_at
+           FROM (visible_lease l
+             LEFT JOIN pg_qx_attempt a ON ((a.oid = l.qxleaseledgerattemptid)))
+          ORDER BY l.qxleaseledgertaskid, a.qxattemptseqno DESC, l.oid DESC
+        ), latest_heartbeat AS (
+         SELECT DISTINCT ON (h.qxheartbeatledgertaskid) h.qxheartbeatledgertaskid AS task_oid,
+            COALESCE(l.qxleaseledgerqueuename, h.qxheartbeatledgerqueuename) AS queue_name,
+            COALESCE(l.qxleaseledgerprincipalruntime, h.qxheartbeatledgerprincipalruntime) AS runtime_class,
+            l.qxleaseledgerprovidername AS provider_name,
+            COALESCE(l.qxleaseledgerproviderkind, h.qxheartbeatledgerproviderkind) AS provider_kind,
+            h.qxheartbeatledgerstate AS heartbeat_state,
+            h.qxheartbeatledgerstale AS stale,
+            h.qxheartbeatledgerobservedat AS observed_at
+           FROM ((visible_heartbeat h
+             LEFT JOIN visible_lease l ON ((l.oid = h.qxheartbeatledgerleaseid)))
+             LEFT JOIN pg_qx_attempt a ON ((a.oid = h.qxheartbeatledgerattemptid)))
+          ORDER BY h.qxheartbeatledgertaskid, a.qxattemptseqno DESC, h.oid DESC
+        ), current_task_metrics AS (
+         SELECT COALESCE(lq.queue_name, ll.queue_name, lh.queue_name) AS queue_name,
+            COALESCE(lq.runtime_class, ll.runtime_class, lh.runtime_class) AS runtime_class,
+            COALESCE(lq.provider_name, ll.provider_name, lh.provider_name) AS provider_name,
+            COALESCE(lq.provider_kind, ll.provider_kind, lh.provider_kind) AS provider_kind,
+            count(*) FILTER (WHERE (t.qxtaskstate = 'q'::"char")) AS queued_task_count,
+            count(*) FILTER (WHERE ((t.qxtaskstate = 'q'::"char") AND (lq.queue_name IS NOT NULL) AND (lq.runnable_count > 0) AND (lq.blocked_count = 0) AND (lq.eligible_at <= clock_timestamp()))) AS eligible_task_count,
+            count(*) FILTER (WHERE ((t.qxtaskstate = 'q'::"char") AND (lq.queue_kind = 1))) AS queued_retry_task_count,
+            count(*) FILTER (WHERE ((t.qxtaskstate = 'q'::"char") AND (lq.queue_kind = 2))) AS queued_recovery_task_count,
+            count(*) FILTER (WHERE (t.qxtaskstate = 'r'::"char")) AS running_task_count,
+            count(*) FILTER (WHERE (t.qxtaskstate = 'k'::"char")) AS checkpointed_task_count,
+            count(*) FILTER (WHERE (t.qxtaskstate = 'c'::"char")) AS completed_task_count,
+            count(*) FILTER (WHERE ((ll.lease_state = 1) AND (clock_timestamp() <= ll.expires_at))) AS active_lease_count,
+            count(*) FILTER (WHERE ((ll.lease_state = 2) OR ((ll.lease_state <> ALL (ARRAY[3, 4])) AND (clock_timestamp() > ll.expires_at)))) AS expired_lease_count,
+            count(*) FILTER (WHERE COALESCE(lh.stale, false)) AS stale_heartbeat_task_count,
+            count(*) FILTER (WHERE (lh.heartbeat_state = 3)) AS missed_heartbeat_task_count
+           FROM (((pg_qx_task t
+             LEFT JOIN latest_queue lq ON ((lq.task_oid = t.oid)))
+             LEFT JOIN latest_lease ll ON ((ll.task_oid = t.oid)))
+             LEFT JOIN latest_heartbeat lh ON ((lh.task_oid = t.oid)))
+          WHERE (COALESCE(lq.queue_name, ll.queue_name, lh.queue_name) IS NOT NULL)
+          GROUP BY COALESCE(lq.queue_name, ll.queue_name, lh.queue_name), COALESCE(lq.runtime_class, ll.runtime_class, lh.runtime_class), COALESCE(lq.provider_name, ll.provider_name, lh.provider_name), COALESCE(lq.provider_kind, ll.provider_kind, lh.provider_kind)
+        ), queue_event_metrics AS (
+         SELECT q.qxqueueledgername AS queue_name,
+            q.qxqueueledgerprincipalruntime AS runtime_class,
+            q.qxqueueledgerprovidername AS provider_name,
+            q.qxqueueledgerproviderkind AS provider_kind,
+            count(*) AS queue_snapshot_count,
+            count(*) FILTER (WHERE (q.qxqueueledgerkind = 1)) AS retry_queue_snapshot_count,
+            count(*) FILTER (WHERE (q.qxqueueledgerkind = 2)) AS recovery_queue_snapshot_count,
+            max(q.qxqueueledgerupdatedat) AS last_queue_update_at
+           FROM visible_queue q
+          GROUP BY q.qxqueueledgername, q.qxqueueledgerprincipalruntime, q.qxqueueledgerprovidername, q.qxqueueledgerproviderkind
+        ), lease_event_metrics AS (
+         SELECT l.qxleaseledgerqueuename AS queue_name,
+            l.qxleaseledgerprincipalruntime AS runtime_class,
+            l.qxleaseledgerprovidername AS provider_name,
+            l.qxleaseledgerproviderkind AS provider_kind,
+            count(*) AS lease_snapshot_count,
+            count(*) FILTER (WHERE (l.qxleaseledgerstate = 3)) AS released_lease_snapshot_count,
+            count(*) FILTER (WHERE (l.qxleaseledgerstate = 4)) AS reclaimed_lease_snapshot_count,
+            max(l.qxleaseledgerrenewalcount) AS max_lease_renewal_count,
+            max(l.qxleaseledgerrenewedat) AS last_lease_renewed_at
+           FROM visible_lease l
+          GROUP BY l.qxleaseledgerqueuename, l.qxleaseledgerprincipalruntime, l.qxleaseledgerprovidername, l.qxleaseledgerproviderkind
+        ), heartbeat_event_metrics AS (
+         SELECT COALESCE(l.qxleaseledgerqueuename, h.qxheartbeatledgerqueuename) AS queue_name,
+            COALESCE(l.qxleaseledgerprincipalruntime, h.qxheartbeatledgerprincipalruntime) AS runtime_class,
+            l.qxleaseledgerprovidername AS provider_name,
+            COALESCE(l.qxleaseledgerproviderkind, h.qxheartbeatledgerproviderkind) AS provider_kind,
+            count(*) AS heartbeat_snapshot_count,
+            count(*) FILTER (WHERE (h.qxheartbeatledgerreceiptmode = 'scheduler-renew'::text)) AS renew_event_count,
+            count(*) FILTER (WHERE (h.qxheartbeatledgerreceiptmode = 'scheduler-reclaim'::text)) AS reclaim_event_count,
+            count(*) FILTER (WHERE (h.qxheartbeatledgerreceiptmode = 'scheduler-release'::text)) AS release_event_count,
+            max(h.qxheartbeatledgerobservedat) AS last_heartbeat_observed_at
+           FROM (visible_heartbeat h
+             LEFT JOIN visible_lease l ON ((l.oid = h.qxheartbeatledgerleaseid)))
+          GROUP BY COALESCE(l.qxleaseledgerqueuename, h.qxheartbeatledgerqueuename), COALESCE(l.qxleaseledgerprincipalruntime, h.qxheartbeatledgerprincipalruntime), l.qxleaseledgerprovidername, COALESCE(l.qxleaseledgerproviderkind, h.qxheartbeatledgerproviderkind)
+        ), activity_keys AS (
+         SELECT current_task_metrics.queue_name,
+            current_task_metrics.runtime_class,
+            current_task_metrics.provider_name,
+            current_task_metrics.provider_kind
+           FROM current_task_metrics
+        UNION
+         SELECT queue_event_metrics.queue_name,
+            queue_event_metrics.runtime_class,
+            queue_event_metrics.provider_name,
+            queue_event_metrics.provider_kind
+           FROM queue_event_metrics
+        UNION
+         SELECT lease_event_metrics.queue_name,
+            lease_event_metrics.runtime_class,
+            lease_event_metrics.provider_name,
+            lease_event_metrics.provider_kind
+           FROM lease_event_metrics
+        UNION
+         SELECT heartbeat_event_metrics.queue_name,
+            heartbeat_event_metrics.runtime_class,
+            heartbeat_event_metrics.provider_name,
+            heartbeat_event_metrics.provider_kind
+           FROM heartbeat_event_metrics
+        )
+ SELECT k.queue_name,
+    k.runtime_class,
+    k.provider_name,
+    k.provider_kind,
+    COALESCE(ctm.queued_task_count, (0)::bigint) AS queued_task_count,
+    COALESCE(ctm.eligible_task_count, (0)::bigint) AS eligible_task_count,
+    COALESCE(ctm.queued_retry_task_count, (0)::bigint) AS queued_retry_task_count,
+    COALESCE(ctm.queued_recovery_task_count, (0)::bigint) AS queued_recovery_task_count,
+    COALESCE(ctm.running_task_count, (0)::bigint) AS running_task_count,
+    COALESCE(ctm.checkpointed_task_count, (0)::bigint) AS checkpointed_task_count,
+    COALESCE(ctm.completed_task_count, (0)::bigint) AS completed_task_count,
+    COALESCE(ctm.active_lease_count, (0)::bigint) AS active_lease_count,
+    COALESCE(ctm.expired_lease_count, (0)::bigint) AS expired_lease_count,
+    COALESCE(ctm.stale_heartbeat_task_count, (0)::bigint) AS stale_heartbeat_task_count,
+    COALESCE(ctm.missed_heartbeat_task_count, (0)::bigint) AS missed_heartbeat_task_count,
+    COALESCE(qem.queue_snapshot_count, (0)::bigint) AS queue_snapshot_count,
+    COALESCE(lem.lease_snapshot_count, (0)::bigint) AS lease_snapshot_count,
+    COALESCE(hem.heartbeat_snapshot_count, (0)::bigint) AS heartbeat_snapshot_count,
+    COALESCE(hem.renew_event_count, (0)::bigint) AS renew_event_count,
+    COALESCE(hem.reclaim_event_count, (0)::bigint) AS reclaim_event_count,
+    COALESCE(hem.release_event_count, (0)::bigint) AS release_event_count,
+    COALESCE(qem.retry_queue_snapshot_count, (0)::bigint) AS retry_queue_snapshot_count,
+    COALESCE(qem.recovery_queue_snapshot_count, (0)::bigint) AS recovery_queue_snapshot_count,
+    COALESCE(lem.released_lease_snapshot_count, (0)::bigint) AS released_lease_snapshot_count,
+    COALESCE(lem.reclaimed_lease_snapshot_count, (0)::bigint) AS reclaimed_lease_snapshot_count,
+    COALESCE(lem.max_lease_renewal_count, 0) AS max_lease_renewal_count,
+    qem.last_queue_update_at,
+    lem.last_lease_renewed_at,
+    hem.last_heartbeat_observed_at
+   FROM ((((activity_keys k
+     LEFT JOIN current_task_metrics ctm ON (((ctm.queue_name = k.queue_name) AND (ctm.runtime_class = k.runtime_class) AND (NOT (ctm.provider_name IS DISTINCT FROM k.provider_name)) AND (NOT (ctm.provider_kind IS DISTINCT FROM k.provider_kind)))))
+     LEFT JOIN queue_event_metrics qem ON (((qem.queue_name = k.queue_name) AND (qem.runtime_class = k.runtime_class) AND (NOT (qem.provider_name IS DISTINCT FROM k.provider_name)) AND (NOT (qem.provider_kind IS DISTINCT FROM k.provider_kind)))))
+     LEFT JOIN lease_event_metrics lem ON (((lem.queue_name = k.queue_name) AND (lem.runtime_class = k.runtime_class) AND (NOT (lem.provider_name IS DISTINCT FROM k.provider_name)) AND (NOT (lem.provider_kind IS DISTINCT FROM k.provider_kind)))))
+     LEFT JOIN heartbeat_event_metrics hem ON (((hem.queue_name = k.queue_name) AND (hem.runtime_class = k.runtime_class) AND (NOT (hem.provider_name IS DISTINCT FROM k.provider_name)) AND (NOT (hem.provider_kind IS DISTINCT FROM k.provider_kind)))));
+pg_stat_qx_scheduler_ledger_heartbeats| SELECT h.oid AS heartbeat_snapshot_oid,
+    h.qxheartbeatledgerleaseid AS lease_snapshot_oid,
+    h.qxheartbeatledgersessionid AS session_oid,
+    h.qxheartbeatledgertaskid AS task_oid,
+    h.qxheartbeatledgerattemptid AS attempt_oid,
+    a.qxattemptseqno AS attempt_seqno,
+    h.qxheartbeatledgerworkername AS worker_name,
+    h.qxheartbeatledgerqueuename AS queue_name,
+    h.qxheartbeatledgerprincipalruntime AS runtime_class,
+    h.qxheartbeatledgerproviderkind AS provider_kind,
+    h.qxheartbeatledgerreceiptmode AS receipt_mode,
+    h.qxheartbeatledgerstate AS heartbeat_state,
+    h.qxheartbeatledgerlagms AS lag_ms,
+    h.qxheartbeatledgerobservedat AS observed_at,
+    h.qxheartbeatledgerexpectedbefore AS expected_before,
+    h.qxheartbeatledgerstale AS stale,
+        CASE
+            WHEN (l.qxleaseledgerstate = ANY (ARRAY[3, 4])) THEN false
+            ELSE (h.qxheartbeatledgerstale OR (clock_timestamp() > h.qxheartbeatledgerexpectedbefore))
+        END AS needs_attention
+   FROM ((pg_qx_scheduler_heartbeat h
+     LEFT JOIN pg_qx_scheduler_lease l ON ((l.oid = h.qxheartbeatledgerleaseid)))
+     LEFT JOIN pg_qx_attempt a ON ((a.oid = h.qxheartbeatledgerattemptid)))
+  WHERE (pg_has_role(SESSION_USER, h.qxheartbeatledgerowner, 'USAGE'::text) OR pg_has_role(SESSION_USER, 'pg_read_all_stats'::name, 'MEMBER'::text));
+pg_stat_qx_scheduler_ledger_leases| SELECT l.oid AS lease_snapshot_oid,
+    l.qxleaseledgerqueueid AS queue_snapshot_oid,
+    l.qxleaseledgersessionid AS session_oid,
+    l.qxleaseledgertaskid AS task_oid,
+    l.qxleaseledgerattemptid AS attempt_oid,
+    a.qxattemptseqno AS attempt_seqno,
+    l.qxleaseledgerqueuename AS queue_name,
+    l.qxleaseledgerworkername AS worker_name,
+    l.qxleaseledgerprincipalname AS principal_name,
+    l.qxleaseledgerprovidername AS provider_name,
+    l.qxleaseledgerproviderkind AS provider_kind,
+    l.qxleaseledgerprincipalruntime AS runtime_class,
+    l.qxleaseledgerstate AS lease_state,
+    l.qxleaseledgeracquiredat AS acquired_at,
+    l.qxleaseledgerrenewedat AS renewed_at,
+    l.qxleaseledgerexpiresat AS expires_at,
+    l.qxleaseledgerlastheartbeatat AS last_heartbeat_at,
+    l.qxleaseledgerrenewalcount AS renewal_count,
+    l.qxleaseledgerneedsrecovery AS needs_recovery,
+        CASE
+            WHEN (l.qxleaseledgerstate = ANY (ARRAY[3, 4])) THEN false
+            WHEN (l.qxleaseledgerstate = 2) THEN true
+            ELSE (clock_timestamp() > l.qxleaseledgerexpiresat)
+        END AS lease_expired
+   FROM (pg_qx_scheduler_lease l
+     LEFT JOIN pg_qx_attempt a ON ((a.oid = l.qxleaseledgerattemptid)))
+  WHERE (pg_has_role(SESSION_USER, l.qxleaseledgerowner, 'USAGE'::text) OR pg_has_role(SESSION_USER, 'pg_read_all_stats'::name, 'MEMBER'::text));
+pg_stat_qx_scheduler_ledger_queues| SELECT q.oid AS queue_snapshot_oid,
+    q.qxqueueledgersessionid AS session_oid,
+    q.qxqueueledgertaskid AS task_oid,
+    q.qxqueueledgerattemptid AS attempt_oid,
+    a.qxattemptseqno AS attempt_seqno,
+    q.qxqueueledgername AS queue_name,
+    q.qxqueueledgerkind AS queue_kind,
+    q.qxqueueledgeragentname AS agent_name,
+    q.qxqueueledgeridentityname AS identity_name,
+    q.qxqueueledgernamespacepolicyname AS namespace_policy_name,
+    q.qxqueueledgerpriority AS priority,
+    q.qxqueueledgerprincipalname AS principal_name,
+    q.qxqueueledgerprovidername AS provider_name,
+    q.qxqueueledgerproviderkind AS provider_kind,
+    q.qxqueueledgerprincipalruntime AS runtime_class,
+    q.qxqueueledgerrunnablecount AS runnable_count,
+    q.qxqueueledgerleasedcount AS leased_count,
+    q.qxqueueledgerblockedcount AS blocked_count,
+    q.qxqueueledgerretrycount AS retry_count,
+    q.qxqueueledgerenqueuedat AS enqueued_at,
+    q.qxqueueledgereligibleat AS eligible_at,
+    q.qxqueueledgerupdatedat AS updated_at
+   FROM (pg_qx_scheduler_queue q
+     LEFT JOIN pg_qx_attempt a ON ((a.oid = q.qxqueueledgerattemptid)))
+  WHERE (pg_has_role(SESSION_USER, q.qxqueueledgerowner, 'USAGE'::text) OR pg_has_role(SESSION_USER, 'pg_read_all_stats'::name, 'MEMBER'::text));
+pg_stat_qx_scheduler_queues| WITH latest_queue AS (
+         SELECT DISTINCT ON (q.qxqueueledgertaskid) q.qxqueueledgertaskid AS task_oid,
+            q.qxqueueledgername AS queue_name,
+            q.qxqueueledgernamespacepolicyname AS namespace_policy_name,
+            q.qxqueueledgerkind AS queue_kind,
+            q.qxqueueledgerpriority AS priority,
+            q.qxqueueledgerprincipalruntime AS runtime_class,
+            q.qxqueueledgerprovidername AS provider_name,
+            q.qxqueueledgerproviderkind AS provider_kind,
+            q.qxqueueledgerretrycount AS retry_count
+           FROM (pg_qx_scheduler_queue q
+             LEFT JOIN pg_qx_attempt a ON ((a.oid = q.qxqueueledgerattemptid)))
+          WHERE (pg_has_role(SESSION_USER, q.qxqueueledgerowner, 'USAGE'::text) OR pg_has_role(SESSION_USER, 'pg_read_all_stats'::name, 'MEMBER'::text))
+          ORDER BY q.qxqueueledgertaskid, a.qxattemptseqno DESC, q.oid DESC
+        ), task_scheduler AS (
+         SELECT t.oid AS task_oid,
+            lq.namespace_policy_name,
+                CASE t.qxtaskstate
+                    WHEN 'q'::"char" THEN 'queued'::text
+                    WHEN 'r'::"char" THEN 'running'::text
+                    WHEN 'k'::"char" THEN 'checkpointed'::text
+                    WHEN 'c'::"char" THEN 'completed'::text
+                    ELSE 'other'::text
+                END AS task_state,
+            lq.queue_name,
+            lq.queue_kind,
+                CASE
+                    WHEN ((lq.priority IS NULL) OR (lq.priority = ''::text)) THEN 40
+                    WHEN (lower(lq.priority) = ANY (ARRAY['urgent'::text, 'critical'::text])) THEN 100
+                    WHEN (lower(lq.priority) = 'high'::text) THEN 80
+                    WHEN (lower(lq.priority) = 'normal'::text) THEN 60
+                    WHEN (lower(lq.priority) = 'low'::text) THEN 35
+                    WHEN (lower(lq.priority) = 'idle'::text) THEN 10
+                    ELSE 50
+                END AS priority_weight,
+            lq.runtime_class,
+            lq.provider_name,
+            lq.provider_kind,
+            lq.retry_count,
+                CASE
+                    WHEN ((lq.priority IS NULL) OR (lq.priority = ''::text)) THEN 5000
+                    WHEN (lower(lq.priority) = ANY (ARRAY['urgent'::text, 'critical'::text, 'high'::text])) THEN 1500
+                    WHEN (lower(lq.priority) = 'normal'::text) THEN 3000
+                    WHEN (lower(lq.priority) = 'low'::text) THEN 5000
+                    WHEN (lower(lq.priority) = 'idle'::text) THEN 8000
+                    ELSE 3000
+                END AS heartbeat_interval_ms,
+                CASE
+                    WHEN ((lq.priority IS NULL) OR (lq.priority = ''::text)) THEN 15000
+                    WHEN (lower(lq.priority) = ANY (ARRAY['urgent'::text, 'critical'::text, 'high'::text])) THEN 4500
+                    WHEN (lower(lq.priority) = 'normal'::text) THEN 9000
+                    WHEN (lower(lq.priority) = 'low'::text) THEN 15000
+                    WHEN (lower(lq.priority) = 'idle'::text) THEN 24000
+                    ELSE 9000
+                END AS lease_ttl_ms
+           FROM (pg_qx_task t
+             JOIN latest_queue lq ON ((lq.task_oid = t.oid)))
+        )
+ SELECT queue_name,
+    namespace_policy_name,
+    (min(queue_kind))::integer AS queue_kind,
+    min(priority_weight) AS priority_weight,
+    runtime_class,
+    provider_name,
+    provider_kind,
+    count(*) AS task_count,
+    count(*) FILTER (WHERE (task_state = 'queued'::text)) AS queued_task_count,
+    count(*) FILTER (WHERE (task_state = 'running'::text)) AS running_task_count,
+    count(*) FILTER (WHERE (task_state = 'checkpointed'::text)) AS checkpointed_task_count,
+    count(*) FILTER (WHERE (task_state = 'completed'::text)) AS completed_task_count,
+    count(*) FILTER (WHERE (retry_count > 0)) AS retrying_task_count,
+    3 AS max_retries,
+    min(heartbeat_interval_ms) AS heartbeat_interval_ms,
+    min(lease_ttl_ms) AS lease_ttl_ms
+   FROM task_scheduler
+  WHERE (queue_name IS NOT NULL)
+  GROUP BY queue_name, namespace_policy_name, runtime_class, provider_name, provider_kind;
+pg_stat_qx_scheduler_retry_backoff| WITH latest_queue AS (
+         SELECT DISTINCT ON (q.qxqueueledgertaskid) q.qxqueueledgertaskid AS task_oid,
+            q.qxqueueledgerattemptid AS attempt_oid,
+            a.qxattemptseqno AS attempt_seqno,
+            q.qxqueueledgername AS queue_name,
+            q.qxqueueledgerpriority AS priority,
+            q.qxqueueledgerprincipalruntime AS runtime_class,
+            q.qxqueueledgerprovidername AS provider_name,
+            q.qxqueueledgerproviderkind AS provider_kind,
+            q.qxqueueledgerkind AS queue_kind,
+            q.qxqueueledgerretrycount AS retry_count,
+            q.qxqueueledgerenqueuedat AS enqueued_at,
+            q.qxqueueledgereligibleat AS eligible_at,
+            q.qxqueueledgerupdatedat AS updated_at
+           FROM (pg_qx_scheduler_queue q
+             LEFT JOIN pg_qx_attempt a ON ((a.oid = q.qxqueueledgerattemptid)))
+          WHERE (pg_has_role(SESSION_USER, q.qxqueueledgerowner, 'USAGE'::text) OR pg_has_role(SESSION_USER, 'pg_read_all_stats'::name, 'MEMBER'::text))
+          ORDER BY q.qxqueueledgertaskid, a.qxattemptseqno DESC, q.oid DESC
+        )
+ SELECT lq.task_oid,
+    lq.attempt_oid,
+    lq.attempt_seqno,
+    lq.queue_name,
+    lq.priority,
+    lq.runtime_class,
+    lq.provider_name,
+    lq.provider_kind,
+    lq.retry_count,
+    pg_qx_scheduler_owner_slot(lq.task_oid) AS owner_slot,
+    pg_qx_scheduler_worker_slot_count() AS slot_count,
+    lq.enqueued_at,
+    lq.eligible_at,
+    lq.updated_at,
+    GREATEST(((EXTRACT(epoch FROM (lq.eligible_at - lq.enqueued_at)) * (1000)::numeric))::bigint, (0)::bigint) AS retry_delay_ms,
+    GREATEST(((EXTRACT(epoch FROM (lq.eligible_at - clock_timestamp())) * (1000)::numeric))::bigint, (0)::bigint) AS remaining_backoff_ms,
+    (lq.eligible_at <= clock_timestamp()) AS eligible_now
+   FROM (latest_queue lq
+     JOIN pg_qx_task t ON ((t.oid = lq.task_oid)))
+  WHERE ((t.qxtaskstate = 'q'::"char") AND (lq.queue_kind = 1));
+pg_stat_qx_scheduler_worker_balance| WITH latest_queue AS (
+         SELECT DISTINCT ON (q.qxqueueledgertaskid) q.qxqueueledgertaskid AS task_oid,
+            q.qxqueueledgername AS queue_name,
+            q.qxqueueledgerpriority AS priority,
+            q.qxqueueledgerprincipalruntime AS runtime_class,
+            q.qxqueueledgerprovidername AS provider_name,
+            q.qxqueueledgerproviderkind AS provider_kind,
+            q.qxqueueledgerkind AS queue_kind,
+            q.qxqueueledgerretrycount AS retry_count,
+            q.qxqueueledgerenqueuedat AS enqueued_at,
+            q.qxqueueledgereligibleat AS eligible_at,
+            q.qxqueueledgerupdatedat AS updated_at
+           FROM (pg_qx_scheduler_queue q
+             LEFT JOIN pg_qx_attempt a ON ((a.oid = q.qxqueueledgerattemptid)))
+          WHERE (pg_has_role(SESSION_USER, q.qxqueueledgerowner, 'USAGE'::text) OR pg_has_role(SESSION_USER, 'pg_read_all_stats'::name, 'MEMBER'::text))
+          ORDER BY q.qxqueueledgertaskid, a.qxattemptseqno DESC, q.oid DESC
+        ), activity_keys AS (
+         SELECT DISTINCT lq.queue_name,
+            lq.runtime_class,
+            lq.provider_name,
+            lq.provider_kind
+           FROM latest_queue lq
+          WHERE (lq.queue_name IS NOT NULL)
+        ), slot_series AS (
+         SELECT gs.gs AS owner_slot,
+            pg_qx_scheduler_worker_slot_count() AS slot_count
+           FROM generate_series(1, pg_qx_scheduler_worker_slot_count()) gs(gs)
+        ), task_scheduler AS (
+         SELECT t.oid AS task_oid,
+                CASE t.qxtaskstate
+                    WHEN 'q'::"char" THEN 'queued'::text
+                    WHEN 'r'::"char" THEN 'running'::text
+                    WHEN 'k'::"char" THEN 'checkpointed'::text
+                    WHEN 'c'::"char" THEN 'completed'::text
+                    ELSE 'other'::text
+                END AS task_state,
+            lq.queue_name,
+            lq.runtime_class,
+            lq.provider_name,
+            lq.provider_kind,
+            lq.queue_kind,
+            lq.retry_count,
+            lq.enqueued_at,
+            lq.eligible_at,
+            lq.updated_at,
+            pg_qx_scheduler_owner_slot(t.oid) AS owner_slot
+           FROM (pg_qx_task t
+             JOIN latest_queue lq ON ((lq.task_oid = t.oid)))
+        ), slot_metrics AS (
+         SELECT ts.owner_slot,
+            ts.queue_name,
+            ts.runtime_class,
+            ts.provider_name,
+            ts.provider_kind,
+            count(*) AS owned_task_count,
+            count(*) FILTER (WHERE (ts.task_state = 'queued'::text)) AS owned_queued_task_count,
+            count(*) FILTER (WHERE ((ts.task_state = 'queued'::text) AND (ts.queue_kind = 1))) AS owned_retry_task_count,
+            count(*) FILTER (WHERE ((ts.task_state = 'queued'::text) AND (ts.queue_kind = 1) AND (ts.eligible_at <= clock_timestamp()))) AS owned_retry_ready_count,
+            count(*) FILTER (WHERE ((ts.task_state = 'queued'::text) AND (ts.queue_kind = 1) AND (ts.eligible_at > clock_timestamp()))) AS owned_retry_waiting_count,
+            count(*) FILTER (WHERE (ts.task_state = 'running'::text)) AS owned_running_task_count,
+            count(*) FILTER (WHERE (ts.task_state = 'checkpointed'::text)) AS owned_checkpointed_task_count,
+            max(ts.updated_at) AS last_queue_update_at,
+            min(ts.eligible_at) FILTER (WHERE ((ts.task_state = 'queued'::text) AND (ts.queue_kind = 1))) AS oldest_retry_eligible_at
+           FROM task_scheduler ts
+          GROUP BY ts.owner_slot, ts.queue_name, ts.runtime_class, ts.provider_name, ts.provider_kind
+        )
+ SELECT (current_database())::text AS database_name,
+    ss.owner_slot,
+    ss.slot_count,
+    format('qhapaqxian scheduler db %s slot %s/%s'::text, current_database(), ss.owner_slot, ss.slot_count) AS worker_name,
+    ak.queue_name,
+    ak.runtime_class,
+    ak.provider_name,
+    ak.provider_kind,
+    COALESCE(sm.owned_task_count, (0)::bigint) AS owned_task_count,
+    COALESCE(sm.owned_queued_task_count, (0)::bigint) AS owned_queued_task_count,
+    COALESCE(sm.owned_retry_task_count, (0)::bigint) AS owned_retry_task_count,
+    COALESCE(sm.owned_retry_ready_count, (0)::bigint) AS owned_retry_ready_count,
+    COALESCE(sm.owned_retry_waiting_count, (0)::bigint) AS owned_retry_waiting_count,
+    COALESCE(sm.owned_running_task_count, (0)::bigint) AS owned_running_task_count,
+    COALESCE(sm.owned_checkpointed_task_count, (0)::bigint) AS owned_checkpointed_task_count,
+    sm.last_queue_update_at,
+    sm.oldest_retry_eligible_at
+   FROM ((activity_keys ak
+     CROSS JOIN slot_series ss)
+     LEFT JOIN slot_metrics sm ON (((sm.owner_slot = ss.owner_slot) AND (sm.queue_name = ak.queue_name) AND (sm.runtime_class = ak.runtime_class) AND (NOT (sm.provider_name IS DISTINCT FROM ak.provider_name)) AND (NOT (sm.provider_kind IS DISTINCT FROM ak.provider_kind)))));
+pg_stat_qx_scheduler_workers| WITH latest_queue AS (
+         SELECT DISTINCT ON (q.qxqueueledgertaskid) q.qxqueueledgertaskid AS task_oid,
+            q.qxqueueledgername AS queue_name,
+            q.qxqueueledgerretrycount AS retry_count
+           FROM (pg_qx_scheduler_queue q
+             LEFT JOIN pg_qx_attempt a ON ((a.oid = q.qxqueueledgerattemptid)))
+          WHERE (pg_has_role(SESSION_USER, q.qxqueueledgerowner, 'USAGE'::text) OR pg_has_role(SESSION_USER, 'pg_read_all_stats'::name, 'MEMBER'::text))
+          ORDER BY q.qxqueueledgertaskid, a.qxattemptseqno DESC, q.oid DESC
+        ), latest_lease AS (
+         SELECT DISTINCT ON (l.qxleaseledgertaskid) l.qxleaseledgertaskid AS task_oid,
+            l.qxleaseledgerworkername AS worker_name,
+            l.qxleaseledgerprincipalruntime AS runtime_class,
+            l.qxleaseledgerprovidername AS provider_name,
+            l.qxleaseledgerproviderkind AS provider_kind,
+            l.qxleaseledgerqueuename AS queue_name,
+            l.qxleaseledgerstate AS lease_state,
+                CASE
+                    WHEN (l.qxleaseledgerstate = ANY (ARRAY[3, 4])) THEN false
+                    WHEN (l.qxleaseledgerstate = 2) THEN true
+                    ELSE (clock_timestamp() > l.qxleaseledgerexpiresat)
+                END AS lease_expired
+           FROM (pg_qx_scheduler_lease l
+             LEFT JOIN pg_qx_attempt a ON ((a.oid = l.qxleaseledgerattemptid)))
+          WHERE (pg_has_role(SESSION_USER, l.qxleaseledgerowner, 'USAGE'::text) OR pg_has_role(SESSION_USER, 'pg_read_all_stats'::name, 'MEMBER'::text))
+          ORDER BY l.qxleaseledgertaskid, a.qxattemptseqno DESC, l.oid DESC
+        ), latest_heartbeat AS (
+         SELECT DISTINCT ON (h.qxheartbeatledgertaskid) h.qxheartbeatledgertaskid AS task_oid,
+            h.qxheartbeatledgerstate AS heartbeat_state,
+            h.qxheartbeatledgerstale AS stale
+           FROM (pg_qx_scheduler_heartbeat h
+             LEFT JOIN pg_qx_attempt a ON ((a.oid = h.qxheartbeatledgerattemptid)))
+          WHERE (pg_has_role(SESSION_USER, h.qxheartbeatledgerowner, 'USAGE'::text) OR pg_has_role(SESSION_USER, 'pg_read_all_stats'::name, 'MEMBER'::text))
+          ORDER BY h.qxheartbeatledgertaskid, a.qxattemptseqno DESC, h.oid DESC
+        ), task_scheduler AS (
+         SELECT t.oid AS task_oid,
+                CASE t.qxtaskstate
+                    WHEN 'q'::"char" THEN 'queued'::text
+                    WHEN 'r'::"char" THEN 'running'::text
+                    WHEN 'k'::"char" THEN 'checkpointed'::text
+                    WHEN 'c'::"char" THEN 'completed'::text
+                    ELSE 'other'::text
+                END AS task_state,
+            ll.worker_name,
+            ll.runtime_class,
+            ll.provider_name,
+            ll.provider_kind,
+            COALESCE(ll.queue_name, lq.queue_name) AS queue_name,
+            COALESCE(lq.retry_count, 0) AS retry_count,
+            ll.lease_state,
+            ll.lease_expired,
+            lh.heartbeat_state,
+            COALESCE(lh.stale, false) AS heartbeat_stale
+           FROM (((pg_qx_task t
+             JOIN latest_lease ll ON ((ll.task_oid = t.oid)))
+             LEFT JOIN latest_queue lq ON ((lq.task_oid = t.oid)))
+             LEFT JOIN latest_heartbeat lh ON ((lh.task_oid = t.oid)))
+        )
+ SELECT worker_name,
+    runtime_class,
+    provider_name,
+    provider_kind,
+    count(*) AS dispatched_task_count,
+    count(DISTINCT queue_name) AS queue_count,
+    count(*) FILTER (WHERE (task_state = 'running'::text)) AS running_task_count,
+    count(*) FILTER (WHERE (task_state = 'checkpointed'::text)) AS checkpointed_task_count,
+    count(*) FILTER (WHERE (task_state = 'completed'::text)) AS completed_task_count,
+    count(*) FILTER (WHERE (retry_count > 0)) AS retrying_task_count,
+    count(*) FILTER (WHERE lease_expired) AS expired_lease_count,
+    count(*) FILTER (WHERE heartbeat_stale) AS stale_heartbeat_count,
+    (max(lease_state))::integer AS lease_state,
+    (max(heartbeat_state))::integer AS heartbeat_state
+   FROM task_scheduler
+  WHERE (worker_name IS NOT NULL)
+  GROUP BY worker_name, runtime_class, provider_name, provider_kind;
 pg_stat_qx_sessions| SELECT s.oid AS session_oid,
     a.qxagentname AS agent_name,
     pg_get_userbyid(s.qxsessionowner) AS owner_name,
@@ -2161,13 +2818,27 @@ pg_stat_qx_tasks| SELECT t.oid AS task_oid,
     ( SELECT count(*) AS count
            FROM pg_qx_checkpoint c
           WHERE (c.qxcheckpointtaskid = t.oid)) AS checkpoint_count,
+    sched.scheduler_queue,
+    sched.scheduler_runtime,
+    sched.scheduler_provider,
+    sched.scheduler_worker,
+    sched.scheduler_retry,
     ( SELECT count(*) AS count
            FROM pg_qx_memory m
           WHERE (m.qxmemorytaskid = t.oid)) AS memory_count
-   FROM (((pg_qx_task t
+   FROM ((((pg_qx_task t
      JOIN pg_qx_agent a ON ((a.oid = t.qxtaskagentid)))
      JOIN pg_qx_identity qxi ON ((qxi.oid = t.qxtaskidentityid)))
      JOIN pg_qx_namespace qxn ON ((qxn.oid = t.qxtasknamespacepolicyid)))
+     LEFT JOIN LATERAL ( SELECT pg_qx_trace_detail_value(tr.qxtracedetail, 'scheduler_queue'::text) AS scheduler_queue,
+            pg_qx_trace_detail_value(tr.qxtracedetail, 'scheduler_runtime'::text) AS scheduler_runtime,
+            pg_qx_trace_detail_value(tr.qxtracedetail, 'scheduler_provider'::text) AS scheduler_provider,
+            pg_qx_trace_detail_value(tr.qxtracedetail, 'scheduler_worker'::text) AS scheduler_worker,
+            pg_qx_trace_detail_value(tr.qxtracedetail, 'scheduler_retry'::text) AS scheduler_retry
+           FROM pg_qx_trace tr
+          WHERE ((tr.qxtracetaskid = t.oid) AND (tr.qxtracename = ANY (ARRAY['runtime.queue'::text, 'runtime.dispatch'::text, 'runtime.resume'::text, 'runtime.resume_dispatch'::text])))
+          ORDER BY tr.oid DESC
+         LIMIT 1) sched ON (true))
   WHERE (pg_has_role(SESSION_USER, t.qxtaskowner, 'USAGE'::text) OR pg_has_role(SESSION_USER, 'pg_read_all_stats'::name, 'MEMBER'::text));
 pg_stat_recovery_prefetch| SELECT stats_reset,
     prefetch,

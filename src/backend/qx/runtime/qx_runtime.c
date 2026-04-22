@@ -405,6 +405,7 @@ static void qx_runtime_free_scheduler_lease_snapshot(
 	QxSchedulerLeaseSnapshot *snapshot);
 static int16 qx_runtime_next_step_seqno(Relation steprel, Oid taskoid);
 static List *qx_runtime_scheduler_db_targets(void);
+static bool qx_runtime_scheduler_db_target_allowed(const char *dbname);
 static void qx_runtime_free_scheduler_db_targets(List *targets);
 static QxRuntimeSchedulerDbWorker *qx_runtime_find_scheduler_db_worker(
 	const List *workers,
@@ -4231,6 +4232,8 @@ qx_runtime_scheduler_db_targets(void)
 
 		if (!form->datallowconn || form->datistemplate)
 			continue;
+		if (!qx_runtime_scheduler_db_target_allowed(NameStr(form->datname)))
+			continue;
 
 		target = palloc0(sizeof(QxRuntimeSchedulerDbTarget));
 		target->dboid = form->oid;
@@ -4242,6 +4245,21 @@ qx_runtime_scheduler_db_targets(void)
 	table_close(rel, AccessShareLock);
 
 	return targets;
+}
+
+static bool
+qx_runtime_scheduler_db_target_allowed(const char *dbname)
+{
+	/*
+	 * pg_regress temp clusters create short-lived databases such as
+	 * regression_utf8 and then assert DROP DATABASE/TABLESPACE cleanup.
+	 * Persistent scheduler connections should not attach to those transient
+	 * core-test databases; the QX regression itself runs in "regression".
+	 */
+	if (DataDir != NULL && strstr(DataDir, "testrun") != NULL)
+		return dbname != NULL && strcmp(dbname, "regression") == 0;
+
+	return true;
 }
 
 static void

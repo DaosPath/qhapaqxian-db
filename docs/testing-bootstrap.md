@@ -129,6 +129,10 @@ Non-simulated pass criteria:
 - the same focused lane should also assert `pg_stat_qx_scheduler_worker_balance`
   so both worker slots stay visible even when only one currently owns the
   queue's live work.
+- pg_regress temp clusters constrain autonomous scheduler database workers to
+  the canonical `regression` database. This preserves real daemon behavior for
+  QX coverage while avoiding persistent scheduler connections to transient
+  upstream test databases created by core regression cases.
 - heartbeat `needs_attention` is timing-derived, so focused regressions should
   normalize it against `stale` instead of expecting active lease rows to remain
   unexpired for the whole test wall clock.
@@ -167,6 +171,9 @@ Focused local command shape:
 - The focused Windows run validated during Stage 32 used Docker Desktop
   29.3.1 and the prebuilt QEMU assets under
   `build-stage4-codex/microvm-assets/`.
+- Stage 31 follow-up validation also ran the full `regress/regress` suite in
+  the Windows temp cluster and passed all 225 subtests after the scheduler
+  launcher stopped targeting transient core-test databases.
 
 Validated real-backend sweep on 2026-04-20:
 - Windows: `meson compile -C build-stage4-codex -j 2`

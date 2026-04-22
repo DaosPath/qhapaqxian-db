@@ -628,7 +628,9 @@ ORDER BY attempt_seqno, queue_kind, retry_count;
 
 SELECT task_oid = :qx_container_task_oid AS task_match,
        attempt_seqno,
-       worker_name::text AS worker_name,
+       regexp_replace(worker_name::text,
+                      'slot [0-9]+/[0-9]+$',
+                      'slot <slot>/<slots>') AS worker_name,
        queue_name::text AS queue_name,
        runtime_class::text AS runtime_class,
        provider_name::text AS provider_name,
@@ -643,7 +645,9 @@ ORDER BY attempt_seqno, lease_state, renewal_count, worker_name, provider_name;
 
 SELECT task_oid = :qx_container_task_oid AS task_match,
        attempt_seqno,
-       worker_name::text AS worker_name,
+       regexp_replace(worker_name::text,
+                      'slot [0-9]+/[0-9]+$',
+                      'slot <slot>/<slots>') AS worker_name,
        queue_name::text AS queue_name,
        runtime_class::text AS runtime_class,
        provider_kind::text AS provider_kind,
@@ -724,7 +728,9 @@ SELECT queue_name::text AS queue_name,
 FROM pg_stat_qx_scheduler_queues
 ORDER BY queue_name;
 
-SELECT worker_name::text AS worker_name,
+SELECT regexp_replace(worker_name::text,
+                      'slot [0-9]+/[0-9]+$',
+                      'slot <slot>/<slots>') AS worker_name,
        runtime_class::text AS runtime_class,
        provider_name::text AS provider_name,
        provider_kind::text AS provider_kind,
@@ -758,7 +764,9 @@ ORDER BY attempt_seqno, queue_name, queue_kind, retry_count, runtime_class, prov
 
 SELECT task_oid = :qx_task_oid AS task_match,
        attempt_seqno,
-       worker_name::text AS worker_name,
+       regexp_replace(worker_name::text,
+                      'slot [0-9]+/[0-9]+$',
+                      'slot <slot>/<slots>') AS worker_name,
        queue_name::text AS queue_name,
        runtime_class::text AS runtime_class,
        provider_name::text AS provider_name,
@@ -772,7 +780,9 @@ ORDER BY attempt_seqno, lease_state, renewal_count, worker_name, provider_name;
 
 SELECT task_oid = :qx_task_oid AS task_match,
        attempt_seqno,
-       worker_name::text AS worker_name,
+       regexp_replace(worker_name::text,
+                      'slot [0-9]+/[0-9]+$',
+                      'slot <slot>/<slots>') AS worker_name,
        queue_name::text AS queue_name,
        runtime_class::text AS runtime_class,
        provider_kind::text AS provider_kind,

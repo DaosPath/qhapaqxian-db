@@ -29,6 +29,9 @@ What landed:
   `scheduler-renew` heartbeat snapshots;
 - postmaster startup now registers a static scheduler launcher bgworker, and
   that launcher spawns one dynamic scheduler worker per connectable database;
+- pg_regress temp clusters constrain the autonomous launcher to the canonical
+  `regression` database so scheduler workers do not hold connections to
+  short-lived core-test databases such as `regression_utf8`;
 - each database worker now wakes periodically, scans running tasks against the
   durable lease ledger, renews a held lease once, then reclaims stale work and
   appends the matching recovery queue / reclaim heartbeat rows;
