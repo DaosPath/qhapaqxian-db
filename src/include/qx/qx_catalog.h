@@ -15,6 +15,7 @@
 #include "access/xlogdefs.h"
 #include "nodes/nodes.h"
 #include "nodes/pg_list.h"
+#include "qx/qx_scheduler.h"
 
 typedef struct QxCatalogAgentInfo
 {
@@ -251,5 +252,16 @@ extern bool QxCatalogLookupCheckpointByOid(Oid checkpointoid,
 extern List *QxCatalogBuildTaskInfoList(Oid databaseoid, Oid ownerid);
 extern List *QxCatalogBuildAttemptInfoList(Oid databaseoid, Oid ownerid);
 extern List *QxCatalogBuildCheckpointInfoList(Oid databaseoid, Oid ownerid);
+
+extern bool QxCatalogLookupLatestSchedulerQueue(Oid dboid, Oid taskoid,
+												Oid attemptoid,
+												QxSchedulerQueueSnapshot *snapshot);
+extern bool QxCatalogLookupLatestSchedulerLease(Oid dboid, Oid taskoid,
+												Oid attemptoid,
+												QxSchedulerLeaseSnapshot *snapshot,
+												Oid *queueoid);
+extern int16 QxCatalogMaxStepSeqnoForTask(Oid dboid, Oid taskoid);
+extern void QxCatalogFreeSchedulerQueueSnapshot(QxSchedulerQueueSnapshot *snapshot);
+extern void QxCatalogFreeSchedulerLeaseSnapshot(QxSchedulerLeaseSnapshot *snapshot);
 
 #endif							/* QX_CATALOG_H */

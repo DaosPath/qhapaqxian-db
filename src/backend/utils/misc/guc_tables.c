@@ -111,6 +111,7 @@ extern bool trace_syncscan;
 #ifdef DEBUG_BOUNDED_SORT
 extern bool optimize_bounded_sort;
 #endif
+extern bool qhapaqxian_track_stats;
 
 /*
  * Options for enum values defined in this module.
@@ -1432,6 +1433,15 @@ struct config_bool ConfigureNamesBool[] =
 		},
 		&track_wal_io_timing,
 		false,
+		NULL, NULL, NULL
+	},
+	{
+		{"qhapaqxian.track_stats", PGC_SUSET, CUSTOM_OPTIONS,
+			gettext_noop("Collects QhapaqXian runtime and scheduler statistics in shared memory."),
+			NULL
+		},
+		&qhapaqxian_track_stats,
+		true,
 		NULL, NULL, NULL
 	},
 

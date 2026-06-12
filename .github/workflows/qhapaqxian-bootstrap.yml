@@ -143,4 +143,18 @@ jobs:
           QX_MICROVM_ACCEL: tcg
         run: |
           make -C src/test/regress check-tests TESTS=qx_stage3_agentic
+          make -C src/test/regress check-tests TESTS=qx_stage3_observability
           make -C contrib/qhapaqxian_output check
+
+  kvm-probe-optional:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probe host KVM availability
+        run: |
+          if [[ -e /dev/kvm ]]; then
+            bash scripts/ci/kvm-probe.sh
+          else
+            echo "Skipping KVM probe on hosted runner without /dev/kvm"
+          fi

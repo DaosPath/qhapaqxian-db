@@ -18,9 +18,13 @@
 #include "catalog/pg_qx_principal.h"
 #include "catalog/pg_qx_provider.h"
 #include "catalog/pg_qx_session.h"
+#include "catalog/pg_qx_scheduler_lease.h"
+#include "catalog/pg_qx_scheduler_queue.h"
+#include "catalog/pg_qx_step.h"
 #include "catalog/pg_qx_task.h"
 #include "catalog/pg_qx_tool.h"
-#include "qx_catalog.h"
+#include "qx/qx_catalog.h"
+#include "qx/qx_scheduler.h"
 #include "utils/builtins.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
@@ -1213,4 +1217,259 @@ QxCatalogBuildCheckpointInfoList(Oid databaseoid, Oid ownerid)
 	table_close(rel, AccessShareLock);
 
 	return checkpoints;
+}
+
+static char *
+qx_catalog_heap_text_attr(Relation rel, HeapTuple tup, AttrNumber attnum)
+{
+	Datum		datum;
+	bool		isnull;
+
+	datum = heap_getattr(tup, attnum, RelationGetDescr(rel), &isnull);
+	if (isnull)
+		return NULL;
+
+	return TextDatumGetCString(datum);
+}
+
+static void
+qx_catalog_copy_scheduler_queue_snapshot(Relation rel, HeapTuple tup,
+										 QxSchedulerQueueSnapshot *snapshot)
+{
+	Form_pg_qx_scheduler_queue form;
+
+	Assert(snapshot != NULL);
+
+	form = (Form_pg_qx_scheduler_queue) GETSTRUCT(tup);
+	MemSet(snapshot, 0, sizeof(QxSchedulerQueueSnapshot));
+	snapshot->queueoid = form->oid;
+	snapshot->ownerid = form->qxqueueledgerowner;
+	snapshot->namespace_policy_oid = form->qxqueueledgernamespaceid;
+	snapshot->agentoid = form->qxqueueledgeragentid;
+	snapshot->sessionoid = form->qxqueueledgersessionid;
+	snapshot->taskoid = form->qxqueueledgertaskid;
+	snapshot->attemptoid = form->qxqueueledgerattemptid;
+	snapshot->queue_kind = (QxSchedulerQueueKind) form->qxqueueledgerkind;
+	snapshot->runnable_count = form->qxqueueledgerrunnablecount;
+	snapshot->leased_count = form->qxqueueledgerleasedcount;
+	snapshot->blocked_count = form->qxqueueledgerblockedcount;
+	snapshot->retry_count = form->qxqueueledgerretrycount;
+	snapshot->enqueued_at = form->qxqueueledgerenqueuedat;
+	snapshot->eligible_at = form->qxqueueledgereligibleat;
+	snapshot->updated_at = form->qxqueueledgerupdatedat;
+	snapshot->queue_name = qx_catalog_heap_text_attr(rel, tup,
+		Anum_pg_qx_scheduler_queue_qxqueueledgername);
+	snapshot->agent_name = qx_catalog_heap_text_attr(rel, tup,
+		Anum_pg_qx_scheduler_queue_qxqueueledgeragentname);
+	snapshot->identity_name = qx_catalog_heap_text_attr(rel, tup,
+		Anum_pg_qx_scheduler_queue_qxqueueledgeridentityname);
+	snapshot->namespace_policy_name = qx_catalog_heap_text_attr(rel, tup,
+		Anum_pg_qx_scheduler_queue_qxqueueledgernamespacepolicyname);
+	snapshot->priority = qx_catalog_heap_text_attr(rel, tup,
+		Anum_pg_qx_scheduler_queue_qxqueueledgerpriority);
+	snapshot->principal_name = qx_catalog_heap_text_attr(rel, tup,
+		Anum_pg_qx_scheduler_queue_qxqueueledgerprincipalname);
+	snapshot->provider_name = qx_catalog_heap_text_attr(rel, tup,
+		Anum_pg_qx_scheduler_queue_qxqueueledgerprovidername);
+	snapshot->provider_kind = qx_catalog_heap_text_attr(rel, tup,
+		Anum_pg_qx_scheduler_queue_qxqueueledgerproviderkind);
+	snapshot->principal_runtime = qx_catalog_heap_text_attr(rel, tup,
+		Anum_pg_qx_scheduler_queue_qxqueueledgerprincipalruntime);
+}
+
+static void
+qx_catalog_copy_scheduler_lease_snapshot(Relation rel, HeapTuple tup,
+										 QxSchedulerLeaseSnapshot *snapshot,
+										 Oid *queueoid)
+{
+	Form_pg_qx_scheduler_lease form;
+
+	Assert(snapshot != NULL);
+
+	form = (Form_pg_qx_scheduler_lease) GETSTRUCT(tup);
+	MemSet(snapshot, 0, sizeof(QxSchedulerLeaseSnapshot));
+	snapshot->leaseoid = form->oid;
+	snapshot->queueoid = form->qxleaseledgerqueueid;
+	snapshot->ownerid = form->qxleaseledgerowner;
+	snapshot->workeroid = form->qxleaseledgerworkerid;
+	snapshot->sessionoid = form->qxleaseledgersessionid;
+	snapshot->taskoid = form->qxleaseledgertaskid;
+	snapshot->attemptoid = form->qxleaseledgerattemptid;
+	snapshot->state = (QxSchedulerLeaseState) form->qxleaseledgerstate;
+	snapshot->acquired_at = form->qxleaseledgeracquiredat;
+	snapshot->renewed_at = form->qxleaseledgerrenewedat;
+	snapshot->expires_at = form->qxleaseledgerexpiresat;
+	snapshot->last_heartbeat_at = form->qxleaseledgerlastheartbeatat;
+	snapshot->renewal_count = form->qxleaseledgerrenewalcount;
+	snapshot->needs_recovery = form->qxleaseledgerneedsrecovery;
+	snapshot->queue_name = qx_catalog_heap_text_attr(rel, tup,
+		Anum_pg_qx_scheduler_lease_qxleaseledgerqueuename);
+	snapshot->worker_name = qx_catalog_heap_text_attr(rel, tup,
+		Anum_pg_qx_scheduler_lease_qxleaseledgerworkername);
+	snapshot->lease_token = qx_catalog_heap_text_attr(rel, tup,
+		Anum_pg_qx_scheduler_lease_qxleaseledgerleasetoken);
+	snapshot->principal_name = qx_catalog_heap_text_attr(rel, tup,
+		Anum_pg_qx_scheduler_lease_qxleaseledgerprincipalname);
+	snapshot->provider_name = qx_catalog_heap_text_attr(rel, tup,
+		Anum_pg_qx_scheduler_lease_qxleaseledgerprovidername);
+	snapshot->provider_kind = qx_catalog_heap_text_attr(rel, tup,
+		Anum_pg_qx_scheduler_lease_qxleaseledgerproviderkind);
+	snapshot->principal_runtime = qx_catalog_heap_text_attr(rel, tup,
+		Anum_pg_qx_scheduler_lease_qxleaseledgerprincipalruntime);
+
+	if (queueoid != NULL)
+		*queueoid = form->qxleaseledgerqueueid;
+}
+
+bool
+QxCatalogLookupLatestSchedulerQueue(Oid dboid, Oid taskoid, Oid attemptoid,
+									QxSchedulerQueueSnapshot *snapshot)
+{
+	Relation	rel;
+	TableScanDesc scan;
+	HeapTuple	tup;
+	HeapTuple	best = NULL;
+	Oid			bestoid = InvalidOid;
+
+	Assert(snapshot != NULL);
+
+	rel = table_open(QxSchedulerQueueRelationId, AccessShareLock);
+	scan = table_beginscan_catalog(rel, 0, NULL);
+	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	{
+		Form_pg_qx_scheduler_queue form =
+			(Form_pg_qx_scheduler_queue) GETSTRUCT(tup);
+
+		if (form->qxqueueledgerdbid != dboid ||
+			form->qxqueueledgertaskid != taskoid ||
+			form->qxqueueledgerattemptid != attemptoid)
+			continue;
+
+		if (!OidIsValid(bestoid) || form->oid > bestoid)
+		{
+			if (best != NULL)
+				heap_freetuple(best);
+			best = heap_copytuple(tup);
+			bestoid = form->oid;
+		}
+	}
+	table_endscan(scan);
+
+	if (best == NULL)
+	{
+		table_close(rel, AccessShareLock);
+		return false;
+	}
+
+	qx_catalog_copy_scheduler_queue_snapshot(rel, best, snapshot);
+	heap_freetuple(best);
+	table_close(rel, AccessShareLock);
+	return true;
+}
+
+bool
+QxCatalogLookupLatestSchedulerLease(Oid dboid, Oid taskoid, Oid attemptoid,
+									QxSchedulerLeaseSnapshot *snapshot,
+									Oid *queueoid)
+{
+	Relation	rel;
+	TableScanDesc scan;
+	HeapTuple	tup;
+	HeapTuple	best = NULL;
+	Oid			bestoid = InvalidOid;
+
+	Assert(snapshot != NULL);
+
+	rel = table_open(QxSchedulerLeaseRelationId, AccessShareLock);
+	scan = table_beginscan_catalog(rel, 0, NULL);
+	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	{
+		Form_pg_qx_scheduler_lease form =
+			(Form_pg_qx_scheduler_lease) GETSTRUCT(tup);
+
+		if (form->qxleaseledgerdbid != dboid ||
+			form->qxleaseledgertaskid != taskoid ||
+			form->qxleaseledgerattemptid != attemptoid)
+			continue;
+
+		if (!OidIsValid(bestoid) || form->oid > bestoid)
+		{
+			if (best != NULL)
+				heap_freetuple(best);
+			best = heap_copytuple(tup);
+			bestoid = form->oid;
+		}
+	}
+	table_endscan(scan);
+
+	if (best == NULL)
+	{
+		table_close(rel, AccessShareLock);
+		return false;
+	}
+
+	qx_catalog_copy_scheduler_lease_snapshot(rel, best, snapshot, queueoid);
+	heap_freetuple(best);
+	table_close(rel, AccessShareLock);
+	return true;
+}
+
+int16
+QxCatalogMaxStepSeqnoForTask(Oid dboid, Oid taskoid)
+{
+	Relation	rel;
+	TableScanDesc scan;
+	HeapTuple	tup;
+	int16		maxseqno = 0;
+
+	rel = table_open(QxStepRelationId, AccessShareLock);
+	scan = table_beginscan_catalog(rel, 0, NULL);
+	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	{
+		Form_pg_qx_step form = (Form_pg_qx_step) GETSTRUCT(tup);
+
+		if (form->qxstepdbid != dboid || form->qxsteptaskid != taskoid)
+			continue;
+
+		if (form->qxstepseqno > maxseqno)
+			maxseqno = form->qxstepseqno;
+	}
+	table_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	return maxseqno + 1;
+}
+
+void
+QxCatalogFreeSchedulerQueueSnapshot(QxSchedulerQueueSnapshot *snapshot)
+{
+	if (snapshot == NULL)
+		return;
+
+	QxCatalogFreeString(&snapshot->queue_name);
+	QxCatalogFreeString(&snapshot->agent_name);
+	QxCatalogFreeString(&snapshot->identity_name);
+	QxCatalogFreeString(&snapshot->namespace_policy_name);
+	QxCatalogFreeString(&snapshot->priority);
+	QxCatalogFreeString(&snapshot->principal_name);
+	QxCatalogFreeString(&snapshot->provider_name);
+	QxCatalogFreeString(&snapshot->provider_kind);
+	QxCatalogFreeString(&snapshot->principal_runtime);
+	MemSet(snapshot, 0, sizeof(QxSchedulerQueueSnapshot));
+}
+
+void
+QxCatalogFreeSchedulerLeaseSnapshot(QxSchedulerLeaseSnapshot *snapshot)
+{
+	if (snapshot == NULL)
+		return;
+
+	QxCatalogFreeString(&snapshot->queue_name);
+	QxCatalogFreeString(&snapshot->worker_name);
+	QxCatalogFreeString(&snapshot->lease_token);
+	QxCatalogFreeString(&snapshot->principal_name);
+	QxCatalogFreeString(&snapshot->provider_name);
+	QxCatalogFreeString(&snapshot->provider_kind);
+	QxCatalogFreeString(&snapshot->principal_runtime);
+	MemSet(snapshot, 0, sizeof(QxSchedulerLeaseSnapshot));
 }

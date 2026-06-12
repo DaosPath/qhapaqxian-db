@@ -67,6 +67,11 @@ typedef struct Request
 	int		input_present;
 	int		path_present;
 	int		require_attestation;
+	int		allow_network;
+	int		allow_privilege_escalation;
+	char	launch_request_file[260];
+	char	container_id[128];
+	char	vm_id[128];
 } Request;
 
 #define QX_RECEIPT_SIG_HEX_LEN	((PG_SHA256_DIGEST_LENGTH * 2) + 1)
@@ -155,6 +160,106 @@ file_contains_marker(const char *path, const char *marker)
 }
 
 static int
+parse_launch_request_file(const char *path, Request *request)
+{
+	FILE	   *file;
+	char		line[2048];
+	char	   *cursor;
+
+	if (path == NULL || path[0] == '\0')
+		return 0;
+
+	file = fopen(path, "r");
+	if (file == NULL)
+		return 0;
+
+	while (fgets(line, sizeof(line), file) != NULL)
+	{
+		cursor = line;
+		while (cursor != NULL && *cursor != '\0')
+		{
+			char	   *semi = strchr(cursor, ';');
+			char	   *eq;
+			char	   *key;
+			char	   *value;
+
+			if (semi != NULL)
+				*semi = '\0';
+			eq = strchr(cursor, '=');
+			if (eq != NULL)
+			{
+				*eq = '\0';
+				key = cursor;
+				value = eq + 1;
+				if (strcmp(key, "timeout_ms") == 0)
+					request->timeout_ms = strtol(value, NULL, 10);
+				else if (strcmp(key, "memory_kb") == 0)
+					request->memory_kb = strtol(value, NULL, 10);
+				else if (strcmp(key, "process_limit") == 0)
+					request->process_limit = strtol(value, NULL, 10);
+				else if (strcmp(key, "allow_network") == 0)
+					request->allow_network = (strcmp(value, "true") == 0);
+				else if (strcmp(key, "allow_privilege_escalation") == 0)
+					request->allow_privilege_escalation = (strcmp(value, "true") == 0);
+				else if (strcmp(key, "image_ref") == 0 &&
+						 request->container_image[0] == '\0')
+					snprintf(request->container_image, sizeof(request->container_image),
+							 "%s", value);
+			}
+			cursor = semi != NULL ? semi + 1 : NULL;
+		}
+	}
+
+	fclose(file);
+	return 1;
+}
+
+#if !defined(_WIN32)
+static int
+run_supervised_command(const char *executable, const char *command,
+					   long timeout_ms, int *exit_status)
+{
+	pid_t		pid;
+	int			status = -1;
+	long		elapsed_ms = 0;
+
+	pid = fork();
+	if (pid < 0)
+		return 0;
+
+	if (pid == 0)
+	{
+		execl("/bin/sh", "sh", "-c", command, (char *) NULL);
+		_exit(127);
+	}
+
+	while (elapsed_ms <= timeout_ms)
+	{
+		pid_t		wait_result = waitpid(pid, &status, WNOHANG);
+
+		if (wait_result == pid)
+		{
+			if (WIFEXITED(status))
+				*exit_status = WEXITSTATUS(status);
+			else
+				*exit_status = -1;
+			return 1;
+		}
+		if (wait_result < 0)
+			return 0;
+
+		usleep(100000);
+		elapsed_ms += 100;
+	}
+
+	kill(pid, SIGKILL);
+	waitpid(pid, &status, 0);
+	*exit_status = -1;
+	return 0;
+}
+#endif
+
+static int
 run_real_microvm_backend(const Request *request, char *detail, size_t detail_len)
 {
 	const char *qemu_cli;
@@ -217,7 +322,9 @@ run_real_microvm_backend(const Request *request, char *detail, size_t detail_len
 	remove(debug_path);
 	remove(qemu_log_path);
 
-	memory_mb = 128;
+	memory_mb = request->memory_kb > 0 ? (request->memory_kb + 1023) / 1024 : 128;
+	if (memory_mb < 1)
+		memory_mb = 1;
 
 	snprintf(command, sizeof(command),
 			 "\"%s\" -M microvm -accel %s -cpu qemu64 -m %ld -nodefaults -no-user-config "
@@ -292,7 +399,25 @@ run_real_microvm_backend(const Request *request, char *detail, size_t detail_len
 		status = (int) exit_code;
 	}
 #else
-	status = system(command);
+	{
+		long		qemu_timeout_ms = request->timeout_ms > 0 ?
+			request->timeout_ms : 30000;
+		int			supervised_status = -1;
+
+		if (!run_supervised_command(qemu_cli, command, qemu_timeout_ms,
+									&supervised_status))
+		{
+			debug = fopen(debug_path, "w");
+			if (debug != NULL)
+			{
+				fprintf(debug, "supervised qemu timed out after %ld ms for %s\n",
+						qemu_timeout_ms, qemu_cli);
+				fclose(debug);
+			}
+			return 0;
+		}
+		status = supervised_status;
+	}
 #endif
 	if (status != 0)
 	{
@@ -316,12 +441,15 @@ run_real_microvm_backend(const Request *request, char *detail, size_t detail_len
 		return 0;
 	}
 
+	snprintf(request->vm_id, sizeof(request->vm_id),
+			 "qx-microvm-%ld", request->task_oid);
 	snprintf(detail, detail_len,
-			 "tool %s via %s for %s phase on task %ld;backend_launch=qemu;microvm_accel=%s;microvm_kernel=%s",
+			 "tool %s via %s for %s phase on task %ld;backend_launch=qemu;vm_id=%s;microvm_accel=%s;microvm_kernel=%s",
 			 request->tool,
 			 request->principal,
 			 request->phase[0] != '\0' ? request->phase : "submit",
 			 request->task_oid,
+			 request->vm_id,
 			 accel,
 			 kernel);
 	remove(serial_path);
@@ -356,9 +484,15 @@ run_real_container_backend(const Request *request, char *detail, size_t detail_l
 			 request->process_limit > 0 ? request->process_limit : 1);
 	snprintf(memory_limit, sizeof(memory_limit), "%ldk",
 			 request->memory_kb > 0 ? request->memory_kb : 65536);
+	snprintf(request->container_id, sizeof(request->container_id),
+			 "qx-container-%ld", request->task_oid);
 	snprintf(command, sizeof(command),
-			 "\"%s\" run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --pids-limit %s --memory %s %s true",
+			 "\"%s\" run --rm --name %s --network %s --read-only --cap-drop ALL --security-opt %s --pids-limit %s --memory %s %s true",
 			 docker_cli,
+			 request->container_id,
+			 request->allow_network ? "bridge" : "none",
+			 request->allow_privilege_escalation ?
+			 "seccomp=unconfined" : "no-new-privileges",
 			 pids_limit,
 			 memory_limit,
 			 image);
@@ -403,17 +537,27 @@ run_real_container_backend(const Request *request, char *detail, size_t detail_l
 		status = (int) exit_code;
 	}
 #else
-	status = system(command);
+	{
+		long		docker_timeout_ms = request->timeout_ms > 0 ?
+			request->timeout_ms : 30000;
+		int			supervised_status = -1;
+
+		if (!run_supervised_command(docker_cli, command, docker_timeout_ms,
+									&supervised_status))
+			return 0;
+		status = supervised_status;
+	}
 #endif
 	if (status != 0)
 		return 0;
 
 	snprintf(detail, detail_len,
-			 "tool %s via %s for %s phase on task %ld;backend_launch=docker;container_image=%s",
+			 "tool %s via %s for %s phase on task %ld;backend_launch=docker;container_id=%s;container_image=%s",
 			 request->tool,
 			 request->principal,
 			 request->phase[0] != '\0' ? request->phase : "submit",
 			 request->task_oid,
+			 request->container_id,
 			 image);
 	return 1;
 }
@@ -696,10 +840,23 @@ parse_request(const char *path, Request *request)
 			snprintf(request->receipt_signer, sizeof(request->receipt_signer), "%s", value);
 		else if (strcmp(key, "REQUIRE_ATTESTATION") == 0)
 			request->require_attestation = (strcmp(value, "true") == 0);
+		else if (strcmp(key, "LAUNCH_REQUEST_FILE") == 0)
+			snprintf(request->launch_request_file, sizeof(request->launch_request_file),
+					 "%s", value);
 	}
 
 	fclose(file);
 	parse_sandbox_environment(request);
+	if (request->launch_request_file[0] != '\0')
+		(void) parse_launch_request_file(request->launch_request_file, request);
+	const char *launch_env = getenv("LAUNCH_REQUEST_FILE");
+	if (launch_env != NULL && launch_env[0] != '\0' &&
+		request->launch_request_file[0] == '\0')
+	{
+		snprintf(request->launch_request_file, sizeof(request->launch_request_file),
+				 "%s", launch_env);
+		(void) parse_launch_request_file(request->launch_request_file, request);
+	}
 	return request->tool[0] != '\0' && request->principal[0] != '\0';
 }
 
@@ -844,6 +1001,10 @@ main(int argc, char **argv)
 	fprintf(response, "ATTESTATION=%s\n", attestation_mode);
 	fprintf(response, "TOKENS=%d\n", tokens);
 	fprintf(response, "COST=%d\n", cost);
+	if (request.container_id[0] != '\0')
+		fprintf(response, "CONTAINER_ID=%s\n", request.container_id);
+	if (request.vm_id[0] != '\0')
+		fprintf(response, "VM_ID=%s\n", request.vm_id);
 	fprintf(response, "DETAIL=%s\n", detail);
 
 	fclose(response);

@@ -12225,5 +12225,13 @@
   proname => 'pg_qx_test_start_exhausted_retry_task', provolatile => 'v',
   proparallel => 'u', proisstrict => 't', prorettype => 'oid',
   proargtypes => 'oid', prosrc => 'pg_qx_test_start_exhausted_retry_task' },
+{ oid => '9210', descr => 'reset QhapaqXian shared-memory statistics',
+  proname => 'pg_qx_stat_reset', provolatile => 'v', proparallel => 'r',
+  proisstrict => 'f', prorettype => 'void', proargtypes => 'text',
+  prosrc => 'pg_qx_stat_reset' },
+{ oid => '9211', descr => 'provider stats from QhapaqXian shared-memory collector',
+  proname => 'pg_qx_stat_get_provider_stats', prorows => '32', proretset => 't',
+  provolatile => 's', proparallel => 'r', prorettype => 'record', proargtypes => '',
+  prosrc => 'pg_qx_stat_get_provider_stats' },
 
 ]

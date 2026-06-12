@@ -2,4 +2,5 @@
 
 backend_sources += files(
   'qx_observe.c',
+  'qx_stat.c',
 )

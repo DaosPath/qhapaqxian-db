@@ -13,24 +13,22 @@ Current state:
   fields too, so operator output no longer drops the live scheduler contract
   on `runtime.queue`, `runtime.dispatch`, `runtime.resume`, and
   `runtime.resume_dispatch`.
-- `pg_stat_qx_providers`, `pg_stat_qx_principals`, and
-  `pg_stat_qx_runtime_classes` now reuse the builtin
-  `pg_qx_trace_detail_value()` extractor instead of open-coding
-  `position('key=value;')` parsing in SQL.
-- scheduler queue/worker/activity/ledger views now derive their state from the
-  durable scheduler ledger, while provider/principal/runtime-class views keep
-  using the shared trace-detail extractor.
-- `pg_stat_qx_scheduler_activity` now gives operators a single queue/runtime/
+- `qx_stat` (Stage 33 v1) collects provider/principal/runtime-class/scheduler
+  counters in shared memory when `qhapaqxian.track_stats` is enabled.
+- `QxObserveRecord*` delegates to `QxStatReport*` for live counter updates.
+- `pg_qx_stat_get_provider_stats()` and `pg_qx_stat_reset(text)` expose the
+  collector to SQL callers.
+- `pg_stat_qx_providers` now joins the shared-memory collector for submit,
+  resume, and verified-receipt counters.
+- `pg_stat_qx_principals` and `pg_stat_qx_runtime_classes` still use trace
+  extraction for several counters until principal/runtime-class SRFs land.
+- scheduler queue/worker/activity/ledger views derive state from the durable
+  scheduler ledger.
+- `pg_stat_qx_scheduler_activity` gives operators a single queue/runtime/
   provider rollup for current task state plus renew/reclaim/release/retry
   counts without opening the raw scheduler ledger tables directly.
-- `pg_stat_qx_scheduler_retry_backoff` now exposes current retry-delay and
-  eligibility state per task, including the owning scheduler slot.
-- `pg_stat_qx_scheduler_worker_balance` now exposes per-slot owned task counts
-  per queue/runtime/provider key, including empty slots, so balancing skew is
-  visible without replaying the raw ledger by hand.
 
 Integration debt:
-- richer stats collection and a dedicated operator dashboard are still open.
-- the `pg_stat_qx_*` views still aggregate directly over `pg_qx_trace` or the
-  scheduler ledger and do not yet consume pre-aggregated observe state or a
-  dedicated stats collector.
+- principal/runtime-class stats SRFs and historical/SLO accounting remain open.
+- richer operator dashboards and pre-aggregated long-horizon rollups are still
+  future work.

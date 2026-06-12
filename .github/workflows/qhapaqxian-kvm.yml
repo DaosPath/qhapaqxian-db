@@ -1,0 +1,101 @@
+name: qhapaqxian-kvm
+
+on:
+  push:
+    branches:
+      - codex/**
+      - qx/**
+  pull_request:
+
+jobs:
+  kvm-real-backend:
+    runs-on: [self-hosted, linux, kvm]
+    steps:
+      - uses: actions/checkout@v4
+      - name: KVM probe
+        run: bash scripts/ci/kvm-probe.sh
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bison \
+            cpio \
+            flex \
+            libreadline-dev \
+            zlib1g-dev \
+            libxml2-dev \
+            libxslt1-dev \
+            libssl-dev \
+            perl \
+            pkg-config \
+            qemu-system-x86
+      - name: Configure
+        run: ./configure --without-icu --without-ldap --without-pam --with-openssl --with-extra-version='+qhx-kvm'
+      - name: Build
+        run: make -j"$(nproc)"
+      - name: Prepare microvm assets
+        run: |
+          set -euxo pipefail
+          rm -rf microvm-assets
+          mkdir -p microvm-assets/rootfs
+          curl -fsSL -o microvm-assets/vmlinuz-virt \
+            https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/x86_64/netboot/vmlinuz-virt
+          curl -fsSL -o microvm-assets/alpine-minirootfs-3.23.4-x86_64.tar.gz \
+            https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/x86_64/alpine-minirootfs-3.23.4-x86_64.tar.gz
+          tar -xzf microvm-assets/alpine-minirootfs-3.23.4-x86_64.tar.gz -C microvm-assets/rootfs
+          cat > microvm-assets/rootfs/init <<'EOF'
+          #!/bin/sh
+          mount -t proc proc /proc
+          mount -t sysfs sys /sys
+          mount -t devtmpfs dev /dev 2>/dev/null || mount -t tmpfs dev /dev
+          echo QX-MICROVM-BOOT-OK
+          poweroff -f >/dev/null 2>&1 || reboot -f
+          EOF
+          chmod +x microvm-assets/rootfs/init
+          (
+            cd microvm-assets/rootfs
+            find . -print | cpio -o -H newc | gzip -9
+          ) > microvm-assets/initramfs-qx-microvm2.cpio.gz
+      - name: MicroVM KVM smoke
+        env:
+          QX_MICROVM_ACCEL: kvm
+        run: |
+          cat > /tmp/qx-microvm-kvm.req <<EOF
+          PHASE=submit
+          TASK_OID=42
+          GOAL_LENGTH=8
+          INPUT_PRESENT=true
+          TOOL=summarize
+          HANDLER=builtin.summarize
+          SANDBOX=isolated
+          PRINCIPAL=summarize_runner
+          PRINCIPAL_RUNTIME=microvm
+          PROVIDER=microvm_provider
+          PROVIDER_KIND=microvm
+          PROVIDER_ENDPOINT=microvm://broker/primary
+          REQUIRE_ATTESTATION=true
+          RECEIPT_SCHEMA=qx.receipt.v1
+          RECEIPT_ALG=ed25519
+          RECEIPT_NONCE=ci:microvm-kvm
+          RECEIPT_SIGNER=$PWD/src/bin/qhapaqxian_tool_runner/qx_remote_ed25519_private.pem
+          QEMU_CLI=qemu-system-x86_64
+          MICROVM_KERNEL=$PWD/microvm-assets/vmlinuz-virt
+          MICROVM_INITRD=$PWD/microvm-assets/initramfs-qx-microvm2.cpio.gz
+          MICROVM_ACCEL=${QX_MICROVM_ACCEL}
+          EOF
+          QX_SANDBOX_PROFILE=isolated \
+          QX_SANDBOX_TIMEOUT_MS=15000 \
+          QX_SANDBOX_MEMORY_KB=262144 \
+          QX_SANDBOX_PROCESS_LIMIT=4 \
+          ./src/bin/qhapaqxian_tool_runner/qhapaqxian-tool-runner \
+            --request-file /tmp/qx-microvm-kvm.req \
+            --response-file /tmp/qx-microvm-kvm.resp
+          grep -q '^STATUS=ok$' /tmp/qx-microvm-kvm.resp
+          grep -q 'backend_launch=qemu' /tmp/qx-microvm-kvm.resp
+          grep -q '^VM_ID=' /tmp/qx-microvm-kvm.resp
+      - name: Focused regressions with KVM
+        env:
+          QX_MICROVM_ACCEL: kvm
+        run: |
+          make -C src/test/regress check-tests TESTS=qx_stage3_agentic
+          make -C src/test/regress check-tests TESTS=qx_stage3_observability

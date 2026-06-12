@@ -50,6 +50,7 @@
 #include "storage/procsignal.h"
 #include "storage/sinvaladt.h"
 #include "storage/spin.h"
+#include "qx/qx_stat.h"
 #include "utils/guc.h"
 #include "utils/injection_point.h"
 
@@ -151,6 +152,7 @@ CalculateShmemSize(int *num_semaphores)
 	size = add_size(size, StatsShmemSize());
 	size = add_size(size, WaitEventCustomShmemSize());
 	size = add_size(size, InjectionPointShmemSize());
+	size = add_size(size, QxStatShmemSize());
 	size = add_size(size, SlotSyncShmemSize());
 #ifdef EXEC_BACKEND
 	size = add_size(size, ShmemBackendArraySize());
@@ -357,6 +359,7 @@ CreateOrAttachShmemStructs(void)
 	StatsShmemInit();
 	WaitEventCustomShmemInit();
 	InjectionPointShmemInit();
+	QxStatShmemInit();
 }
 
 /*

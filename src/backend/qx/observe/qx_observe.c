@@ -12,8 +12,12 @@
 #include "postgres.h"
 
 #include "fmgr.h"
+#include "miscadmin.h"
 #include "lib/stringinfo.h"
+#include "catalog/namespace.h"
+#include "qx/qx_catalog.h"
 #include "qx/qx_observe.h"
+#include "qx/qx_stat.h"
 #include "utils/builtins.h"
 
 static char *qx_observe_contract_value(const char *contract,
@@ -162,6 +166,8 @@ QxObserveRecordProviderExecution(QxObserveProviderStats *stats, bool resume,
 								 int32 token_charge, int32 cost_charge,
 								 bool receipt_verified)
 {
+	Oid			provideroid = InvalidOid;
+
 	if (stats == NULL)
 		return;
 
@@ -175,6 +181,21 @@ QxObserveRecordProviderExecution(QxObserveProviderStats *stats, bool resume,
 		stats->rejected_receipt_count++;
 	stats->token_used += token_charge;
 	stats->cost_used += cost_charge;
+
+	if (qhapaqxian_track_stats && stats->provider_name != NULL)
+	{
+		QxCatalogProviderInfo provider;
+
+		if (QxCatalogLookupProviderByName(get_namespace_oid("public", false),
+										  stats->provider_name, &provider))
+		{
+			provideroid = provider.oid;
+			QxCatalogFreeProviderInfo(&provider);
+		}
+		if (OidIsValid(provideroid))
+			QxStatReportProviderExecution(MyDatabaseId, provideroid, resume,
+										  receipt_verified);
+	}
 }
 
 void
@@ -182,6 +203,8 @@ QxObserveRecordPrincipalExecution(QxObservePrincipalStats *stats, bool resume,
 								  bool checkpointed, int32 token_charge,
 								  int32 cost_charge)
 {
+	Oid			principaloid = InvalidOid;
+
 	if (stats == NULL)
 		return;
 
@@ -194,6 +217,26 @@ QxObserveRecordPrincipalExecution(QxObservePrincipalStats *stats, bool resume,
 		stats->checkpoint_count++;
 	stats->token_used += token_charge;
 	stats->cost_used += cost_charge;
+
+	if (qhapaqxian_track_stats && stats->principal_name != NULL)
+	{
+		QxCatalogPrincipalInfo principal;
+
+		if (QxCatalogLookupPrincipalByName(get_namespace_oid("public", false),
+										   stats->principal_name, &principal))
+		{
+			principaloid = principal.oid;
+			QxCatalogFreePrincipalInfo(&principal);
+		}
+		if (OidIsValid(principaloid))
+			QxStatReportPrincipalExecution(MyDatabaseId, principaloid, resume,
+										   checkpointed);
+	}
+
+	if (qhapaqxian_track_stats && stats->runtime_class != NULL &&
+		stats->runtime_class[0] != '\0')
+		QxStatReportRuntimeClassExecution(MyDatabaseId, stats->runtime_class,
+										  resume, checkpointed);
 }
 
 void
@@ -213,6 +256,11 @@ QxObserveRecordRuntimeClassExecution(QxObserveRuntimeClassStats *stats,
 		stats->checkpoint_count++;
 	stats->token_used += token_charge;
 	stats->cost_used += cost_charge;
+
+	if (qhapaqxian_track_stats && stats->runtime_class != NULL &&
+		stats->runtime_class[0] != '\0')
+		QxStatReportRuntimeClassExecution(MyDatabaseId, stats->runtime_class,
+										  resume, checkpointed);
 }
 
 char *

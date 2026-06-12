@@ -17,7 +17,7 @@ Documentation hierarchy:
 - `docs/stage-*/README.md` = stage-local landed contracts and notes
 
 Snapshot date:
-- `2026-04-22`
+- `2026-06-12`
 
 Last validated test sweep:
 - Windows: `meson compile -C build-stage4-codex -j 2`
@@ -77,17 +77,18 @@ Status legend:
 | 21 asymmetric receipts | yes | yes | yes | yes | signer material is still repo/bindir local; no certificate chain or hardware root |
 | 22 container/microVM runtime classes | yes | yes | yes | yes | runtime classes now have real Docker and QEMU launch paths; deeper OCI policy and VM lifecycle ownership remain future work |
 | 23 attestation contracts | yes | yes | yes | partial | attestation bundles are consumed by real backend paths and regression now covers partial/missing/mismatched/inherited contract permutations; stronger provenance roots remain future work |
-| 24 container backend scaffold | yes | yes | partial | yes | Docker launch is wired and validated; cgroup/seccomp/image-policy ownership remains future work |
-| 25 microVM backend scaffold | yes | yes | partial | yes | QEMU `microvm` launch is wired and validated with Windows TCG and WSL KVM; VM lifecycle supervision and KVM CI remain future work |
+| 24 container backend scaffold | yes | yes | partial | yes | Docker launch is wired with typed launch requests, image allowlists, supervised Unix waits, and `CONTAINER_ID` responses; cgroup/seccomp ownership remains future work |
+| 25 microVM backend scaffold | yes | yes | partial | yes | QEMU `microvm` launch is wired with typed launch requests, policy memory limits, supervised Unix waits, `VM_ID` responses, and self-hosted KVM CI; deeper VM lifecycle ownership remains future work |
 | 26 scheduler scaffold | yes | yes | yes | partial | durable queue/lease/heartbeat catalogs, release snapshots, autonomous launcher/database bgworkers, configurable bounded per-database slot ownership with default 2, pg_regress-safe temp-cluster targeting, lease renewal, reclaim snapshots, checkpoint-backed task/attempt repair, non-checkpoint stale-attempt fail-closed retry repair (`failed` attempt + durable `RETRY` queue + queued backoff), autonomous retry intake that ranks eligible retry candidates by priority/eligibility order before re-running real submit work, priority-aware exponential retry backoff with deterministic jitter, max-retry dead-letter into durable `failed` task state plus blocked `MAINTENANCE` queue evidence, failover rebuild snapshots, and ledger-backed queue/worker/activity/backoff/balance views now exist, but load-adaptive slot scaling and a dedicated scheduler stats plane remain future work |
 | 27 recovery scanner scaffold | yes | yes | yes | partial | startup recovery, failover rebuild, and the autonomous scheduler supervisor now drive real scheduler requeue/reclaim writes, repeated scans suppress duplicate recovery queue/reclaimed-lease evidence when the latest durable scheduler ledger already reflects the repair, stale no-checkpoint attempts now fail closed into queued retry state before autonomous retry dispatch, and exhausted retries fail closed into dead-letter state; deeper semantic replay and broader supervision policy remain future work |
-| 28 observability scaffold | yes | yes | partial | partial | `qx_observe` now backs `SHOW TRACE` summaries, the scheduler durable ledger plus `pg_stat_qx_scheduler_activity`, `pg_stat_qx_scheduler_retry_backoff`, and `pg_stat_qx_scheduler_worker_balance` exist, `pg_stat_qx_tasks` maps exhausted retry dead-letter to `failed`, and focused `qx_stage3_agentic` covers renew/reclaim/release/retry/dead-letter aggregation plus slot/backoff/balance assertions, but there is still no dedicated stats collector or standalone observability test suite |
+| 28 observability scaffold | yes | yes | partial | partial | `qx_observe` backs `SHOW TRACE` summaries and scheduler activity views; Stage 33 adds shared-memory `qx_stat`, `pg_qx_stat_get_provider_stats`, and `qx_stage3_observability`, but principal/runtime-class collector SRFs and historical/SLO accounting remain open |
 | 29 capability-aware planner/executor | yes | yes | yes | yes | planner/executor now materialize explicit submit/resume capability routes, persist them in `pg_qx_task`, and runtime/retry/recovery consume those routes instead of first/last contract heuristics |
 | 30 security/tool capability contract | yes | yes | yes | yes | namespace policy `USING` contracts now enforce required/denied capability tags during tool authorization and `CREATE AGENT`; OS-level OCI/VM policy compilation and stronger provenance remain future hardening |
 | 31 semantic payload v2 | yes | yes | yes | yes | v2 payloads cover verified execution events, but the replication surface is still logical-message text rather than a deeper WAL family |
-| 32 catalog snapshot helper layer | yes | yes | partial | partial | recovery, planner, security authorization/validation, selected runtime reads plus budget validation, command authorization reads, and the main `pg_stat_qx_*` contract extractors now consume shared helpers through `qx_catalog`/`qx_observe`; runtime write paths, scheduler, and broader observability aggregation still need migration and helper coverage remains indirect |
+| 32 catalog snapshot helper layer | yes | yes | partial | partial | recovery, planner, security, commands, and runtime scheduler reads now use `qx_catalog` helpers including latest queue/lease snapshots and step seqno; runtime write paths still use syscache for task/attempt updates and principal/runtime-class stats views still scan traces |
+| 33 stats collector and runtime hardening | yes | yes | partial | partial | `qx_stat` shared-memory collector, `qhapaqxian.track_stats`, catalog scheduler helpers, runtime policy/supervisor, typed launch requests, KVM CI workflow, and `qx_stage3_observability` landed; principal/runtime-class SRFs, historical stats, and full OCI/VM policy compilation remain open |
 
 Canonical next-gap summary:
-- strongest remaining platform gap: hardening real Docker/QEMU backends into owned OCI policy, VM lifecycle supervision, and self-hosted KVM CI coverage;
-- strongest observability gap: turn the current ledger-backed queue/worker/activity/backoff/balance SQL rollups into a dedicated stats collector/dashboard with stronger historical/SLO accounting;
+- strongest remaining platform gap: deepen OCI cgroup/seccomp policy compilation and cross-process VM lifecycle ownership beyond the new supervisor registry;
+- strongest observability gap: extend the Stage 33 collector to principals/runtime-classes with historical/SLO accounting and operator dashboards;
 - strongest documentation gap: older stage docs still vary in depth and shape; use `docs/stage-template.md` and `docs/README.md` as the cleanup baseline.

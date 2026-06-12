@@ -167,6 +167,18 @@ backend_launch=qemu
 microvm_accel=kvm
 ```
 
+## KVM CI
+
+Self-hosted runners labeled `linux` and `kvm` can execute
+`.github/workflows/qhapaqxian-kvm.yml`:
+
+- `scripts/ci/kvm-probe.sh` verifies `/dev/kvm` and QEMU KVM acceleration.
+- the workflow builds the tree, boots the Alpine microVM asset with
+  `QX_MICROVM_ACCEL=kvm`, and runs `qx_stage3_agentic` plus
+  `qx_stage3_observability`.
+- `qhapaqxian-bootstrap.yml` includes an optional KVM probe step that skips
+  cleanly on hosted runners without `/dev/kvm`.
+
 ## Test Matrix
 
 CI smoke lane:

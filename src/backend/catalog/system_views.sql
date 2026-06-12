@@ -2211,25 +2211,33 @@ CREATE VIEW pg_stat_qx_providers WITH (security_barrier) AS
         (SELECT count(*)::bigint
          FROM pg_qx_principal pr
          WHERE pr.qxprincipalproviderid = p.oid) AS principal_count,
-        (SELECT count(DISTINCT tr.qxtracetaskid)::bigint
-         FROM pg_qx_trace tr
-         WHERE tr.qxtracename IN ('runtime.external_submit', 'runtime.external_resume')
-           AND pg_qx_trace_detail_value(tr.qxtracedetail, 'provider') = p.qxprovidername) AS task_count,
-        (SELECT count(*)::bigint
-         FROM pg_qx_trace tr
-         WHERE tr.qxtracename = 'runtime.external_submit'
-           AND pg_qx_trace_detail_value(tr.qxtracedetail, 'provider') = p.qxprovidername) AS submit_count,
-        (SELECT count(*)::bigint
-         FROM pg_qx_trace tr
-         WHERE tr.qxtracename = 'runtime.external_resume'
-           AND pg_qx_trace_detail_value(tr.qxtracedetail, 'provider') = p.qxprovidername) AS resume_count,
-        (SELECT count(*)::bigint
-         FROM pg_qx_trace tr
-         WHERE tr.qxtracename IN ('runtime.external_submit', 'runtime.external_resume')
-           AND pg_qx_trace_detail_value(tr.qxtracedetail, 'provider') = p.qxprovidername
-           AND pg_qx_trace_detail_value(tr.qxtracedetail, 'receipt_sig') = 'verified') AS verified_receipt_count
+        COALESCE(stats.execution_count, 0::bigint) AS task_count,
+        COALESCE(stats.submit_count, 0::bigint) AS submit_count,
+        COALESCE(stats.resume_count, 0::bigint) AS resume_count,
+        COALESCE(stats.verified_receipts, 0::bigint) AS verified_receipt_count
     FROM pg_qx_provider p
          LEFT JOIN pg_namespace n ON (n.oid = p.qxprovidernamespace)
+         LEFT JOIN LATERAL (
+            SELECT s.submit_count,
+                   s.resume_count,
+                   s.verified_receipts,
+                   s.execution_count
+            FROM pg_qx_stat_get_provider_stats() AS s(provider_oid oid,
+                                                      provider_name text,
+                                                      provider_kind text,
+                                                      provider_endpoint text,
+                                                      enabled boolean,
+                                                      attestation_required boolean,
+                                                      submit_count bigint,
+                                                      resume_count bigint,
+                                                      verified_receipts bigint,
+                                                      rejected_receipts bigint,
+                                                      checkpoint_count bigint,
+                                                      execution_count bigint,
+                                                      task_count bigint,
+                                                      reserved bigint)
+            WHERE s.provider_oid = p.oid
+         ) stats ON true
     WHERE pg_has_role(SESSION_USER, p.qxproviderowner, 'USAGE')
        OR pg_has_role(SESSION_USER, 'pg_read_all_stats', 'MEMBER');
 

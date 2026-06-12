@@ -48,9 +48,12 @@
 #include "port.h"
 #include "postmaster/bgworker.h"
 #include "postmaster/interrupt.h"
+#include "qx_backend_supervisor.h"
 #include "qx_container_backend.h"
 #include "qx_microvm_backend.h"
+#include "qx_runtime_policy.h"
 #include "qx/qx_catalog.h"
+#include "qx/qx_stat.h"
 #include "qx/qx_recovery.h"
 #include "qx/qx_runtime.h"
 #include "qx/qx_scheduler.h"
@@ -269,12 +272,13 @@ static void qx_resolve_receipt_signer_path(const char *signer_name,
 										   char *resolved,
 										   size_t resolved_len);
 static void qx_launch_principal_program(const char *program_path,
-										const QxSandboxProfile *profile,
-										const char *runtime_dir,
-										const char *request_path,
-										const char *response_path,
-										bool preserve_host_identity,
-										QxSandboxObservation *observation);
+							const QxSandboxProfile *profile,
+							const char *runtime_dir,
+							const char *request_path,
+							const char *response_path,
+							const char *launch_request_path,
+							bool preserve_host_identity,
+							QxSandboxObservation *observation);
 static void qx_read_external_result(const char *path,
 									QxExternalToolResult *result);
 static void qx_build_semantic_execution_metadata(
@@ -373,23 +377,7 @@ static Oid qx_insert_scheduler_lease(Relation rel,
 static Oid qx_insert_scheduler_heartbeat(Relation rel,
 										 Oid leaseoid,
 										 const QxSchedulerHeartbeatSnapshot *snapshot);
-static char *qx_runtime_heap_text_attr(Relation rel, HeapTuple tup,
-									   AttrNumber attnum);
-static void qx_runtime_copy_scheduler_queue_snapshot(
-	Relation rel,
-	HeapTuple tup,
-	QxSchedulerQueueSnapshot *snapshot);
-static bool qx_runtime_latest_queue(
-	Relation queueledgerrel,
-	Oid taskoid,
-	Oid attemptoid,
-	QxSchedulerQueueSnapshot *snapshot);
-static bool qx_runtime_latest_lease(
-	Relation leaseledgerrel,
-	Oid taskoid,
-	Oid attemptoid,
-	QxSchedulerLeaseSnapshot *snapshot,
-	Oid *queueoid);
+
 static int32 qx_runtime_lease_ttl_ms(
 	const QxSchedulerLeaseSnapshot *snapshot);
 static int32 qx_runtime_scheduler_max_retries(void);
@@ -409,7 +397,7 @@ static void qx_runtime_free_scheduler_queue_snapshot(
 	QxSchedulerQueueSnapshot *snapshot);
 static void qx_runtime_free_scheduler_lease_snapshot(
 	QxSchedulerLeaseSnapshot *snapshot);
-static int16 qx_runtime_next_step_seqno(Relation steprel, Oid taskoid);
+
 static List *qx_runtime_scheduler_db_targets(void);
 static bool qx_runtime_scheduler_db_target_allowed(const char *dbname);
 static void qx_runtime_free_scheduler_db_targets(List *targets);
@@ -2000,6 +1988,7 @@ qx_launch_principal_program(const char *program_path,
 							const char *runtime_dir,
 							const char *request_path,
 							const char *response_path,
+							const char *launch_request_path,
 							bool preserve_host_identity,
 							QxSandboxObservation *observation)
 {
@@ -2009,7 +1998,7 @@ qx_launch_principal_program(const char *program_path,
 	bool		timed_out = false;
 	TimestampTz	started_at;
 	char	   *argv[6];
-	char	   *envp[9];
+	char	   *envp[10];
 	int			env_index = 0;
 
 	argv[0] = unconstify(char *, program_path);
@@ -2029,6 +2018,9 @@ qx_launch_principal_program(const char *program_path,
 	envp[env_index++] = psprintf("QX_SANDBOX_MAX_OPEN_FILES=%d", profile->max_open_files);
 	envp[env_index++] = psprintf("QX_RUNTIME_ROOT=%s", runtime_dir);
 	envp[env_index++] = psprintf("TMPDIR=%s", runtime_dir);
+	if (launch_request_path != NULL && launch_request_path[0] != '\0')
+		envp[env_index++] = psprintf("LAUNCH_REQUEST_FILE=%s",
+									 launch_request_path);
 	envp[env_index++] = pstrdup("LANG=C");
 	envp[env_index] = NULL;
 
@@ -2239,6 +2231,8 @@ qx_launch_principal_program(const char *program_path,
 	QX_APPEND_ENV("QX_RUNTIME_ROOT", runtime_dir);
 	QX_APPEND_ENV("TMP", runtime_dir);
 	QX_APPEND_ENV("TEMP", runtime_dir);
+	if (launch_request_path != NULL && launch_request_path[0] != '\0')
+		QX_APPEND_ENV("LAUNCH_REQUEST_FILE", launch_request_path);
 	if (system_root != NULL && system_root[0] != '\0')
 		QX_APPEND_ENV("SystemRoot", system_root);
 	appendBinaryStringInfo(&environment, "\0", 1);
@@ -2855,9 +2849,13 @@ qx_execute_tool_contract(const char *contract, const char *phase, Oid taskoid,
 	char		microvm_initrd_path[MAXPGPATH];
 	char		request_path[MAXPGPATH];
 	char		response_path[MAXPGPATH];
+	char		launch_request_path[MAXPGPATH];
 	char	   *request_payload;
+	char	   *launch_request_payload = NULL;
+	char	   *tool_capability_tags;
 	char	   *container_request_lines = NULL;
 	char	   *microvm_request_lines = NULL;
+	QxRuntimePolicy runtime_policy;
 	Oid			provideroid = InvalidOid;
 	const char *resolved_signer = "";
 	bool		use_container_backend = false;
@@ -2884,10 +2882,13 @@ qx_execute_tool_contract(const char *contract, const char *phase, Oid taskoid,
 	provider_attestation = qx_contract_value(contract, "provider_attestation");
 	receipt_schema = qx_contract_value(contract, "receipt_schema");
 	receipt_alg = qx_contract_value(contract, "receipt_alg");
+	tool_capability_tags = qx_contract_value(contract, "tool_capability_tags");
 	receipt_nonce = psprintf("%s:%s:%s",
 							 phase != NULL ? phase : "submit",
 							 tool_name != NULL ? tool_name : "tool",
 							 principal_name != NULL ? principal_name : "principal");
+	qx_runtime_policy_init(&runtime_policy);
+	qx_runtime_policy_from_authz(NULL, tool_capability_tags, &runtime_policy);
 	if (principal_runtime == NULL || principal_runtime[0] == '\0')
 	{
 		if (principal_runtime != NULL)
@@ -3015,6 +3016,96 @@ qx_execute_tool_contract(const char *contract, const char *phase, Oid taskoid,
 	qx_runtime_temp_dir(runtime_dir, sizeof(runtime_dir));
 	qx_runtime_temp_path(request_path, sizeof(request_path), "req");
 	qx_runtime_temp_path(response_path, sizeof(response_path), "resp");
+	launch_request_path[0] = '\0';
+	if (use_container_backend)
+	{
+		QxContainerBackendRequest backend_request;
+
+		qx_runtime_temp_path(launch_request_path, sizeof(launch_request_path),
+							 "launch");
+		qx_container_backend_request_init(&backend_request);
+		backend_request.phase = pstrdup(phase != NULL ? phase : "submit");
+		backend_request.tool_name = pstrdup(qx_safe_runtime_text(tool_name));
+		backend_request.principal_name = pstrdup(qx_safe_runtime_text(principal_name));
+		backend_request.principal_runtime = pstrdup(qx_safe_runtime_text(principal_runtime));
+		backend_request.provider_name = pstrdup(qx_safe_runtime_text(provider_name));
+		backend_request.provider_kind = pstrdup(qx_safe_runtime_text(provider_kind));
+		backend_request.provider_endpoint = pstrdup(qx_safe_runtime_text(provider_endpoint));
+		backend_request.sandbox_name = pstrdup(qx_safe_runtime_text(effective_sandbox));
+		backend_request.profile_name = pstrdup(execution_profile->name);
+		backend_request.environment_mode = pstrdup("minimal");
+		backend_request.workdir_name = pstrdup("pg_qx_runtime");
+		backend_request.command_line = psprintf("docker run --rm %s true",
+												runtime_policy.image_ref);
+		qx_runtime_policy_validate_image_ref(runtime_policy.image_ref);
+		backend_request.image_ref = pstrdup(runtime_policy.image_ref);
+		backend_request.receipt_schema = pstrdup(receipt_schema != NULL ? receipt_schema : "qx.receipt.v1");
+		backend_request.receipt_alg = pstrdup(receipt_alg != NULL ? receipt_alg : "hmac-sha256");
+		backend_request.receipt_nonce = pstrdup(receipt_nonce);
+		backend_request.attestation_mode =
+			pstrdup(qx_container_backend_expected_attestation_mode());
+		backend_request.detail = psprintf("task=%u", taskoid);
+		backend_request.timeout_ms = execution_profile->timeout_ms;
+		backend_request.memory_kb = execution_profile->memory_kb;
+		backend_request.process_limit = execution_profile->process_limit;
+		backend_request.require_attestation =
+			(provider_attestation != NULL &&
+			 strcmp(provider_attestation, "required") == 0);
+		backend_request.allow_network = runtime_policy.allow_network;
+		backend_request.allow_privilege_escalation =
+			runtime_policy.allow_privilege_escalation;
+		launch_request_payload =
+			qx_container_backend_build_launch_request(&backend_request);
+		qx_container_backend_request_free(&backend_request);
+	}
+	else if (use_microvm_backend)
+	{
+		QxMicrovmBackendRequest backend_request;
+
+		qx_runtime_temp_path(launch_request_path, sizeof(launch_request_path),
+							 "launch");
+		qx_microvm_backend_request_init(&backend_request);
+		backend_request.phase = pstrdup(phase != NULL ? phase : "submit");
+		backend_request.tool_name = pstrdup(qx_safe_runtime_text(tool_name));
+		backend_request.principal_name = pstrdup(qx_safe_runtime_text(principal_name));
+		backend_request.principal_runtime = pstrdup(qx_safe_runtime_text(principal_runtime));
+		backend_request.provider_name = pstrdup(qx_safe_runtime_text(provider_name));
+		backend_request.provider_kind = pstrdup(qx_safe_runtime_text(provider_kind));
+		backend_request.provider_endpoint = pstrdup(qx_safe_runtime_text(provider_endpoint));
+		backend_request.sandbox_name = pstrdup(qx_safe_runtime_text(effective_sandbox));
+		backend_request.profile_name = pstrdup(execution_profile->name);
+		backend_request.environment_mode = pstrdup("minimal");
+		backend_request.workdir_name = pstrdup("pg_qx_runtime");
+		backend_request.command_line = psprintf("%s -M microvm -kernel %s -initrd %s",
+											  microvm_qemu_path,
+											  microvm_kernel_path,
+											  microvm_initrd_path);
+		backend_request.image_ref = psprintf("kernel=%s;initrd=%s",
+											 microvm_kernel_path,
+											 microvm_initrd_path);
+		backend_request.snapshot_ref = NULL;
+		backend_request.receipt_schema = pstrdup(receipt_schema != NULL ? receipt_schema : "qx.receipt.v1");
+		backend_request.receipt_alg = pstrdup(receipt_alg != NULL ? receipt_alg : "hmac-sha256");
+		backend_request.receipt_nonce = pstrdup(receipt_nonce);
+		backend_request.attestation_mode =
+			pstrdup(qx_microvm_backend_expected_attestation_mode());
+		backend_request.detail = psprintf("task=%u", taskoid);
+		backend_request.timeout_ms = execution_profile->timeout_ms;
+		backend_request.memory_kb = execution_profile->memory_kb;
+		backend_request.process_limit = execution_profile->process_limit;
+		backend_request.vcpu_count = 1;
+		backend_request.require_attestation =
+			(provider_attestation != NULL &&
+			 strcmp(provider_attestation, "required") == 0);
+		backend_request.allow_network = runtime_policy.allow_network;
+		backend_request.allow_privilege_escalation =
+			runtime_policy.allow_privilege_escalation;
+		launch_request_payload =
+			qx_microvm_backend_build_launch_request(&backend_request);
+		qx_microvm_backend_request_free(&backend_request);
+	}
+	if (launch_request_payload != NULL)
+		qx_write_text_file(launch_request_path, launch_request_payload);
 
 	request_payload = psprintf(
 		"PHASE=%s\nTASK_OID=%u\nGOAL_LENGTH=%zu\nINPUT_PRESENT=%s\nTOOL=%s\nHANDLER=%s\nSANDBOX=%s\nPRINCIPAL=%s\nPRINCIPAL_RUNTIME=%s\nPROVIDER=%s\nPROVIDER_KIND=%s\nPROVIDER_ENDPOINT=%s\nREQUIRE_ATTESTATION=%s\nRECEIPT_SCHEMA=%s\nRECEIPT_ALG=%s\nRECEIPT_NONCE=%s\nRECEIPT_KEY=%s\nRECEIPT_SIGNER=%s\n",
@@ -3056,8 +3147,20 @@ qx_execute_tool_contract(const char *contract, const char *phase, Oid taskoid,
 		pfree(request_payload);
 		request_payload = augmented_payload;
 	}
+	if (launch_request_path[0] != '\0')
+	{
+		char	   *augmented_payload;
+
+		augmented_payload = psprintf("%sLAUNCH_REQUEST_FILE=%s\n",
+									 request_payload,
+									 launch_request_path);
+		pfree(request_payload);
+		request_payload = augmented_payload;
+	}
 	qx_write_text_file(request_path, request_payload);
 	pfree(request_payload);
+	if (launch_request_payload != NULL)
+		pfree(launch_request_payload);
 	if (container_request_lines != NULL)
 		pfree(container_request_lines);
 	if (microvm_request_lines != NULL)
@@ -3066,9 +3169,29 @@ qx_execute_tool_contract(const char *contract, const char *phase, Oid taskoid,
 	memset(&observation, 0, sizeof(observation));
 	qx_launch_principal_program(program_path, execution_profile, runtime_dir,
 								request_path, response_path,
+								launch_request_path[0] != '\0' ?
+								launch_request_path : NULL,
 								(use_container_backend || use_microvm_backend),
 								&observation);
 	qx_read_external_result(response_path, result);
+	if (use_container_backend && result->detail != NULL &&
+		strstr(result->detail, "backend_launch=docker") != NULL)
+	{
+		char		instance_id[64];
+
+		snprintf(instance_id, sizeof(instance_id), "qx-container-%u", taskoid);
+		qx_backend_supervisor_register(taskoid, instance_id,
+									   QX_BACKEND_LEASE_CONTAINER);
+	}
+	else if (use_microvm_backend && result->detail != NULL &&
+			 strstr(result->detail, "backend_launch=qemu") != NULL)
+	{
+		char		instance_id[64];
+
+		snprintf(instance_id, sizeof(instance_id), "qx-microvm-%u", taskoid);
+		qx_backend_supervisor_register(taskoid, instance_id,
+									   QX_BACKEND_LEASE_MICROVM);
+	}
 	qx_validate_external_result(result, execution_profile,
 								phase,
 								taskoid,
@@ -3091,6 +3214,10 @@ qx_execute_tool_contract(const char *contract, const char *phase, Oid taskoid,
 	if (unlink(response_path) != 0 && errno != ENOENT)
 		elog(WARNING, "could not remove QhapaqXian response file \"%s\": %m",
 			 response_path);
+	if (launch_request_path[0] != '\0' &&
+		unlink(launch_request_path) != 0 && errno != ENOENT)
+		elog(WARNING, "could not remove QhapaqXian launch request file \"%s\": %m",
+			 launch_request_path);
 
 	if (result->tool_name == NULL && tool_name != NULL)
 		result->tool_name = pstrdup(tool_name);
@@ -3132,6 +3259,16 @@ qx_execute_tool_contract(const char *contract, const char *phase, Oid taskoid,
 		result->process_limit = profile->process_limit;
 	result->restricted_identity = observation.restricted_identity;
 	result->wall_time_ms = observation.wall_time_ms;
+	if (qhapaqxian_track_stats && OidIsValid(provideroid))
+	{
+		bool		resume = (phase != NULL && strcmp(phase, "resume") == 0);
+		bool		receipt_verified =
+			(result->receipt_signature != NULL &&
+			 strcmp(result->receipt_signature, "verified") == 0);
+
+		QxStatReportProviderExecution(MyDatabaseId, provideroid, resume,
+									  receipt_verified);
+	}
 	if (result->detail != NULL)
 	{
 		char	   *augmented_detail;
@@ -3180,6 +3317,9 @@ qx_execute_tool_contract(const char *contract, const char *phase, Oid taskoid,
 		pfree(receipt_nonce);
 	if (receipt_key != NULL)
 		pfree(receipt_key);
+	if (tool_capability_tags != NULL)
+		pfree(tool_capability_tags);
+	qx_runtime_policy_free(&runtime_policy);
 }
 
 static List *
@@ -3543,6 +3683,9 @@ qx_insert_trace(Relation rel, Oid sessionoid, Oid taskoid, Oid stepoid,
 	CatalogTupleInsert(rel, tup);
 	heap_freetuple(tup);
 
+	if (qhapaqxian_track_stats)
+		QxStatReportTrace(name, detail);
+
 	return traceoid;
 }
 
@@ -3834,191 +3977,6 @@ qx_insert_scheduler_heartbeat(Relation rel, Oid leaseoid,
 	return heartbeatoid;
 }
 
-static char *
-qx_runtime_heap_text_attr(Relation rel, HeapTuple tup, AttrNumber attnum)
-{
-	Datum		datum;
-	bool		isnull;
-
-	datum = heap_getattr(tup, attnum, RelationGetDescr(rel), &isnull);
-	if (isnull)
-		return NULL;
-
-	return TextDatumGetCString(datum);
-}
-
-static void
-qx_runtime_copy_scheduler_queue_snapshot(Relation rel, HeapTuple tup,
-										 QxSchedulerQueueSnapshot *snapshot)
-{
-	Form_pg_qx_scheduler_queue form;
-
-	Assert(snapshot != NULL);
-
-	form = (Form_pg_qx_scheduler_queue) GETSTRUCT(tup);
-	MemSet(snapshot, 0, sizeof(QxSchedulerQueueSnapshot));
-	snapshot->queueoid = form->oid;
-	snapshot->ownerid = form->qxqueueledgerowner;
-	snapshot->namespace_policy_oid = form->qxqueueledgernamespaceid;
-	snapshot->agentoid = form->qxqueueledgeragentid;
-	snapshot->sessionoid = form->qxqueueledgersessionid;
-	snapshot->taskoid = form->qxqueueledgertaskid;
-	snapshot->attemptoid = form->qxqueueledgerattemptid;
-	snapshot->queue_kind = (QxSchedulerQueueKind) form->qxqueueledgerkind;
-	snapshot->runnable_count = form->qxqueueledgerrunnablecount;
-	snapshot->leased_count = form->qxqueueledgerleasedcount;
-	snapshot->blocked_count = form->qxqueueledgerblockedcount;
-	snapshot->retry_count = form->qxqueueledgerretrycount;
-	snapshot->enqueued_at = form->qxqueueledgerenqueuedat;
-	snapshot->eligible_at = form->qxqueueledgereligibleat;
-	snapshot->updated_at = form->qxqueueledgerupdatedat;
-	snapshot->queue_name = qx_runtime_heap_text_attr(rel, tup,
-		Anum_pg_qx_scheduler_queue_qxqueueledgername);
-	snapshot->agent_name = qx_runtime_heap_text_attr(rel, tup,
-		Anum_pg_qx_scheduler_queue_qxqueueledgeragentname);
-	snapshot->identity_name = qx_runtime_heap_text_attr(rel, tup,
-		Anum_pg_qx_scheduler_queue_qxqueueledgeridentityname);
-	snapshot->namespace_policy_name = qx_runtime_heap_text_attr(rel, tup,
-		Anum_pg_qx_scheduler_queue_qxqueueledgernamespacepolicyname);
-	snapshot->priority = qx_runtime_heap_text_attr(rel, tup,
-		Anum_pg_qx_scheduler_queue_qxqueueledgerpriority);
-	snapshot->principal_name = qx_runtime_heap_text_attr(rel, tup,
-		Anum_pg_qx_scheduler_queue_qxqueueledgerprincipalname);
-	snapshot->provider_name = qx_runtime_heap_text_attr(rel, tup,
-		Anum_pg_qx_scheduler_queue_qxqueueledgerprovidername);
-	snapshot->provider_kind = qx_runtime_heap_text_attr(rel, tup,
-		Anum_pg_qx_scheduler_queue_qxqueueledgerproviderkind);
-	snapshot->principal_runtime = qx_runtime_heap_text_attr(rel, tup,
-		Anum_pg_qx_scheduler_queue_qxqueueledgerprincipalruntime);
-}
-
-static bool
-qx_runtime_latest_queue(Relation queueledgerrel, Oid taskoid, Oid attemptoid,
-						QxSchedulerQueueSnapshot *snapshot)
-{
-	TableScanDesc scan;
-	HeapTuple	tup;
-	HeapTuple	best = NULL;
-	Oid			bestoid = InvalidOid;
-
-	Assert(snapshot != NULL);
-
-	scan = table_beginscan_catalog(queueledgerrel, 0, NULL);
-	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
-	{
-		Form_pg_qx_scheduler_queue form =
-			(Form_pg_qx_scheduler_queue) GETSTRUCT(tup);
-
-		if (form->qxqueueledgerdbid != MyDatabaseId ||
-			form->qxqueueledgertaskid != taskoid ||
-			form->qxqueueledgerattemptid != attemptoid)
-			continue;
-
-		if (!OidIsValid(bestoid) || form->oid > bestoid)
-		{
-			if (best != NULL)
-				heap_freetuple(best);
-			best = heap_copytuple(tup);
-			bestoid = form->oid;
-		}
-	}
-	table_endscan(scan);
-
-	if (best == NULL)
-		return false;
-
-	qx_runtime_copy_scheduler_queue_snapshot(queueledgerrel, best, snapshot);
-	heap_freetuple(best);
-	return true;
-}
-
-static void
-qx_runtime_copy_scheduler_lease_snapshot(Relation rel, HeapTuple tup,
-										 QxSchedulerLeaseSnapshot *snapshot,
-										 Oid *queueoid)
-{
-	Form_pg_qx_scheduler_lease form;
-
-	Assert(snapshot != NULL);
-
-	form = (Form_pg_qx_scheduler_lease) GETSTRUCT(tup);
-	MemSet(snapshot, 0, sizeof(QxSchedulerLeaseSnapshot));
-	snapshot->leaseoid = form->oid;
-	snapshot->queueoid = form->qxleaseledgerqueueid;
-	snapshot->ownerid = form->qxleaseledgerowner;
-	snapshot->workeroid = form->qxleaseledgerworkerid;
-	snapshot->sessionoid = form->qxleaseledgersessionid;
-	snapshot->taskoid = form->qxleaseledgertaskid;
-	snapshot->attemptoid = form->qxleaseledgerattemptid;
-	snapshot->state = (QxSchedulerLeaseState) form->qxleaseledgerstate;
-	snapshot->acquired_at = form->qxleaseledgeracquiredat;
-	snapshot->renewed_at = form->qxleaseledgerrenewedat;
-	snapshot->expires_at = form->qxleaseledgerexpiresat;
-	snapshot->last_heartbeat_at = form->qxleaseledgerlastheartbeatat;
-	snapshot->renewal_count = form->qxleaseledgerrenewalcount;
-	snapshot->needs_recovery = form->qxleaseledgerneedsrecovery;
-	snapshot->queue_name = qx_runtime_heap_text_attr(rel, tup,
-		Anum_pg_qx_scheduler_lease_qxleaseledgerqueuename);
-	snapshot->worker_name = qx_runtime_heap_text_attr(rel, tup,
-		Anum_pg_qx_scheduler_lease_qxleaseledgerworkername);
-	snapshot->lease_token = qx_runtime_heap_text_attr(rel, tup,
-		Anum_pg_qx_scheduler_lease_qxleaseledgerleasetoken);
-	snapshot->principal_name = qx_runtime_heap_text_attr(rel, tup,
-		Anum_pg_qx_scheduler_lease_qxleaseledgerprincipalname);
-	snapshot->provider_name = qx_runtime_heap_text_attr(rel, tup,
-		Anum_pg_qx_scheduler_lease_qxleaseledgerprovidername);
-	snapshot->provider_kind = qx_runtime_heap_text_attr(rel, tup,
-		Anum_pg_qx_scheduler_lease_qxleaseledgerproviderkind);
-	snapshot->principal_runtime = qx_runtime_heap_text_attr(rel, tup,
-		Anum_pg_qx_scheduler_lease_qxleaseledgerprincipalruntime);
-
-	if (queueoid != NULL)
-		*queueoid = form->qxleaseledgerqueueid;
-}
-
-static bool
-qx_runtime_latest_lease(Relation leaseledgerrel, Oid taskoid,
-						Oid attemptoid,
-						QxSchedulerLeaseSnapshot *snapshot,
-						Oid *queueoid)
-{
-	TableScanDesc scan;
-	HeapTuple	tup;
-	HeapTuple	best = NULL;
-	Oid			bestoid = InvalidOid;
-
-	Assert(snapshot != NULL);
-
-	scan = table_beginscan_catalog(leaseledgerrel, 0, NULL);
-	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
-	{
-		Form_pg_qx_scheduler_lease form =
-			(Form_pg_qx_scheduler_lease) GETSTRUCT(tup);
-
-		if (form->qxleaseledgerdbid != MyDatabaseId ||
-			form->qxleaseledgertaskid != taskoid ||
-			form->qxleaseledgerattemptid != attemptoid)
-			continue;
-
-		if (!OidIsValid(bestoid) || form->oid > bestoid)
-		{
-			if (best != NULL)
-				heap_freetuple(best);
-			best = heap_copytuple(tup);
-			bestoid = form->oid;
-		}
-	}
-	table_endscan(scan);
-
-	if (best == NULL)
-		return false;
-
-	qx_runtime_copy_scheduler_lease_snapshot(leaseledgerrel, best,
-											 snapshot, queueoid);
-	heap_freetuple(best);
-	return true;
-}
-
 static int32
 qx_runtime_lease_ttl_ms(const QxSchedulerLeaseSnapshot *snapshot)
 {
@@ -4037,28 +3995,7 @@ qx_runtime_lease_ttl_ms(const QxSchedulerLeaseSnapshot *snapshot)
 static void
 qx_runtime_free_scheduler_queue_snapshot(QxSchedulerQueueSnapshot *snapshot)
 {
-	if (snapshot == NULL)
-		return;
-
-	if (snapshot->queue_name != NULL)
-		pfree(snapshot->queue_name);
-	if (snapshot->agent_name != NULL)
-		pfree(snapshot->agent_name);
-	if (snapshot->identity_name != NULL)
-		pfree(snapshot->identity_name);
-	if (snapshot->namespace_policy_name != NULL)
-		pfree(snapshot->namespace_policy_name);
-	if (snapshot->priority != NULL)
-		pfree(snapshot->priority);
-	if (snapshot->principal_name != NULL)
-		pfree(snapshot->principal_name);
-	if (snapshot->provider_name != NULL)
-		pfree(snapshot->provider_name);
-	if (snapshot->provider_kind != NULL)
-		pfree(snapshot->provider_kind);
-	if (snapshot->principal_runtime != NULL)
-		pfree(snapshot->principal_runtime);
-	MemSet(snapshot, 0, sizeof(QxSchedulerQueueSnapshot));
+	QxCatalogFreeSchedulerQueueSnapshot(snapshot);
 }
 
 static int32
@@ -4212,48 +4149,7 @@ qx_runtime_set_heartbeat_receipt(QxSchedulerHeartbeatSnapshot *heartbeat,
 static void
 qx_runtime_free_scheduler_lease_snapshot(QxSchedulerLeaseSnapshot *snapshot)
 {
-	if (snapshot == NULL)
-		return;
-
-	if (snapshot->queue_name != NULL)
-		pfree(snapshot->queue_name);
-	if (snapshot->worker_name != NULL)
-		pfree(snapshot->worker_name);
-	if (snapshot->lease_token != NULL)
-		pfree(snapshot->lease_token);
-	if (snapshot->principal_name != NULL)
-		pfree(snapshot->principal_name);
-	if (snapshot->provider_name != NULL)
-		pfree(snapshot->provider_name);
-	if (snapshot->provider_kind != NULL)
-		pfree(snapshot->provider_kind);
-	if (snapshot->principal_runtime != NULL)
-		pfree(snapshot->principal_runtime);
-	MemSet(snapshot, 0, sizeof(QxSchedulerLeaseSnapshot));
-}
-
-static int16
-qx_runtime_next_step_seqno(Relation steprel, Oid taskoid)
-{
-	TableScanDesc scan;
-	HeapTuple	tup;
-	int16		maxseqno = 0;
-
-	scan = table_beginscan_catalog(steprel, 0, NULL);
-	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
-	{
-		Form_pg_qx_step form = (Form_pg_qx_step) GETSTRUCT(tup);
-
-		if (form->qxstepdbid != MyDatabaseId ||
-			form->qxsteptaskid != taskoid)
-			continue;
-
-		if (form->qxstepseqno > maxseqno)
-			maxseqno = form->qxstepseqno;
-	}
-	table_endscan(scan);
-
-	return maxseqno + 1;
+	QxCatalogFreeSchedulerLeaseSnapshot(snapshot);
 }
 
 static List *
@@ -4546,6 +4442,8 @@ qx_runtime_reclaim_running_attempt(Relation taskrel,
 		stats->leases_reclaimed++;
 		stats->heartbeats_written++;
 	}
+	QxStatReportSchedulerEvent(MyDatabaseId, "reclaim");
+	qx_backend_supervisor_fence_stale(task->oid);
 
 	if (selected_contract != NULL)
 		pfree(selected_contract);
@@ -4618,7 +4516,7 @@ qx_runtime_run_scheduler_cycle(QxRuntimeSchedulerCycleStats *stats,
 		}
 
 		MemSet(&lease_snapshot, 0, sizeof(lease_snapshot));
-		if (!qx_runtime_latest_lease(leaseledgerrel,
+		if (!QxCatalogLookupLatestSchedulerLease(MyDatabaseId,
 									 task->oid,
 									 attempt.oid,
 									 &lease_snapshot,
@@ -4656,6 +4554,7 @@ qx_runtime_run_scheduler_cycle(QxRuntimeSchedulerCycleStats *stats,
 
 			stats->leases_renewed++;
 			stats->heartbeats_written++;
+			QxStatReportSchedulerEvent(MyDatabaseId, "renew");
 		}
 		else
 			(void) qx_runtime_reclaim_running_attempt(taskrel,
@@ -4751,7 +4650,7 @@ qx_runtime_run_scheduler_retry_cycle(QxRuntimeSchedulerCycleStats *stats,
 		}
 
 		MemSet(&retry_queue, 0, sizeof(retry_queue));
-		if (!qx_runtime_latest_queue(queueledgerrel,
+		if (!QxCatalogLookupLatestSchedulerQueue(MyDatabaseId,
 									 task->oid,
 									 failed_attempt.oid,
 									 &retry_queue))
@@ -4997,7 +4896,7 @@ qx_runtime_dispatch_retry_task(Relation taskrel,
 				 errmsg("task %u has no authorized retry contract", task->oid)));
 
 	nextattemptseqno = failed_attempt->seqno + 1;
-	stepseqbase = qx_runtime_next_step_seqno(steprel, task->oid);
+	stepseqbase = QxCatalogMaxStepSeqnoForTask(MyDatabaseId, task->oid);
 	memset(&tool_result, 0, sizeof(tool_result));
 
 	attemptoid = qx_insert_attempt(attemptrel,
@@ -6189,7 +6088,7 @@ pg_qx_test_run_scheduler_worker_tick(PG_FUNCTION_ARGS)
 		}
 
 		MemSet(&lease_snapshot, 0, sizeof(lease_snapshot));
-		if (!qx_runtime_latest_lease(leaseledgerrel,
+		if (!QxCatalogLookupLatestSchedulerLease(MyDatabaseId,
 									 task->oid,
 									 attempt.oid,
 									 &lease_snapshot,
