@@ -4154,7 +4154,7 @@ qx_runtime_run_scheduler_cycle(QxRuntimeSchedulerCycleStats *stats,
 		}
 
 		MemSet(&lease_snapshot, 0, sizeof(lease_snapshot));
-		if (!QxCatalogLookupLatestSchedulerLease(MyDatabaseId,
+		if (!QxCatalogLookupLatestSchedulerLease(MyDatabaseId, InvalidOid,
 									 task->oid,
 									 attempt.oid,
 									 &lease_snapshot,
@@ -4288,7 +4288,7 @@ qx_runtime_run_scheduler_retry_cycle(QxRuntimeSchedulerCycleStats *stats,
 		}
 
 		MemSet(&retry_queue, 0, sizeof(retry_queue));
-		if (!QxCatalogLookupLatestSchedulerQueue(MyDatabaseId,
+		if (!QxCatalogLookupLatestSchedulerQueue(MyDatabaseId, InvalidOid,
 									 task->oid,
 									 failed_attempt.oid,
 									 &retry_queue))
@@ -4473,7 +4473,7 @@ qx_runtime_dead_letter_retry_task(Relation taskrel,
 	(void) QxCatalogInsertEvent(eventrel, task->sessionoid, task->oid, InvalidOid,
 						   task->ownerid, NULL, "TASK_DEAD_LETTERED", payload);
 	(void) QxCatalogInsertTrace(tracerel, task->sessionoid, task->oid, InvalidOid,
-						   task->ownerid, NULL, "runtime.dead_letter", payload);
+						   task->ownerid, NULL, QX_TRACE_STATE_CLOSED, "runtime.dead_letter", payload);
 	pfree(payload);
 
 	if (stats != NULL)
@@ -4592,7 +4592,7 @@ qx_runtime_dispatch_retry_task(Relation taskrel,
 	(void) QxCatalogInsertEvent(eventrel, task->sessionoid, task->oid, InvalidOid,
 						   task->ownerid, NULL, "TASK_RETRIED", payload);
 	(void) QxCatalogInsertTrace(tracerel, task->sessionoid, task->oid, InvalidOid,
-						   task->ownerid, NULL, "runtime.retry", payload);
+						   task->ownerid, NULL, QX_TRACE_STATE_CLOSED, "runtime.retry", payload);
 	pfree(payload);
 
 	stepoid = QxCatalogInsertStep(steprel, task->sessionoid, task->oid, stepseqbase,
@@ -4625,7 +4625,7 @@ qx_runtime_dispatch_retry_task(Relation taskrel,
 	(void) QxCatalogInsertEvent(eventrel, task->sessionoid, task->oid, stepoid,
 						   task->ownerid, NULL, "TASK_RETRY_DISPATCHED", payload);
 	(void) QxCatalogInsertTrace(tracerel, task->sessionoid, task->oid, stepoid,
-						   task->ownerid, NULL, "runtime.retry_dispatch", payload);
+						   task->ownerid, NULL, QX_TRACE_STATE_CLOSED, "runtime.retry_dispatch", payload);
 	pfree(payload);
 
 	stepoid = QxCatalogInsertStep(steprel, task->sessionoid, task->oid,
@@ -4641,7 +4641,7 @@ qx_runtime_dispatch_retry_task(Relation taskrel,
 	(void) QxCatalogInsertEvent(eventrel, task->sessionoid, task->oid, stepoid,
 						   task->ownerid, NULL, "TASK_TOOLS_AUTHORIZED", payload);
 	(void) QxCatalogInsertTrace(tracerel, task->sessionoid, task->oid, stepoid,
-						   task->ownerid, NULL, "runtime.authorize_tools", payload);
+						   task->ownerid, NULL, QX_TRACE_STATE_CLOSED, "runtime.authorize_tools", payload);
 	pfree(payload);
 
 	stepoid = QxCatalogInsertStep(steprel, task->sessionoid, task->oid,
@@ -4662,7 +4662,7 @@ qx_runtime_dispatch_retry_task(Relation taskrel,
 						   task->ownerid, &semantic_meta,
 						   "TASK_TOOL_EXECUTED", payload);
 	(void) QxCatalogInsertTrace(tracerel, task->sessionoid, task->oid, stepoid,
-						   task->ownerid, &semantic_meta,
+						   task->ownerid, &semantic_meta, QX_TRACE_STATE_CLOSED,
 						   "runtime.external_submit", payload);
 	pfree(payload);
 
@@ -4680,7 +4680,7 @@ qx_runtime_dispatch_retry_task(Relation taskrel,
 	(void) QxCatalogInsertEvent(eventrel, task->sessionoid, task->oid, stepoid,
 						   task->ownerid, NULL, "TASK_INPUT_CAPTURED", payload);
 	(void) QxCatalogInsertTrace(tracerel, task->sessionoid, task->oid, stepoid,
-						   task->ownerid, NULL, "runtime.capture_input", payload);
+						   task->ownerid, NULL, QX_TRACE_STATE_CLOSED, "runtime.capture_input", payload);
 	pfree(payload);
 
 	stepoid = QxCatalogInsertStep(steprel, task->sessionoid, task->oid,
@@ -4694,7 +4694,7 @@ qx_runtime_dispatch_retry_task(Relation taskrel,
 						   task->ownerid, &semantic_meta,
 						   "TASK_CHECKPOINTED", payload);
 	(void) QxCatalogInsertTrace(tracerel, task->sessionoid, task->oid, stepoid,
-						   task->ownerid, &semantic_meta,
+						   task->ownerid, &semantic_meta, QX_TRACE_STATE_CLOSED,
 						   "runtime.checkpoint", payload);
 
 	checkpoint_data = psprintf("task=%u;attempt=%u;session=%u;next_step=%d",
@@ -4733,7 +4733,7 @@ qx_runtime_dispatch_retry_task(Relation taskrel,
 						   task->ownerid, NULL,
 						   "TASK_READY_FOR_RESUME", payload);
 	(void) QxCatalogInsertTrace(tracerel, task->sessionoid, task->oid, InvalidOid,
-						   task->ownerid, NULL, "runtime.pause",
+						   task->ownerid, NULL, QX_TRACE_STATE_CLOSED, "runtime.pause",
 						   "Task paused at durable checkpoint and awaits RESUME TASK");
 	pfree(payload);
 	qx_free_external_result(&tool_result);
@@ -5156,7 +5156,7 @@ qx_runtime_test_start_uncheckpointed_task(Oid sessionoid,
 	(void) QxCatalogInsertEvent(eventrel, request.sessionoid, taskoid, InvalidOid,
 						   request.ownerid, NULL, "TASK_QUEUED", payload);
 	(void) QxCatalogInsertTrace(tracerel, request.sessionoid, taskoid, InvalidOid,
-						   request.ownerid, NULL, "runtime.queue", payload);
+						   request.ownerid, NULL, QX_TRACE_STATE_CLOSED, "runtime.queue", payload);
 	pfree(payload);
 
 	QxCatalogUpdateTaskRuntime(taskrel, taskoid, QX_TASK_STATE_RUNNING,
@@ -5188,7 +5188,7 @@ qx_runtime_test_start_uncheckpointed_task(Oid sessionoid,
 	(void) QxCatalogInsertEvent(eventrel, request.sessionoid, taskoid, stepoid,
 						   request.ownerid, NULL, "TASK_DISPATCHED", payload);
 	(void) QxCatalogInsertTrace(tracerel, request.sessionoid, taskoid, stepoid,
-						   request.ownerid, NULL, "runtime.dispatch", payload);
+						   request.ownerid, NULL, QX_TRACE_STATE_CLOSED, "runtime.dispatch", payload);
 	pfree(payload);
 
 	table_close(heartbeatledgerrel, RowExclusiveLock);
@@ -5289,7 +5289,7 @@ qx_runtime_test_start_exhausted_retry_task(Oid sessionoid)
 						   task.ownerid, NULL,
 						   "TASK_RETRY_EXHAUSTED_FIXTURE", payload);
 	(void) QxCatalogInsertTrace(tracerel, task.sessionoid, taskoid, InvalidOid,
-						   task.ownerid, NULL,
+						   task.ownerid, NULL, QX_TRACE_STATE_CLOSED,
 						   "runtime.retry_exhausted_fixture", payload);
 	pfree(payload);
 
@@ -5653,7 +5653,7 @@ pg_qx_test_run_scheduler_worker_tick(PG_FUNCTION_ARGS)
 		}
 
 		MemSet(&lease_snapshot, 0, sizeof(lease_snapshot));
-		if (!QxCatalogLookupLatestSchedulerLease(MyDatabaseId,
+		if (!QxCatalogLookupLatestSchedulerLease(MyDatabaseId, InvalidOid,
 									 task->oid,
 									 attempt.oid,
 									 &lease_snapshot,
@@ -5855,7 +5855,7 @@ QxRuntimeSubmitTask(const QxRuntimeTaskRequest *request)
 	(void) QxCatalogInsertEvent(eventrel, request->sessionoid, taskoid, InvalidOid,
 						   request->ownerid, NULL, "TASK_QUEUED", payload);
 	(void) QxCatalogInsertTrace(tracerel, request->sessionoid, taskoid, InvalidOid,
-						   request->ownerid, NULL, "runtime.queue", payload);
+						   request->ownerid, NULL, QX_TRACE_STATE_CLOSED, "runtime.queue", payload);
 	pfree(payload);
 
 	QxCatalogUpdateTaskRuntime(taskrel, taskoid, QX_TASK_STATE_RUNNING,
@@ -5888,7 +5888,7 @@ QxRuntimeSubmitTask(const QxRuntimeTaskRequest *request)
 	(void) QxCatalogInsertEvent(eventrel, request->sessionoid, taskoid, stepoid,
 						   request->ownerid, NULL, "TASK_DISPATCHED", payload);
 	(void) QxCatalogInsertTrace(tracerel, request->sessionoid, taskoid, stepoid,
-						   request->ownerid, NULL, "runtime.dispatch", payload);
+						   request->ownerid, NULL, QX_TRACE_STATE_CLOSED, "runtime.dispatch", payload);
 	pfree(payload);
 
 	stepoid = QxCatalogInsertStep(steprel, request->sessionoid, taskoid, 2,
@@ -5903,7 +5903,7 @@ QxRuntimeSubmitTask(const QxRuntimeTaskRequest *request)
 						   request->ownerid, NULL, "TASK_TOOLS_AUTHORIZED",
 						   payload);
 	(void) QxCatalogInsertTrace(tracerel, request->sessionoid, taskoid, stepoid,
-						   request->ownerid, NULL, "runtime.authorize_tools",
+						   request->ownerid, NULL, QX_TRACE_STATE_CLOSED, "runtime.authorize_tools",
 						   payload);
 	pfree(payload);
 
@@ -5923,7 +5923,7 @@ QxRuntimeSubmitTask(const QxRuntimeTaskRequest *request)
 						   request->ownerid, &semantic_meta,
 						   "TASK_TOOL_EXECUTED", payload);
 	(void) QxCatalogInsertTrace(tracerel, request->sessionoid, taskoid, stepoid,
-						   request->ownerid, &semantic_meta,
+						   request->ownerid, &semantic_meta, QX_TRACE_STATE_CLOSED,
 						   "runtime.external_submit", payload);
 	pfree(payload);
 
@@ -5941,7 +5941,7 @@ QxRuntimeSubmitTask(const QxRuntimeTaskRequest *request)
 						   request->ownerid, NULL, "TASK_INPUT_CAPTURED",
 						   payload);
 	(void) QxCatalogInsertTrace(tracerel, request->sessionoid, taskoid, stepoid,
-						   request->ownerid, NULL, "runtime.capture_input",
+						   request->ownerid, NULL, QX_TRACE_STATE_CLOSED, "runtime.capture_input",
 						   payload);
 	pfree(payload);
 
@@ -5955,7 +5955,7 @@ QxRuntimeSubmitTask(const QxRuntimeTaskRequest *request)
 						   request->ownerid, &semantic_meta,
 						   "TASK_CHECKPOINTED", payload);
 	(void) QxCatalogInsertTrace(tracerel, request->sessionoid, taskoid, stepoid,
-						   request->ownerid, &semantic_meta,
+						   request->ownerid, &semantic_meta, QX_TRACE_STATE_CLOSED,
 						   "runtime.checkpoint", payload);
 
 	checkpoint_data = psprintf("task=%u;attempt=%u;session=%u;next_step=%d",
@@ -5991,7 +5991,7 @@ QxRuntimeSubmitTask(const QxRuntimeTaskRequest *request)
 						   request->ownerid, NULL,
 						   "TASK_READY_FOR_RESUME", payload);
 	(void) QxCatalogInsertTrace(tracerel, request->sessionoid, taskoid, InvalidOid,
-						   request->ownerid, NULL, "runtime.pause",
+						   request->ownerid, NULL, QX_TRACE_STATE_CLOSED, "runtime.pause",
 						   "Task paused at durable checkpoint and awaits RESUME TASK");
 	pfree(payload);
 	qx_free_external_result(&tool_result);
@@ -6178,7 +6178,7 @@ QxRuntimeResumeTask(Oid taskoid, const char *checkpoint_label, Oid ownerid)
 	(void) QxCatalogInsertEvent(eventrel, task.sessionoid, taskoid,
 						   InvalidOid, ownerid, NULL, "TASK_RESUMED", payload);
 	(void) QxCatalogInsertTrace(tracerel, task.sessionoid, taskoid,
-						   InvalidOid, ownerid, NULL, "runtime.resume", payload);
+						   InvalidOid, ownerid, NULL, QX_TRACE_STATE_CLOSED, "runtime.resume", payload);
 	pfree(payload);
 
 	stepoid = QxCatalogInsertStep(steprel, task.sessionoid, taskoid,
@@ -6206,7 +6206,7 @@ QxRuntimeResumeTask(Oid taskoid, const char *checkpoint_label, Oid ownerid)
 						   stepoid, ownerid, NULL, "TASK_RESUME_DISPATCHED",
 						   payload);
 	(void) QxCatalogInsertTrace(tracerel, task.sessionoid, taskoid,
-						   stepoid, ownerid, NULL, "runtime.resume_dispatch",
+						   stepoid, ownerid, NULL, QX_TRACE_STATE_CLOSED, "runtime.resume_dispatch",
 						   payload);
 	pfree(payload);
 
@@ -6226,7 +6226,7 @@ QxRuntimeResumeTask(Oid taskoid, const char *checkpoint_label, Oid ownerid)
 						   stepoid, ownerid, &semantic_meta,
 						   "TASK_TOOL_EXECUTED", payload);
 	(void) QxCatalogInsertTrace(tracerel, task.sessionoid, taskoid,
-						   stepoid, ownerid, &semantic_meta,
+						   stepoid, ownerid, &semantic_meta, QX_TRACE_STATE_CLOSED,
 						   "runtime.external_resume", payload);
 	pfree(payload);
 
@@ -6241,7 +6241,7 @@ QxRuntimeResumeTask(Oid taskoid, const char *checkpoint_label, Oid ownerid)
 						   stepoid, ownerid, &semantic_meta,
 						   "TASK_CHECKPOINTED", payload);
 	(void) QxCatalogInsertTrace(tracerel, task.sessionoid, taskoid,
-						   stepoid, ownerid, &semantic_meta,
+						   stepoid, ownerid, &semantic_meta, QX_TRACE_STATE_CLOSED,
 						   "runtime.final_checkpoint", payload);
 
 	checkpoint_data = psprintf("task=%u;attempt=%u;session=%u;next_step=%d",
@@ -6277,7 +6277,7 @@ QxRuntimeResumeTask(Oid taskoid, const char *checkpoint_label, Oid ownerid)
 						   InvalidOid, ownerid, &semantic_meta,
 						   "TASK_COMPLETED", payload);
 	(void) QxCatalogInsertTrace(tracerel, task.sessionoid, taskoid,
-						   InvalidOid, ownerid, &semantic_meta,
+						   InvalidOid, ownerid, &semantic_meta, QX_TRACE_STATE_CLOSED,
 						   "runtime.complete",
 						   "Task completed after resumable attempt handoff");
 	pfree(payload);

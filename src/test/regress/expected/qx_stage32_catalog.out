@@ -1,0 +1,128 @@
+-- Stage 32 catalog helper layer regression (loopback, self-contained)
+CREATE PROVIDER public.catalog_loopback_provider
+  KIND 'loopback'
+  ENDPOINT 'local://qhapaqxian-tool-runner'
+  RECEIPT KEY 'catalog-loopback-key'
+  ATTESTATION PROFILE 'loopback.local'
+  VERSION 'v1'
+  POLICY loopback_attest
+  ATTESTATION ENABLE;
+CREATE PRINCIPAL public.catalog_search_runner
+  PROGRAM 'qhapaqxian-tool-runner'
+  SANDBOX 'restricted'
+  RUNTIME 'host'
+  PROVIDER public.catalog_loopback_provider
+  ATTESTATION PROFILE 'loopback.local'
+  VERSION 'v1'
+  POLICY loopback_attest;
+CREATE TOOL public.catalog_search
+  HANDLER 'builtin.search'
+  SANDBOX 'builtin'
+  PRINCIPAL 'catalog_search_runner'
+  TOKEN COST 5
+  COST 3;
+CREATE NAMESPACE POLICY catalog_only FOR SCHEMA public
+  TOOLS (catalog_search)
+  KNOWN TOOLS ENABLE
+  BUDGET ENABLE;
+CREATE AGENT catalog_probe
+  IDENTITY catalog_probe_identity
+  TOOLS (catalog_search)
+  POLICY catalog_only
+  BUDGET (tokens 2048, cost 64);
+START SESSION FOR AGENT catalog_probe
+  WITH CONTEXT jsonb_build_object('mission', 'catalog');
+SELECT count(*) = 1 AS provider_row_present
+FROM pg_qx_provider
+WHERE qxprovidername = 'catalog_loopback_provider';
+ provider_row_present 
+----------------------
+ t
+(1 row)
+
+SELECT count(*) = 1 AS principal_row_present
+FROM pg_qx_principal
+WHERE qxprincipalname = 'catalog_search_runner';
+ principal_row_present 
+-----------------------
+ t
+(1 row)
+
+SELECT count(*) = 1 AS tool_row_present
+FROM pg_qx_tool
+WHERE qxtoolname = 'catalog_search';
+ tool_row_present 
+------------------
+ t
+(1 row)
+
+SELECT count(*) = 1 AS namespace_policy_row_present
+FROM pg_qx_namespace
+WHERE qxnamespacepolicyname = 'catalog_only';
+ namespace_policy_row_present 
+------------------------------
+ t
+(1 row)
+
+SELECT count(*) = 1 AS agent_row_present
+FROM pg_qx_agent
+WHERE qxagentname = 'catalog_probe';
+ agent_row_present 
+-------------------
+ t
+(1 row)
+
+SELECT count(*) = 1 AS identity_row_present
+FROM pg_qx_identity
+WHERE qxidentityname = 'catalog_probe_identity';
+ identity_row_present 
+----------------------
+ t
+(1 row)
+
+SELECT count(*) = 1 AS session_row_present
+FROM pg_qx_session
+WHERE qxsessionagentid = (SELECT oid FROM pg_qx_agent WHERE qxagentname = 'catalog_probe');
+ session_row_present 
+---------------------
+ t
+(1 row)
+
+SELECT count(*) >= 1 AS session_trace_present
+FROM pg_qx_trace
+WHERE qxtracename = 'session.root'
+  AND qxtracesessionid = (
+    SELECT oid FROM pg_qx_session
+    WHERE qxsessionagentid = (SELECT oid FROM pg_qx_agent WHERE qxagentname = 'catalog_probe')
+    ORDER BY oid DESC
+    LIMIT 1
+  );
+ session_trace_present 
+-----------------------
+ t
+(1 row)
+
+SELECT count(*) = 1 AS provider_stats_row_present
+FROM pg_stat_qx_providers
+WHERE provider_name = 'catalog_loopback_provider';
+ provider_stats_row_present 
+----------------------------
+ t
+(1 row)
+
+SELECT count(*) = 1 AS principal_stats_row_present
+FROM pg_stat_qx_principals
+WHERE principal_name = 'catalog_search_runner';
+ principal_stats_row_present 
+-----------------------------
+ t
+(1 row)
+
+SELECT count(*) = 1 AS runtime_class_stats_row_present
+FROM pg_stat_qx_runtime_classes
+WHERE runtime_class = 'host';
+ runtime_class_stats_row_present 
+---------------------------------
+ t
+(1 row)
+

@@ -231,6 +231,112 @@ typedef struct QxCatalogTaskInsertParams
 	int32		estimated_cost;
 } QxCatalogTaskInsertParams;
 
+typedef struct QxCatalogIdentityInsertParams
+{
+	Oid			namespaceoid;
+	Oid			ownerid;
+	Oid			authrole;
+	const char *name;
+	const char *policy_name;
+	List	   *budget_options;
+} QxCatalogIdentityInsertParams;
+
+typedef struct QxCatalogAgentInsertParams
+{
+	const char *name;
+	Oid			namespaceoid;
+	Oid			namespacepolicyoid;
+	Oid			identityoid;
+	Oid			ownerid;
+	const char *identity_name;
+	const char *model_uri;
+	const char *memory_profile;
+	const char *policy_name;
+	List	   *tools;
+	List	   *budget_options;
+} QxCatalogAgentInsertParams;
+
+typedef struct QxCatalogSessionInsertParams
+{
+	Oid			agentoid;
+	Oid			namespacepolicyoid;
+	Oid			identityoid;
+	Oid			ownerid;
+	char		status;
+	const char *context_serialized;
+} QxCatalogSessionInsertParams;
+
+typedef struct QxCatalogNamespacePolicyInsertParams
+{
+	const char *name;
+	Oid			namespaceoid;
+	Oid			ownerid;
+	Oid			authrole;
+	bool		require_known_tools;
+	bool		enforce_budgets;
+	const char *policy_contract;
+	List	   *allowed_tools;
+} QxCatalogNamespacePolicyInsertParams;
+
+typedef struct QxCatalogProviderInsertParams
+{
+	const char *name;
+	Oid			namespaceoid;
+	Oid			ownerid;
+	bool		enabled;
+	bool		attestation_required;
+	const char *kind;
+	const char *endpoint;
+	const char *receipt_alg;
+	const char *receipt_key;
+	const char *attestation_profile;
+	const char *attestation_version;
+	const char *attestation_policy;
+} QxCatalogProviderInsertParams;
+
+typedef struct QxCatalogPrincipalInsertParams
+{
+	const char *name;
+	Oid			namespaceoid;
+	Oid			ownerid;
+	Oid			provideroid;
+	bool		enabled;
+	const char *sandbox_name;
+	const char *program_name;
+	const char *provider_name;
+	const char *runtime_class;
+	const char *receipt_signer;
+	const char *attestation_profile;
+	const char *attestation_version;
+	const char *attestation_policy;
+} QxCatalogPrincipalInsertParams;
+
+typedef struct QxCatalogToolInsertParams
+{
+	const char *name;
+	Oid			namespaceoid;
+	Oid			ownerid;
+	Oid			principaloid;
+	bool		enabled;
+	int32		token_cost;
+	int32		cost_units;
+	const char *handler_name;
+	const char *sandbox_name;
+	const char *principal_name;
+	const char *policy_name;
+} QxCatalogToolInsertParams;
+
+typedef struct QxCatalogMemoryInsertParams
+{
+	Oid			agentoid;
+	Oid			sessionoid;
+	Oid			ownerid;
+	char		scope;
+	const char *memory_key;
+	const char *serialized_value;
+	const char *serialized_tags;
+} QxCatalogMemoryInsertParams;
+
 extern void QxCatalogFreeAgentInfo(QxCatalogAgentInfo *info);
 extern void QxCatalogFreeIdentityInfo(QxCatalogIdentityInfo *info);
 extern void QxCatalogFreeProviderInfo(QxCatalogProviderInfo *info);
@@ -285,11 +391,11 @@ extern List *QxCatalogBuildProviderInfoList(Oid namespaceoid, Oid ownerid);
 extern List *QxCatalogBuildPrincipalInfoList(Oid namespaceoid, Oid ownerid);
 extern List *QxCatalogBuildDistinctRuntimeClassList(void);
 
-extern bool QxCatalogLookupLatestSchedulerQueue(Oid dboid, Oid taskoid,
-												Oid attemptoid,
+extern bool QxCatalogLookupLatestSchedulerQueue(Oid dboid, Oid ownerid,
+												Oid taskoid, Oid attemptoid,
 												QxSchedulerQueueSnapshot *snapshot);
-extern bool QxCatalogLookupLatestSchedulerLease(Oid dboid, Oid taskoid,
-												Oid attemptoid,
+extern bool QxCatalogLookupLatestSchedulerLease(Oid dboid, Oid ownerid,
+												Oid taskoid, Oid attemptoid,
 												QxSchedulerLeaseSnapshot *snapshot,
 												Oid *queueoid);
 extern int16 QxCatalogMaxStepSeqnoForTask(Oid dboid, Oid taskoid);
@@ -317,6 +423,7 @@ extern Oid QxCatalogInsertEvent(Relation rel, Oid sessionoid, Oid taskoid,
 extern Oid QxCatalogInsertTrace(Relation rel, Oid sessionoid, Oid taskoid,
 								 Oid stepoid, Oid ownerid,
 								 const QxSemanticExecutionMetadata *metadata,
+								 char trace_state,
 								 const char *name, const char *detail);
 extern Oid QxCatalogInsertCheckpoint(Relation rel, Oid sessionoid, Oid taskoid,
 									   Oid attemptoid, Oid stepoid, Oid ownerid,
@@ -331,5 +438,21 @@ extern Oid QxCatalogInsertSchedulerHeartbeat(Relation rel, Oid leaseoid,
 											 const QxSchedulerHeartbeatSnapshot *snapshot);
 extern Oid QxCatalogInsertTask(Relation taskrel,
 							   const QxCatalogTaskInsertParams *params);
+extern Oid QxCatalogInsertIdentity(Relation rel,
+								   const QxCatalogIdentityInsertParams *params);
+extern Oid QxCatalogInsertAgent(Relation rel,
+								const QxCatalogAgentInsertParams *params);
+extern Oid QxCatalogInsertSession(Relation rel,
+								  const QxCatalogSessionInsertParams *params);
+extern Oid QxCatalogInsertMemory(Relation memoryrel,
+								 const QxCatalogMemoryInsertParams *params);
+extern Oid QxCatalogInsertNamespacePolicy(Relation rel,
+										  const QxCatalogNamespacePolicyInsertParams *params);
+extern Oid QxCatalogInsertProvider(Relation rel,
+								   const QxCatalogProviderInsertParams *params);
+extern Oid QxCatalogInsertPrincipal(Relation rel,
+									const QxCatalogPrincipalInsertParams *params);
+extern Oid QxCatalogInsertTool(Relation rel,
+							   const QxCatalogToolInsertParams *params);
 
 #endif							/* QX_CATALOG_H */

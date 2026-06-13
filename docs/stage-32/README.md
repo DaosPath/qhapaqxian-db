@@ -77,9 +77,10 @@ It is a consolidation step, not a new runtime feature by itself.
   checkpoint snapshots;
 - planner flow now depends on this helper layer for session, agent, identity,
   task, and checkpoint snapshots used by `EXPLAIN AGENT`;
-- remaining security DDL/write paths still have direct catalog access to
-  migrate where practical;
-- no dedicated regression schedule was added yet for the helper API itself.
+- security DDL/write paths for identity, agent, session, memory, and policy
+  objects now route tuple inserts through `QxCatalogInsert*` helpers;
+- dedicated `qx_stage32_catalog` regression exercises the catalog layer
+  indirectly through CREATE/START SESSION and stats-backed observability views.
 
 ## Why this stage matters
 
@@ -103,15 +104,17 @@ It is a consolidation step, not a new runtime feature by itself.
 ## Known gaps
 
 - this stage is mainly an internal maintainability improvement;
-- recovery, planner, security authorization/validation, and selected runtime
-  read paths are now migrated consumers;
-- security write/validation paths still use direct catalog access in places
-  and need migration in later cleanup phases.
+- recovery, planner, security authorization/validation, runtime read/write
+  paths, and DDL tuple inserts for core catalog objects are now migrated
+  consumers;
+- ALTER-command catalog updates remain in command layers by design.
 
 ## Validation
 
-- There is no dedicated unit-style coverage for the helper layer yet.
-- Validation remains indirect through build and higher-level integration.
+- `src/test/regress/sql/qx_stage32_catalog.sql` provides dedicated helper-layer
+  regression coverage through CREATE NAMESPACE POLICY/PROVIDER/PRINCIPAL/TOOL,
+  CREATE AGENT, START SESSION, and stats-backed observability assertions.
+- Validation also remains indirect through build and higher-level integration.
 - Current migration validation:
   `meson compile -C build-stage4-codex -j 2`.
 - Stage 32 also reran `meson test -C build-stage4-codex --suite postgresql:setup --print-errorlogs`,
@@ -125,10 +128,11 @@ It is a consolidation step, not a new runtime feature by itself.
   no `SearchSysCache`, `ReleaseSysCache`, `HeapTuple`, `GETSTRUCT`,
   `SysCacheGetAttr`, `table_open`, or `heap_getnext` references remain in
   those two consumers.
-- `security` authorization/read helpers, operational identity lookup, and
-  registered-tool validation were migrated to `qx_catalog`; direct security
-  catalog access is now limited to write-time tuple insertion for identity
-  creation.
+- `security` authorization/read helpers, operational identity lookup,
+  registered-tool validation, and identity tuple insertion were migrated to
+  `qx_catalog`.
+- `agentcmds`, `sessioncmds`, `qxpolicycmds` CREATE paths, and `qx_memory`
+  now route tuple inserts and duplicate checks through `qx_catalog` helpers.
 - `runtime` now uses `qx_catalog` for pure resume/read metadata, budget
   validation, provider receipt-key reads, and all durable insert paths for
   tasks, attempts, steps, events, traces, checkpoints, and scheduler ledgers.

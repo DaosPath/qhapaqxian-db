@@ -14,10 +14,13 @@
 #include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
 #include "catalog/objectaddress.h"
+#include "catalog/pg_authid.h"
+#include "catalog/pg_namespace.h"
 #include "catalog/pg_qx_agent.h"
 #include "catalog/pg_qx_attempt.h"
 #include "catalog/pg_qx_checkpoint.h"
 #include "catalog/pg_qx_identity.h"
+#include "catalog/pg_qx_memory.h"
 #include "catalog/pg_qx_namespace.h"
 #include "catalog/pg_qx_principal.h"
 #include "catalog/pg_qx_provider.h"
@@ -1535,7 +1538,8 @@ qx_catalog_copy_scheduler_lease_snapshot(Relation rel, HeapTuple tup,
 }
 
 bool
-QxCatalogLookupLatestSchedulerQueue(Oid dboid, Oid taskoid, Oid attemptoid,
+QxCatalogLookupLatestSchedulerQueue(Oid dboid, Oid ownerid, Oid taskoid,
+									Oid attemptoid,
 									QxSchedulerQueueSnapshot *snapshot)
 {
 	Relation	rel;
@@ -1556,6 +1560,9 @@ QxCatalogLookupLatestSchedulerQueue(Oid dboid, Oid taskoid, Oid attemptoid,
 		if (form->qxqueueledgerdbid != dboid ||
 			form->qxqueueledgertaskid != taskoid ||
 			form->qxqueueledgerattemptid != attemptoid)
+			continue;
+
+		if (OidIsValid(ownerid) && form->qxqueueledgerowner != ownerid)
 			continue;
 
 		if (!OidIsValid(bestoid) || form->oid > bestoid)
@@ -1581,7 +1588,8 @@ QxCatalogLookupLatestSchedulerQueue(Oid dboid, Oid taskoid, Oid attemptoid,
 }
 
 bool
-QxCatalogLookupLatestSchedulerLease(Oid dboid, Oid taskoid, Oid attemptoid,
+QxCatalogLookupLatestSchedulerLease(Oid dboid, Oid ownerid, Oid taskoid,
+									Oid attemptoid,
 									QxSchedulerLeaseSnapshot *snapshot,
 									Oid *queueoid)
 {
@@ -1603,6 +1611,9 @@ QxCatalogLookupLatestSchedulerLease(Oid dboid, Oid taskoid, Oid attemptoid,
 		if (form->qxleaseledgerdbid != dboid ||
 			form->qxleaseledgertaskid != taskoid ||
 			form->qxleaseledgerattemptid != attemptoid)
+			continue;
+
+		if (OidIsValid(ownerid) && form->qxleaseledgerowner != ownerid)
 			continue;
 
 		if (!OidIsValid(bestoid) || form->oid > bestoid)
@@ -1936,7 +1947,7 @@ QxCatalogInsertEvent(Relation rel, Oid sessionoid, Oid taskoid, Oid stepoid,
 Oid
 QxCatalogInsertTrace(Relation rel, Oid sessionoid, Oid taskoid, Oid stepoid,
 					 Oid ownerid, const QxSemanticExecutionMetadata *metadata,
-					 const char *name, const char *detail)
+					 char trace_state, const char *name, const char *detail)
 {
 	Datum		values[Natts_pg_qx_trace];
 	bool		nulls[Natts_pg_qx_trace];
@@ -1968,16 +1979,16 @@ QxCatalogInsertTrace(Relation rel, Oid sessionoid, Oid taskoid, Oid stepoid,
 	values[Anum_pg_qx_trace_qxtracestepid - 1] = ObjectIdGetDatum(stepoid);
 	values[Anum_pg_qx_trace_qxtraceowner - 1] = ObjectIdGetDatum(ownerid);
 	values[Anum_pg_qx_trace_qxtracestate - 1] =
-		CharGetDatum(QX_TRACE_STATE_CLOSED);
+		CharGetDatum(trace_state);
 	if (metadata != NULL)
 		tracelsn = QxEmitSemanticTraceRecordV2(traceoid, sessionoid, taskoid,
 											   stepoid, ownerid, metadata,
-											   QX_TRACE_STATE_CLOSED, name,
+											   trace_state, name,
 											   trace_detail);
 	else
 		tracelsn = QxEmitSemanticTraceRecord(traceoid, sessionoid, taskoid,
 											 stepoid, ownerid,
-											 QX_TRACE_STATE_CLOSED, name,
+											 trace_state, name,
 											 trace_detail);
 	values[Anum_pg_qx_trace_qxtracelsn - 1] = LSNGetDatum(tracelsn);
 	qx_catalog_set_text_datum(values, nulls, Anum_pg_qx_trace_qxtracename, name);
@@ -2367,4 +2378,404 @@ QxCatalogInsertTask(Relation taskrel, const QxCatalogTaskInsertParams *params)
 	InvokeObjectPostCreateHook(QxTaskRelationId, taskoid, 0);
 
 	return taskoid;
+}
+
+Oid
+QxCatalogInsertIdentity(Relation rel, const QxCatalogIdentityInsertParams *params)
+{
+	Datum		values[Natts_pg_qx_identity];
+	bool		nulls[Natts_pg_qx_identity];
+	HeapTuple	tup;
+	Oid			identityoid;
+	ObjectAddress myself;
+	ObjectAddress referenced;
+
+	Assert(params != NULL);
+
+	memset(values, 0, sizeof(values));
+	memset(nulls, false, sizeof(nulls));
+
+	identityoid = GetNewOidWithIndex(rel, QxIdentityOidIndexId,
+									 Anum_pg_qx_identity_oid);
+	values[Anum_pg_qx_identity_oid - 1] = ObjectIdGetDatum(identityoid);
+	values[Anum_pg_qx_identity_qxidentityname - 1] =
+		DirectFunctionCall1(namein, CStringGetDatum(params->name));
+	values[Anum_pg_qx_identity_qxidentitynamespace - 1] =
+		ObjectIdGetDatum(params->namespaceoid);
+	values[Anum_pg_qx_identity_qxidentityowner - 1] =
+		ObjectIdGetDatum(params->ownerid);
+	values[Anum_pg_qx_identity_qxidentityauthrole - 1] =
+		ObjectIdGetDatum(params->authrole);
+	qx_catalog_set_text_datum(values, nulls,
+							  Anum_pg_qx_identity_qxidentitypolicy,
+							  params->policy_name);
+	qx_catalog_set_nodetree_datum(values, nulls,
+								  Anum_pg_qx_identity_qxidentitybudget,
+								  params->budget_options);
+
+	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
+	CatalogTupleInsert(rel, tup);
+	heap_freetuple(tup);
+
+	ObjectAddressSet(myself, QxIdentityRelationId, identityoid);
+	recordDependencyOnOwner(QxIdentityRelationId, identityoid, params->ownerid);
+	ObjectAddressSet(referenced, NamespaceRelationId, params->namespaceoid);
+	recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
+	ObjectAddressSet(referenced, AuthIdRelationId, params->authrole);
+	recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
+	recordDependencyOnCurrentExtension(&myself, false);
+	InvokeObjectPostCreateHook(QxIdentityRelationId, identityoid, 0);
+
+	return identityoid;
+}
+
+Oid
+QxCatalogInsertAgent(Relation rel, const QxCatalogAgentInsertParams *params)
+{
+	Datum		values[Natts_pg_qx_agent];
+	bool		nulls[Natts_pg_qx_agent];
+	HeapTuple	tup;
+	Oid			agentoid;
+
+	Assert(params != NULL);
+
+	memset(values, 0, sizeof(values));
+	memset(nulls, false, sizeof(nulls));
+
+	agentoid = GetNewOidWithIndex(rel, QxAgentOidIndexId,
+								  Anum_pg_qx_agent_oid);
+	values[Anum_pg_qx_agent_oid - 1] = ObjectIdGetDatum(agentoid);
+	values[Anum_pg_qx_agent_qxagentname - 1] =
+		DirectFunctionCall1(namein, CStringGetDatum(params->name));
+	values[Anum_pg_qx_agent_qxagentnamespace - 1] =
+		ObjectIdGetDatum(params->namespaceoid);
+	values[Anum_pg_qx_agent_qxnamespacepolicyid - 1] =
+		ObjectIdGetDatum(params->namespacepolicyoid);
+	values[Anum_pg_qx_agent_qxidentityid - 1] =
+		ObjectIdGetDatum(params->identityoid);
+	values[Anum_pg_qx_agent_qxagentowner - 1] =
+		ObjectIdGetDatum(params->ownerid);
+	qx_catalog_set_text_datum(values, nulls, Anum_pg_qx_agent_qxidentity,
+							  params->identity_name);
+	qx_catalog_set_text_datum(values, nulls, Anum_pg_qx_agent_qxmodeluri,
+							  params->model_uri);
+	qx_catalog_set_text_datum(values, nulls, Anum_pg_qx_agent_qxmemoryprofile,
+							  params->memory_profile);
+	qx_catalog_set_text_datum(values, nulls, Anum_pg_qx_agent_qxpolicy,
+							  params->policy_name);
+	qx_catalog_set_nodetree_datum(values, nulls, Anum_pg_qx_agent_qxtools,
+								  params->tools);
+	qx_catalog_set_nodetree_datum(values, nulls, Anum_pg_qx_agent_qxbudget,
+								  params->budget_options);
+
+	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
+	CatalogTupleInsert(rel, tup);
+	heap_freetuple(tup);
+
+	return agentoid;
+}
+
+Oid
+QxCatalogInsertSession(Relation rel, const QxCatalogSessionInsertParams *params)
+{
+	Datum		values[Natts_pg_qx_session];
+	bool		nulls[Natts_pg_qx_session];
+	HeapTuple	tup;
+	Oid			sessionoid;
+	ObjectAddress myself;
+	ObjectAddress referenced;
+
+	Assert(params != NULL);
+
+	memset(values, 0, sizeof(values));
+	memset(nulls, false, sizeof(nulls));
+
+	sessionoid = GetNewOidWithIndex(rel, QxSessionOidIndexId,
+									Anum_pg_qx_session_oid);
+	values[Anum_pg_qx_session_oid - 1] = ObjectIdGetDatum(sessionoid);
+	values[Anum_pg_qx_session_qxsessiondbid - 1] =
+		ObjectIdGetDatum(MyDatabaseId);
+	values[Anum_pg_qx_session_qxsessionagentid - 1] =
+		ObjectIdGetDatum(params->agentoid);
+	values[Anum_pg_qx_session_qxsessionnamespacepolicyid - 1] =
+		ObjectIdGetDatum(params->namespacepolicyoid);
+	values[Anum_pg_qx_session_qxsessionidentityid - 1] =
+		ObjectIdGetDatum(params->identityoid);
+	values[Anum_pg_qx_session_qxsessionowner - 1] =
+		ObjectIdGetDatum(params->ownerid);
+	values[Anum_pg_qx_session_qxsessionstatus - 1] =
+		CharGetDatum(params->status);
+
+	if (params->context_serialized != NULL)
+		qx_catalog_set_text_datum(values, nulls, Anum_pg_qx_session_qxcontext,
+								  params->context_serialized);
+	else
+		nulls[Anum_pg_qx_session_qxcontext - 1] = true;
+
+	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
+	CatalogTupleInsert(rel, tup);
+	heap_freetuple(tup);
+
+	ObjectAddressSet(myself, QxSessionRelationId, sessionoid);
+	recordDependencyOnOwner(QxSessionRelationId, sessionoid, params->ownerid);
+	ObjectAddressSet(referenced, QxAgentRelationId, params->agentoid);
+	recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
+	ObjectAddressSet(referenced, QxNamespaceRelationId,
+					 params->namespacepolicyoid);
+	recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
+	ObjectAddressSet(referenced, QxIdentityRelationId, params->identityoid);
+	recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
+	recordDependencyOnCurrentExtension(&myself, false);
+	InvokeObjectPostCreateHook(QxSessionRelationId, sessionoid, 0);
+
+	return sessionoid;
+}
+
+Oid
+QxCatalogInsertMemory(Relation memoryrel,
+					  const QxCatalogMemoryInsertParams *params)
+{
+	Datum		values[Natts_pg_qx_memory];
+	bool		nulls[Natts_pg_qx_memory];
+	HeapTuple	tup;
+	Oid			memoryoid;
+
+	Assert(params != NULL);
+
+	memset(values, 0, sizeof(values));
+	memset(nulls, false, sizeof(nulls));
+
+	memoryoid = GetNewOidWithIndex(memoryrel, QxMemoryOidIndexId,
+								   Anum_pg_qx_memory_oid);
+	values[Anum_pg_qx_memory_oid - 1] = ObjectIdGetDatum(memoryoid);
+	values[Anum_pg_qx_memory_qxmemorydbid - 1] = ObjectIdGetDatum(MyDatabaseId);
+	values[Anum_pg_qx_memory_qxmemoryagentid - 1] =
+		ObjectIdGetDatum(params->agentoid);
+	values[Anum_pg_qx_memory_qxmemorysessionid - 1] =
+		ObjectIdGetDatum(params->sessionoid);
+	values[Anum_pg_qx_memory_qxmemorytaskid - 1] = ObjectIdGetDatum(InvalidOid);
+	values[Anum_pg_qx_memory_qxmemoryowner - 1] =
+		ObjectIdGetDatum(params->ownerid);
+	values[Anum_pg_qx_memory_qxmemoryscope - 1] =
+		CharGetDatum(params->scope);
+	qx_catalog_set_text_datum(values, nulls, Anum_pg_qx_memory_qxmemorykey,
+							  params->memory_key);
+	qx_catalog_set_text_datum(values, nulls, Anum_pg_qx_memory_qxmemoryvalue,
+							  params->serialized_value);
+	qx_catalog_set_text_datum(values, nulls, Anum_pg_qx_memory_qxmemorytags,
+							  params->serialized_tags);
+
+	tup = heap_form_tuple(RelationGetDescr(memoryrel), values, nulls);
+	CatalogTupleInsert(memoryrel, tup);
+	heap_freetuple(tup);
+
+	return memoryoid;
+}
+
+Oid
+QxCatalogInsertNamespacePolicy(Relation rel,
+							   const QxCatalogNamespacePolicyInsertParams *params)
+{
+	Datum		values[Natts_pg_qx_namespace];
+	bool		nulls[Natts_pg_qx_namespace];
+	HeapTuple	tup;
+	Oid			policyoid;
+
+	Assert(params != NULL);
+
+	memset(values, 0, sizeof(values));
+	memset(nulls, false, sizeof(nulls));
+
+	policyoid = GetNewOidWithIndex(rel, QxNamespaceOidIndexId,
+								   Anum_pg_qx_namespace_oid);
+	values[Anum_pg_qx_namespace_oid - 1] = ObjectIdGetDatum(policyoid);
+	values[Anum_pg_qx_namespace_qxnamespacepolicyname - 1] =
+		DirectFunctionCall1(namein, CStringGetDatum(params->name));
+	values[Anum_pg_qx_namespace_qxnamespaceid - 1] =
+		ObjectIdGetDatum(params->namespaceoid);
+	values[Anum_pg_qx_namespace_qxnamespaceowner - 1] =
+		ObjectIdGetDatum(params->ownerid);
+	values[Anum_pg_qx_namespace_qxnamespaceauthrole - 1] =
+		ObjectIdGetDatum(params->authrole);
+	values[Anum_pg_qx_namespace_qxrequireknowntools - 1] =
+		BoolGetDatum(params->require_known_tools);
+	values[Anum_pg_qx_namespace_qxenforcebudgets - 1] =
+		BoolGetDatum(params->enforce_budgets);
+	qx_catalog_set_text_datum(values, nulls,
+							  Anum_pg_qx_namespace_qxnamespacepolicy,
+							  params->policy_contract);
+	qx_catalog_set_nodetree_datum(values, nulls,
+								  Anum_pg_qx_namespace_qxallowedtools,
+								  params->allowed_tools);
+
+	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
+	CatalogTupleInsert(rel, tup);
+	heap_freetuple(tup);
+
+	return policyoid;
+}
+
+Oid
+QxCatalogInsertProvider(Relation rel,
+						const QxCatalogProviderInsertParams *params)
+{
+	Datum		values[Natts_pg_qx_provider];
+	bool		nulls[Natts_pg_qx_provider];
+	HeapTuple	tup;
+	Oid			provideroid;
+
+	Assert(params != NULL);
+
+	memset(values, 0, sizeof(values));
+	memset(nulls, false, sizeof(nulls));
+
+	provideroid = GetNewOidWithIndex(rel, QxProviderOidIndexId,
+									 Anum_pg_qx_provider_oid);
+	values[Anum_pg_qx_provider_oid - 1] = ObjectIdGetDatum(provideroid);
+	values[Anum_pg_qx_provider_qxprovidername - 1] =
+		DirectFunctionCall1(namein, CStringGetDatum(params->name));
+	values[Anum_pg_qx_provider_qxprovidernamespace - 1] =
+		ObjectIdGetDatum(params->namespaceoid);
+	values[Anum_pg_qx_provider_qxproviderowner - 1] =
+		ObjectIdGetDatum(params->ownerid);
+	values[Anum_pg_qx_provider_qxproviderenabled - 1] =
+		BoolGetDatum(params->enabled);
+	values[Anum_pg_qx_provider_qxproviderattestationrequired - 1] =
+		BoolGetDatum(params->attestation_required);
+	qx_catalog_set_text_datum(values, nulls,
+							  Anum_pg_qx_provider_qxproviderkind,
+							  params->kind);
+	qx_catalog_set_text_datum(values, nulls,
+							  Anum_pg_qx_provider_qxproviderendpoint,
+							  params->endpoint);
+	qx_catalog_set_text_datum(values, nulls,
+							  Anum_pg_qx_provider_qxproviderreceiptalg,
+							  params->receipt_alg);
+	qx_catalog_set_text_datum(values, nulls,
+							  Anum_pg_qx_provider_qxproviderreceiptkey,
+							  params->receipt_key);
+	qx_catalog_set_text_datum(values, nulls,
+							  Anum_pg_qx_provider_qxproviderattestationprofile,
+							  params->attestation_profile);
+	qx_catalog_set_text_datum(values, nulls,
+							  Anum_pg_qx_provider_qxproviderattestationversion,
+							  params->attestation_version);
+	qx_catalog_set_text_datum(values, nulls,
+							  Anum_pg_qx_provider_qxproviderattestationpolicy,
+							  params->attestation_policy);
+
+	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
+	CatalogTupleInsert(rel, tup);
+	heap_freetuple(tup);
+
+	return provideroid;
+}
+
+Oid
+QxCatalogInsertPrincipal(Relation rel,
+						 const QxCatalogPrincipalInsertParams *params)
+{
+	Datum		values[Natts_pg_qx_principal];
+	bool		nulls[Natts_pg_qx_principal];
+	HeapTuple	tup;
+	Oid			principaloid;
+
+	Assert(params != NULL);
+
+	memset(values, 0, sizeof(values));
+	memset(nulls, false, sizeof(nulls));
+
+	principaloid = GetNewOidWithIndex(rel, QxPrincipalOidIndexId,
+									  Anum_pg_qx_principal_oid);
+	values[Anum_pg_qx_principal_oid - 1] = ObjectIdGetDatum(principaloid);
+	values[Anum_pg_qx_principal_qxprincipalname - 1] =
+		DirectFunctionCall1(namein, CStringGetDatum(params->name));
+	values[Anum_pg_qx_principal_qxprincipalnamespace - 1] =
+		ObjectIdGetDatum(params->namespaceoid);
+	values[Anum_pg_qx_principal_qxprincipalowner - 1] =
+		ObjectIdGetDatum(params->ownerid);
+	values[Anum_pg_qx_principal_qxprincipalproviderid - 1] =
+		ObjectIdGetDatum(params->provideroid);
+	values[Anum_pg_qx_principal_qxprincipalenabled - 1] =
+		BoolGetDatum(params->enabled);
+	qx_catalog_set_text_datum(values, nulls,
+							  Anum_pg_qx_principal_qxprincipalsandbox,
+							  params->sandbox_name);
+	qx_catalog_set_text_datum(values, nulls,
+							  Anum_pg_qx_principal_qxprincipalprogram,
+							  params->program_name);
+	qx_catalog_set_text_datum(values, nulls,
+							  Anum_pg_qx_principal_qxprincipalprovider,
+							  params->provider_name);
+	qx_catalog_set_text_datum(values, nulls,
+							  Anum_pg_qx_principal_qxprincipalruntimeclass,
+							  params->runtime_class);
+	qx_catalog_set_text_datum(values, nulls,
+							  Anum_pg_qx_principal_qxprincipalreceiptsigner,
+							  params->receipt_signer);
+	qx_catalog_set_text_datum(values, nulls,
+							  Anum_pg_qx_principal_qxprincipalattestationprofile,
+							  params->attestation_profile);
+	qx_catalog_set_text_datum(values, nulls,
+							  Anum_pg_qx_principal_qxprincipalattestationversion,
+							  params->attestation_version);
+	qx_catalog_set_text_datum(values, nulls,
+							  Anum_pg_qx_principal_qxprincipalattestationpolicy,
+							  params->attestation_policy);
+
+	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
+	CatalogTupleInsert(rel, tup);
+	heap_freetuple(tup);
+
+	return principaloid;
+}
+
+Oid
+QxCatalogInsertTool(Relation rel, const QxCatalogToolInsertParams *params)
+{
+	Datum		values[Natts_pg_qx_tool];
+	bool		nulls[Natts_pg_qx_tool];
+	HeapTuple	tup;
+	Oid			tooloid;
+
+	Assert(params != NULL);
+
+	memset(values, 0, sizeof(values));
+	memset(nulls, false, sizeof(nulls));
+
+	tooloid = GetNewOidWithIndex(rel, QxToolOidIndexId,
+								 Anum_pg_qx_tool_oid);
+	values[Anum_pg_qx_tool_oid - 1] = ObjectIdGetDatum(tooloid);
+	values[Anum_pg_qx_tool_qxtoolname - 1] =
+		DirectFunctionCall1(namein, CStringGetDatum(params->name));
+	values[Anum_pg_qx_tool_qxtoolnamespace - 1] =
+		ObjectIdGetDatum(params->namespaceoid);
+	values[Anum_pg_qx_tool_qxtoolowner - 1] = ObjectIdGetDatum(params->ownerid);
+	values[Anum_pg_qx_tool_qxtoolprincipalid - 1] =
+		ObjectIdGetDatum(params->principaloid);
+	values[Anum_pg_qx_tool_qxtoolenabled - 1] = BoolGetDatum(params->enabled);
+	values[Anum_pg_qx_tool_qxtooltokencost - 1] =
+		Int32GetDatum(params->token_cost);
+	values[Anum_pg_qx_tool_qxtoolcostunits - 1] =
+		Int32GetDatum(params->cost_units);
+	qx_catalog_set_text_datum(values, nulls, Anum_pg_qx_tool_qxtoolhandler,
+							  params->handler_name);
+	qx_catalog_set_text_datum(values, nulls, Anum_pg_qx_tool_qxtoolsandbox,
+							  params->sandbox_name);
+	qx_catalog_set_text_datum(values, nulls, Anum_pg_qx_tool_qxtoolruntimeclass,
+							  NULL);
+	qx_catalog_set_text_datum(values, nulls, Anum_pg_qx_tool_qxtoolsandboxceiling,
+							  NULL);
+	qx_catalog_set_text_datum(values, nulls, Anum_pg_qx_tool_qxtoolcapabilitytags,
+							  NULL);
+	qx_catalog_set_text_datum(values, nulls, Anum_pg_qx_tool_qxtoolprincipal,
+							  params->principal_name);
+	qx_catalog_set_text_datum(values, nulls, Anum_pg_qx_tool_qxtoolpolicy,
+							  params->policy_name);
+
+	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
+	CatalogTupleInsert(rel, tup);
+	heap_freetuple(tup);
+
+	return tooloid;
 }

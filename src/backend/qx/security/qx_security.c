@@ -771,12 +771,7 @@ QxEnsureOperationalIdentity(Oid namespaceoid, Oid ownerid,
 {
 	QxCatalogIdentityInfo existing;
 	Relation	rel;
-	Datum		values[Natts_pg_qx_identity];
-	bool		nulls[Natts_pg_qx_identity];
-	HeapTuple	tup;
 	Oid			identityoid;
-	ObjectAddress myself;
-	ObjectAddress referenced;
 	const char *resolved_name;
 
 	resolved_name = (identity_name != NULL && identity_name[0] != '\0') ?
@@ -799,41 +794,19 @@ QxEnsureOperationalIdentity(Oid namespaceoid, Oid ownerid,
 		return identityoid;
 	}
 
-	rel = table_open(QxIdentityRelationId, RowExclusiveLock);
+	{
+		QxCatalogIdentityInsertParams insert_params;
 
-	memset(values, 0, sizeof(values));
-	memset(nulls, false, sizeof(nulls));
-
-	identityoid = GetNewOidWithIndex(rel, QxIdentityOidIndexId,
-									 Anum_pg_qx_identity_oid);
-	values[Anum_pg_qx_identity_oid - 1] = ObjectIdGetDatum(identityoid);
-	values[Anum_pg_qx_identity_qxidentityname - 1] =
-		DirectFunctionCall1(namein, CStringGetDatum(resolved_name));
-	values[Anum_pg_qx_identity_qxidentitynamespace - 1] =
-		ObjectIdGetDatum(namespaceoid);
-	values[Anum_pg_qx_identity_qxidentityowner - 1] =
-		ObjectIdGetDatum(ownerid);
-	values[Anum_pg_qx_identity_qxidentityauthrole - 1] =
-		ObjectIdGetDatum(authrole);
-	qx_security_set_text(values, nulls, Anum_pg_qx_identity_qxidentitypolicy,
-						 policy_name);
-	qx_security_set_nodetree(values, nulls,
-							 Anum_pg_qx_identity_qxidentitybudget,
-							 budget_options);
-
-	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
-	CatalogTupleInsert(rel, tup);
-	heap_freetuple(tup);
-	table_close(rel, RowExclusiveLock);
-
-	ObjectAddressSet(myself, QxIdentityRelationId, identityoid);
-	recordDependencyOnOwner(QxIdentityRelationId, identityoid, ownerid);
-	ObjectAddressSet(referenced, NamespaceRelationId, namespaceoid);
-	recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
-	ObjectAddressSet(referenced, AuthIdRelationId, authrole);
-	recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
-	recordDependencyOnCurrentExtension(&myself, false);
-	InvokeObjectPostCreateHook(QxIdentityRelationId, identityoid, 0);
+		rel = table_open(QxIdentityRelationId, RowExclusiveLock);
+		insert_params.namespaceoid = namespaceoid;
+		insert_params.ownerid = ownerid;
+		insert_params.authrole = authrole;
+		insert_params.name = resolved_name;
+		insert_params.policy_name = policy_name;
+		insert_params.budget_options = budget_options;
+		identityoid = QxCatalogInsertIdentity(rel, &insert_params);
+		table_close(rel, RowExclusiveLock);
+	}
 
 	return identityoid;
 }

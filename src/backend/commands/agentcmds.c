@@ -14,7 +14,6 @@
 #include "access/table.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
-#include "catalog/indexing.h"
 #include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
 #include "catalog/objectaddress.h"
@@ -25,47 +24,13 @@
 #include "commands/defrem.h"
 #include "commands/agentcmds.h"
 #include "miscadmin.h"
-#include "nodes/nodes.h"
 #include "nodes/pg_list.h"
 #include "nodes/value.h"
+#include "qx/qx_catalog.h"
 #include "qx/qx_security.h"
 #include "utils/acl.h"
-#include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
-#include "utils/syscache.h"
-
-static void
-qx_set_text_datum(Datum *values, bool *nulls, AttrNumber attnum,
-				  const char *value)
-{
-	if (value == NULL)
-	{
-		nulls[attnum - 1] = true;
-		return;
-	}
-
-	nulls[attnum - 1] = false;
-	values[attnum - 1] = CStringGetTextDatum(value);
-}
-
-static void
-qx_set_nodetree_datum(Datum *values, bool *nulls, AttrNumber attnum,
-					  const void *node)
-{
-	char	   *serialized;
-
-	if (node == NULL)
-	{
-		nulls[attnum - 1] = true;
-		return;
-	}
-
-	nulls[attnum - 1] = false;
-	serialized = nodeToString(node);
-	values[attnum - 1] = CStringGetTextDatum(serialized);
-	pfree(serialized);
-}
 
 void
 CreateAgentCommand(CreateAgentStmt *stmt)
@@ -73,8 +38,6 @@ CreateAgentCommand(CreateAgentStmt *stmt)
 	Relation	rel;
 	ObjectAddress myself;
 	ObjectAddress referenced;
-	Datum		values[Natts_pg_qx_agent];
-	bool		nulls[Natts_pg_qx_agent];
 	Oid			agentoid;
 	Oid			identityoid;
 	Oid			namespacepolicyoid;
@@ -83,7 +46,8 @@ CreateAgentCommand(CreateAgentStmt *stmt)
 	AclResult	aclresult;
 	List	   *names;
 	char	   *agentname;
-	HeapTuple	tup;
+	QxCatalogAgentInfo existing_agent;
+	QxCatalogAgentInsertParams insert_params;
 	QxToolAuthorization authz;
 
 	ownerid = GetUserId();
@@ -95,18 +59,14 @@ CreateAgentCommand(CreateAgentStmt *stmt)
 		aclcheck_error(aclresult, OBJECT_SCHEMA,
 					   get_namespace_name(namespaceoid));
 
-	rel = table_open(QxAgentRelationId, RowExclusiveLock);
-
-	if (SearchSysCacheExists2(QXAGENTNAMENSP,
-							  CStringGetDatum(agentname),
-							  ObjectIdGetDatum(namespaceoid)))
+	if (QxCatalogLookupAgentByName(namespaceoid, agentname, &existing_agent))
+	{
+		QxCatalogFreeAgentInfo(&existing_agent);
 		ereport(ERROR,
 				(errcode(ERRCODE_DUPLICATE_OBJECT),
 				 errmsg("agent \"%s\" already exists in schema \"%s\"",
 						agentname, get_namespace_name(namespaceoid))));
-
-	memset(values, 0, sizeof(values));
-	memset(nulls, false, sizeof(nulls));
+	}
 
 	QxValidateToolList(stmt->tools);
 	QxValidateRegisteredTools(namespaceoid, stmt->tools, true);
@@ -128,35 +88,19 @@ CreateAgentCommand(CreateAgentStmt *stmt)
 											  stmt->policy_name,
 											  stmt->budget_options);
 
-	agentoid = GetNewOidWithIndex(rel, QxAgentOidIndexId,
-								  Anum_pg_qx_agent_oid);
-	values[Anum_pg_qx_agent_oid - 1] = ObjectIdGetDatum(agentoid);
-	values[Anum_pg_qx_agent_qxagentname - 1] =
-		DirectFunctionCall1(namein, CStringGetDatum(agentname));
-	values[Anum_pg_qx_agent_qxagentnamespace - 1] =
-		ObjectIdGetDatum(namespaceoid);
-	values[Anum_pg_qx_agent_qxnamespacepolicyid - 1] =
-		ObjectIdGetDatum(namespacepolicyoid);
-	values[Anum_pg_qx_agent_qxidentityid - 1] =
-		ObjectIdGetDatum(identityoid);
-	values[Anum_pg_qx_agent_qxagentowner - 1] = ObjectIdGetDatum(ownerid);
-
-	qx_set_text_datum(values, nulls, Anum_pg_qx_agent_qxidentity,
-					  stmt->identity_name);
-	qx_set_text_datum(values, nulls, Anum_pg_qx_agent_qxmodeluri,
-					  stmt->model_uri);
-	qx_set_text_datum(values, nulls, Anum_pg_qx_agent_qxmemoryprofile,
-					  stmt->memory_profile);
-	qx_set_text_datum(values, nulls, Anum_pg_qx_agent_qxpolicy,
-					  stmt->policy_name);
-	qx_set_nodetree_datum(values, nulls, Anum_pg_qx_agent_qxtools,
-						  stmt->tools);
-	qx_set_nodetree_datum(values, nulls, Anum_pg_qx_agent_qxbudget,
-						  stmt->budget_options);
-
-	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
-	CatalogTupleInsert(rel, tup);
-	heap_freetuple(tup);
+	rel = table_open(QxAgentRelationId, RowExclusiveLock);
+	insert_params.name = agentname;
+	insert_params.namespaceoid = namespaceoid;
+	insert_params.namespacepolicyoid = namespacepolicyoid;
+	insert_params.identityoid = identityoid;
+	insert_params.ownerid = ownerid;
+	insert_params.identity_name = stmt->identity_name;
+	insert_params.model_uri = stmt->model_uri;
+	insert_params.memory_profile = stmt->memory_profile;
+	insert_params.policy_name = stmt->policy_name;
+	insert_params.tools = stmt->tools;
+	insert_params.budget_options = stmt->budget_options;
+	agentoid = QxCatalogInsertAgent(rel, &insert_params);
 	table_close(rel, RowExclusiveLock);
 
 	ObjectAddressSet(myself, QxAgentRelationId, agentoid);

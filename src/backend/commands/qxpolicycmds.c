@@ -28,6 +28,7 @@
 #include "nodes/pg_list.h"
 #include "nodes/value.h"
 #include "port.h"
+#include "qx/qx_catalog.h"
 #include "qx/qx_security.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
@@ -1202,9 +1203,6 @@ void
 CreateNamespacePolicyCommand(CreateNamespacePolicyStmt *stmt)
 {
 	Relation	rel;
-	Datum		values[Natts_pg_qx_namespace];
-	bool		nulls[Natts_pg_qx_namespace];
-	HeapTuple	tup;
 	Oid			namespaceoid;
 	Oid			ownerid;
 	Oid			authrole;
@@ -1230,46 +1228,34 @@ CreateNamespacePolicyCommand(CreateNamespacePolicyStmt *stmt)
 	QxValidateToolList(stmt->allowed_tools);
 	QxValidateRegisteredTools(namespaceoid, stmt->allowed_tools, false);
 
-	if (SearchSysCacheExists2(QXNAMESPACENAMENSP,
-							  CStringGetDatum(stmt->policy_name),
-							  ObjectIdGetDatum(namespaceoid)))
-		ereport(ERROR,
-				(errcode(ERRCODE_DUPLICATE_OBJECT),
-				 errmsg("namespace policy \"%s\" already exists in schema \"%s\"",
-						stmt->policy_name, get_namespace_name(namespaceoid))));
+	{
+		QxCatalogNamespacePolicyInfo existing_policy;
+		QxCatalogNamespacePolicyInsertParams insert_params;
 
-	rel = table_open(QxNamespaceRelationId, RowExclusiveLock);
+		if (QxCatalogLookupNamespacePolicyByName(namespaceoid,
+											   stmt->policy_name,
+											   &existing_policy))
+		{
+			QxCatalogFreeNamespacePolicyInfo(&existing_policy);
+			ereport(ERROR,
+					(errcode(ERRCODE_DUPLICATE_OBJECT),
+					 errmsg("namespace policy \"%s\" already exists in schema \"%s\"",
+							stmt->policy_name, get_namespace_name(namespaceoid))));
+		}
 
-	memset(values, 0, sizeof(values));
-	memset(nulls, false, sizeof(nulls));
-
-	policyoid = GetNewOidWithIndex(rel, QxNamespaceOidIndexId,
-								   Anum_pg_qx_namespace_oid);
-	values[Anum_pg_qx_namespace_oid - 1] = ObjectIdGetDatum(policyoid);
-	values[Anum_pg_qx_namespace_qxnamespacepolicyname - 1] =
-		DirectFunctionCall1(namein, CStringGetDatum(stmt->policy_name));
-	values[Anum_pg_qx_namespace_qxnamespaceid - 1] =
-		ObjectIdGetDatum(namespaceoid);
-	values[Anum_pg_qx_namespace_qxnamespaceowner - 1] =
-		ObjectIdGetDatum(ownerid);
-	values[Anum_pg_qx_namespace_qxnamespaceauthrole - 1] =
-		ObjectIdGetDatum(authrole);
-	values[Anum_pg_qx_namespace_qxrequireknowntools - 1] =
-		BoolGetDatum(stmt->require_known_tools);
-	values[Anum_pg_qx_namespace_qxenforcebudgets - 1] =
-		BoolGetDatum(stmt->enforce_budgets);
-	qxpolicy_set_text(values, nulls,
-					  Anum_pg_qx_namespace_qxnamespacepolicy,
-					  stmt->policy_contract != NULL ?
-					  stmt->policy_contract : stmt->policy_name);
-	qxpolicy_set_nodetree(values, nulls,
-						  Anum_pg_qx_namespace_qxallowedtools,
-						  stmt->allowed_tools);
-
-	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
-	CatalogTupleInsert(rel, tup);
-	heap_freetuple(tup);
-	table_close(rel, RowExclusiveLock);
+		rel = table_open(QxNamespaceRelationId, RowExclusiveLock);
+		insert_params.name = stmt->policy_name;
+		insert_params.namespaceoid = namespaceoid;
+		insert_params.ownerid = ownerid;
+		insert_params.authrole = authrole;
+		insert_params.require_known_tools = stmt->require_known_tools;
+		insert_params.enforce_budgets = stmt->enforce_budgets;
+		insert_params.policy_contract = (stmt->policy_contract != NULL) ?
+			stmt->policy_contract : stmt->policy_name;
+		insert_params.allowed_tools = stmt->allowed_tools;
+		policyoid = QxCatalogInsertNamespacePolicy(rel, &insert_params);
+		table_close(rel, RowExclusiveLock);
+	}
 
 	qx_record_namespace_policy_dependencies(policyoid, ownerid, namespaceoid,
 											authrole);
@@ -1417,9 +1403,6 @@ void
 CreateProviderCommand(CreateProviderStmt *stmt)
 {
 	Relation	rel;
-	Datum		values[Natts_pg_qx_provider];
-	bool		nulls[Natts_pg_qx_provider];
-	HeapTuple	tup;
 	Oid			namespaceoid;
 	Oid			ownerid;
 	Oid			provideroid;
@@ -1450,59 +1433,38 @@ CreateProviderCommand(CreateProviderStmt *stmt)
 											 stmt->attestation_required,
 											 "CREATE PROVIDER");
 
-	if (SearchSysCacheExists2(QXPROVIDERNAMENSP,
-							  CStringGetDatum(stmt->provider_name->relname),
-							  ObjectIdGetDatum(namespaceoid)))
-		ereport(ERROR,
-				(errcode(ERRCODE_DUPLICATE_OBJECT),
-				 errmsg("provider \"%s\" already exists in schema \"%s\"",
-						stmt->provider_name->relname,
-						get_namespace_name(namespaceoid))));
+	{
+		QxCatalogProviderInfo existing_provider;
+		QxCatalogProviderInsertParams insert_params;
 
-	rel = table_open(QxProviderRelationId, RowExclusiveLock);
+		if (QxCatalogLookupProviderByName(namespaceoid,
+										stmt->provider_name->relname,
+										&existing_provider))
+		{
+			QxCatalogFreeProviderInfo(&existing_provider);
+			ereport(ERROR,
+					(errcode(ERRCODE_DUPLICATE_OBJECT),
+					 errmsg("provider \"%s\" already exists in schema \"%s\"",
+							stmt->provider_name->relname,
+							get_namespace_name(namespaceoid))));
+		}
 
-	memset(values, 0, sizeof(values));
-	memset(nulls, false, sizeof(nulls));
-
-	provideroid = GetNewOidWithIndex(rel, QxProviderOidIndexId,
-									 Anum_pg_qx_provider_oid);
-	values[Anum_pg_qx_provider_oid - 1] = ObjectIdGetDatum(provideroid);
-	values[Anum_pg_qx_provider_qxprovidername - 1] =
-		DirectFunctionCall1(namein, CStringGetDatum(stmt->provider_name->relname));
-	values[Anum_pg_qx_provider_qxprovidernamespace - 1] =
-		ObjectIdGetDatum(namespaceoid);
-	values[Anum_pg_qx_provider_qxproviderowner - 1] =
-		ObjectIdGetDatum(ownerid);
-	values[Anum_pg_qx_provider_qxproviderenabled - 1] =
-		BoolGetDatum(true);
-	values[Anum_pg_qx_provider_qxproviderattestationrequired - 1] =
-		BoolGetDatum(stmt->attestation_required);
-	qxpolicy_set_text(values, nulls,
-					  Anum_pg_qx_provider_qxproviderkind,
-					  stmt->provider_kind);
-	qxpolicy_set_text(values, nulls,
-					  Anum_pg_qx_provider_qxproviderendpoint,
-					  stmt->endpoint_name);
-	qxpolicy_set_text(values, nulls,
-					  Anum_pg_qx_provider_qxproviderreceiptalg,
-					  receipt_alg);
-	qxpolicy_set_text(values, nulls,
-					  Anum_pg_qx_provider_qxproviderreceiptkey,
-					  stmt->receipt_key);
-	qxpolicy_set_text(values, nulls,
-					  Anum_pg_qx_provider_qxproviderattestationprofile,
-					  stmt->attestation_profile);
-	qxpolicy_set_text(values, nulls,
-					  Anum_pg_qx_provider_qxproviderattestationversion,
-					  stmt->attestation_version);
-	qxpolicy_set_text(values, nulls,
-					  Anum_pg_qx_provider_qxproviderattestationpolicy,
-					  stmt->attestation_policy);
-
-	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
-	CatalogTupleInsert(rel, tup);
-	heap_freetuple(tup);
-	table_close(rel, RowExclusiveLock);
+		rel = table_open(QxProviderRelationId, RowExclusiveLock);
+		insert_params.name = stmt->provider_name->relname;
+		insert_params.namespaceoid = namespaceoid;
+		insert_params.ownerid = ownerid;
+		insert_params.enabled = true;
+		insert_params.attestation_required = stmt->attestation_required;
+		insert_params.kind = stmt->provider_kind;
+		insert_params.endpoint = stmt->endpoint_name;
+		insert_params.receipt_alg = receipt_alg;
+		insert_params.receipt_key = stmt->receipt_key;
+		insert_params.attestation_profile = stmt->attestation_profile;
+		insert_params.attestation_version = stmt->attestation_version;
+		insert_params.attestation_policy = stmt->attestation_policy;
+		provideroid = QxCatalogInsertProvider(rel, &insert_params);
+		table_close(rel, RowExclusiveLock);
+	}
 
 	qx_record_provider_dependencies(provideroid, ownerid, namespaceoid);
 	ObjectAddressSet(myself, QxProviderRelationId, provideroid);
@@ -1737,9 +1699,6 @@ void
 CreatePrincipalCommand(CreatePrincipalStmt *stmt)
 {
 	Relation	rel;
-	Datum		values[Natts_pg_qx_principal];
-	bool		nulls[Natts_pg_qx_principal];
-	HeapTuple	tup;
 	Oid			namespaceoid;
 	Oid			ownerid;
 	Oid			provideroid;
@@ -1800,62 +1759,39 @@ CreatePrincipalCommand(CreatePrincipalStmt *stmt)
 										  effective_attestation_policy,
 										  "CREATE PRINCIPAL");
 
-	if (SearchSysCacheExists2(QXPRINCIPALNAMENSP,
-							  CStringGetDatum(stmt->principal_name->relname),
-							  ObjectIdGetDatum(namespaceoid)))
-		ereport(ERROR,
-				(errcode(ERRCODE_DUPLICATE_OBJECT),
-				 errmsg("principal \"%s\" already exists in schema \"%s\"",
-						stmt->principal_name->relname,
-						get_namespace_name(namespaceoid))));
+	{
+		QxCatalogPrincipalInfo existing_principal;
+		QxCatalogPrincipalInsertParams insert_params;
 
-	rel = table_open(QxPrincipalRelationId, RowExclusiveLock);
+		if (QxCatalogLookupPrincipalByName(namespaceoid,
+										 stmt->principal_name->relname,
+										 &existing_principal))
+		{
+			QxCatalogFreePrincipalInfo(&existing_principal);
+			ereport(ERROR,
+					(errcode(ERRCODE_DUPLICATE_OBJECT),
+					 errmsg("principal \"%s\" already exists in schema \"%s\"",
+							stmt->principal_name->relname,
+							get_namespace_name(namespaceoid))));
+		}
 
-	memset(values, 0, sizeof(values));
-	memset(nulls, false, sizeof(nulls));
-
-	principaloid = GetNewOidWithIndex(rel, QxPrincipalOidIndexId,
-									  Anum_pg_qx_principal_oid);
-	values[Anum_pg_qx_principal_oid - 1] = ObjectIdGetDatum(principaloid);
-	values[Anum_pg_qx_principal_qxprincipalname - 1] =
-		DirectFunctionCall1(namein, CStringGetDatum(stmt->principal_name->relname));
-	values[Anum_pg_qx_principal_qxprincipalnamespace - 1] =
-		ObjectIdGetDatum(namespaceoid);
-	values[Anum_pg_qx_principal_qxprincipalowner - 1] =
-		ObjectIdGetDatum(ownerid);
-	values[Anum_pg_qx_principal_qxprincipalproviderid - 1] =
-		ObjectIdGetDatum(provideroid);
-	values[Anum_pg_qx_principal_qxprincipalenabled - 1] =
-		BoolGetDatum(stmt->enabled);
-	qxpolicy_set_text(values, nulls,
-					  Anum_pg_qx_principal_qxprincipalsandbox,
-					  stmt->sandbox_name);
-	qxpolicy_set_text(values, nulls,
-					  Anum_pg_qx_principal_qxprincipalprogram,
-					  stmt->program_name);
-	qxpolicy_set_text(values, nulls,
-					  Anum_pg_qx_principal_qxprincipalprovider,
-					  stmt->provider_name->relname);
-	qxpolicy_set_text(values, nulls,
-					  Anum_pg_qx_principal_qxprincipalruntimeclass,
-					  effective_runtime_class);
-	qxpolicy_set_text(values, nulls,
-					  Anum_pg_qx_principal_qxprincipalreceiptsigner,
-					  stmt->receipt_signer);
-	qxpolicy_set_text(values, nulls,
-					  Anum_pg_qx_principal_qxprincipalattestationprofile,
-					  effective_attestation_profile);
-	qxpolicy_set_text(values, nulls,
-					  Anum_pg_qx_principal_qxprincipalattestationversion,
-					  effective_attestation_version);
-	qxpolicy_set_text(values, nulls,
-					  Anum_pg_qx_principal_qxprincipalattestationpolicy,
-					  effective_attestation_policy);
-
-	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
-	CatalogTupleInsert(rel, tup);
-	heap_freetuple(tup);
-	table_close(rel, RowExclusiveLock);
+		rel = table_open(QxPrincipalRelationId, RowExclusiveLock);
+		insert_params.name = stmt->principal_name->relname;
+		insert_params.namespaceoid = namespaceoid;
+		insert_params.ownerid = ownerid;
+		insert_params.provideroid = provideroid;
+		insert_params.enabled = stmt->enabled;
+		insert_params.sandbox_name = stmt->sandbox_name;
+		insert_params.program_name = stmt->program_name;
+		insert_params.provider_name = stmt->provider_name->relname;
+		insert_params.runtime_class = effective_runtime_class;
+		insert_params.receipt_signer = stmt->receipt_signer;
+		insert_params.attestation_profile = effective_attestation_profile;
+		insert_params.attestation_version = effective_attestation_version;
+		insert_params.attestation_policy = effective_attestation_policy;
+		principaloid = QxCatalogInsertPrincipal(rel, &insert_params);
+		table_close(rel, RowExclusiveLock);
+	}
 
 	qx_record_principal_dependencies(principaloid, ownerid, namespaceoid,
 									 provideroid);
@@ -2135,9 +2071,6 @@ void
 CreateToolCommand(CreateToolStmt *stmt)
 {
 	Relation	rel;
-	Datum		values[Natts_pg_qx_tool];
-	bool		nulls[Natts_pg_qx_tool];
-	HeapTuple	tup;
 	Oid			namespaceoid;
 	Oid			ownerid;
 	Oid			tooloid;
@@ -2161,51 +2094,36 @@ CreateToolCommand(CreateToolStmt *stmt)
 	if (stmt->policy_name != NULL)
 		(void) QxLookupNamespacePolicy(namespaceoid, stmt->policy_name, false);
 
-	if (SearchSysCacheExists2(QXTOOLNAMENSP,
-							  CStringGetDatum(stmt->tool_name->relname),
-							  ObjectIdGetDatum(namespaceoid)))
-		ereport(ERROR,
-				(errcode(ERRCODE_DUPLICATE_OBJECT),
-				 errmsg("tool \"%s\" already exists in schema \"%s\"",
-						stmt->tool_name->relname, get_namespace_name(namespaceoid))));
+	{
+		QxCatalogToolInfo existing_tool;
+		QxCatalogToolInsertParams insert_params;
 
-	rel = table_open(QxToolRelationId, RowExclusiveLock);
+		if (QxCatalogLookupToolByName(namespaceoid, stmt->tool_name->relname,
+									  &existing_tool))
+		{
+			QxCatalogFreeToolInfo(&existing_tool);
+			ereport(ERROR,
+					(errcode(ERRCODE_DUPLICATE_OBJECT),
+					 errmsg("tool \"%s\" already exists in schema \"%s\"",
+							stmt->tool_name->relname,
+							get_namespace_name(namespaceoid))));
+		}
 
-	memset(values, 0, sizeof(values));
-	memset(nulls, false, sizeof(nulls));
-
-	tooloid = GetNewOidWithIndex(rel, QxToolOidIndexId,
-								 Anum_pg_qx_tool_oid);
-	values[Anum_pg_qx_tool_oid - 1] = ObjectIdGetDatum(tooloid);
-	values[Anum_pg_qx_tool_qxtoolname - 1] =
-		DirectFunctionCall1(namein, CStringGetDatum(stmt->tool_name->relname));
-	values[Anum_pg_qx_tool_qxtoolnamespace - 1] =
-		ObjectIdGetDatum(namespaceoid);
-	values[Anum_pg_qx_tool_qxtoolowner - 1] = ObjectIdGetDatum(ownerid);
-	values[Anum_pg_qx_tool_qxtoolprincipalid - 1] =
-		ObjectIdGetDatum(principaloid);
-	values[Anum_pg_qx_tool_qxtoolenabled - 1] = BoolGetDatum(stmt->enabled);
-	values[Anum_pg_qx_tool_qxtooltokencost - 1] = Int32GetDatum(stmt->token_cost);
-	values[Anum_pg_qx_tool_qxtoolcostunits - 1] = Int32GetDatum(stmt->cost_units);
-	qxpolicy_set_text(values, nulls, Anum_pg_qx_tool_qxtoolhandler,
-					  stmt->handler_name);
-	qxpolicy_set_text(values, nulls, Anum_pg_qx_tool_qxtoolsandbox,
-					  stmt->sandbox_name);
-	qxpolicy_set_text(values, nulls, Anum_pg_qx_tool_qxtoolruntimeclass,
-					  NULL);
-	qxpolicy_set_text(values, nulls, Anum_pg_qx_tool_qxtoolsandboxceiling,
-					  NULL);
-	qxpolicy_set_text(values, nulls, Anum_pg_qx_tool_qxtoolcapabilitytags,
-					  NULL);
-	qxpolicy_set_text(values, nulls, Anum_pg_qx_tool_qxtoolprincipal,
-					  stmt->principal_name);
-	qxpolicy_set_text(values, nulls, Anum_pg_qx_tool_qxtoolpolicy,
-					  stmt->policy_name);
-
-	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
-	CatalogTupleInsert(rel, tup);
-	heap_freetuple(tup);
-	table_close(rel, RowExclusiveLock);
+		rel = table_open(QxToolRelationId, RowExclusiveLock);
+		insert_params.name = stmt->tool_name->relname;
+		insert_params.namespaceoid = namespaceoid;
+		insert_params.ownerid = ownerid;
+		insert_params.principaloid = principaloid;
+		insert_params.enabled = stmt->enabled;
+		insert_params.token_cost = stmt->token_cost;
+		insert_params.cost_units = stmt->cost_units;
+		insert_params.handler_name = stmt->handler_name;
+		insert_params.sandbox_name = stmt->sandbox_name;
+		insert_params.principal_name = stmt->principal_name;
+		insert_params.policy_name = stmt->policy_name;
+		tooloid = QxCatalogInsertTool(rel, &insert_params);
+		table_close(rel, RowExclusiveLock);
+	}
 
 	qx_record_tool_dependencies(tooloid, ownerid, namespaceoid, principaloid);
 	ObjectAddressSet(myself, QxToolRelationId, tooloid);

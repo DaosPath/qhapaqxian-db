@@ -144,3 +144,4 @@ test: tablespace
 # QhapaqXian DB stage-4 native catalog contract
 test: qx_stage3_agentic
 test: qx_stage3_observability
+test: qx_stage32_catalog

@@ -28,8 +28,8 @@
 #include "executor/executor.h"
 #include "miscadmin.h"
 #include "nodes/value.h"
+#include "qx/qx_catalog.h"
 #include "qx/qx_memory.h"
-#include "qx/qx_semantic_log.h"
 #include "tcop/tcopprot.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
@@ -45,8 +45,7 @@ static char *qx_get_text_attr(TupleDesc tupdesc, HeapTuple tup, AttrNumber attnu
 static bool qx_scope_is_requested(char scope, List *scopes);
 static bool qx_memory_matches_filter(const char *match_text, const char *key,
 									 const char *value, const char *tags);
-static Oid qx_insert_memory_event(Relation rel, Oid sessionoid, Oid ownerid,
-								  const char *kind, const char *payload);
+
 
 static void
 qx_set_text_datum(Datum *values, bool *nulls, AttrNumber attnum,
@@ -178,96 +177,41 @@ qx_memory_matches_filter(const char *match_text, const char *key,
 	return false;
 }
 
-static Oid
-qx_insert_memory_event(Relation rel, Oid sessionoid, Oid ownerid,
-					   const char *kind, const char *payload)
-{
-	Datum		values[Natts_pg_qx_event];
-	bool		nulls[Natts_pg_qx_event];
-	Oid			eventoid;
-	HeapTuple	tup;
-	XLogRecPtr	eventlsn;
-
-	memset(values, 0, sizeof(values));
-	memset(nulls, false, sizeof(nulls));
-
-	eventoid = GetNewOidWithIndex(rel, QxEventOidIndexId,
-								  Anum_pg_qx_event_oid);
-	values[Anum_pg_qx_event_oid - 1] = ObjectIdGetDatum(eventoid);
-	values[Anum_pg_qx_event_qxeventdbid - 1] = ObjectIdGetDatum(MyDatabaseId);
-	values[Anum_pg_qx_event_qxeventsessionid - 1] =
-		ObjectIdGetDatum(sessionoid);
-	values[Anum_pg_qx_event_qxeventtaskid - 1] = ObjectIdGetDatum(InvalidOid);
-	values[Anum_pg_qx_event_qxeventstepid - 1] = ObjectIdGetDatum(InvalidOid);
-	values[Anum_pg_qx_event_qxeventowner - 1] = ObjectIdGetDatum(ownerid);
-	eventlsn = QxEmitSemanticEventRecord(eventoid, sessionoid, InvalidOid,
-										 InvalidOid, ownerid, kind, payload);
-	values[Anum_pg_qx_event_qxeventlsn - 1] = LSNGetDatum(eventlsn);
-	qx_set_text_datum(values, nulls, Anum_pg_qx_event_qxeventkind, kind);
-	qx_set_text_datum(values, nulls, Anum_pg_qx_event_qxeventpayload, payload);
-
-	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
-	CatalogTupleInsert(rel, tup);
-	heap_freetuple(tup);
-
-	return eventoid;
-}
-
 Oid
 QxRememberSessionMemory(const QxRememberRequest *request)
 {
 	Relation	memoryrel;
 	Relation	eventrel;
-	Datum		values[Natts_pg_qx_memory];
-	bool		nulls[Natts_pg_qx_memory];
-	HeapTuple	tup;
 	Oid			memoryoid;
 	ObjectAddress myself;
 	ObjectAddress referenced;
 	char	   *serialized_value;
 	char	   *serialized_tags;
 	char	   *event_payload;
+	QxCatalogMemoryInsertParams insert_params;
 
 	memoryrel = table_open(QxMemoryRelationId, RowExclusiveLock);
 	eventrel = table_open(QxEventRelationId, RowExclusiveLock);
 
-	memset(values, 0, sizeof(values));
-	memset(nulls, false, sizeof(nulls));
-
-	memoryoid = GetNewOidWithIndex(memoryrel, QxMemoryOidIndexId,
-								   Anum_pg_qx_memory_oid);
 	serialized_value = qx_serialize_memory_value(request->memory_value);
 	serialized_tags = qx_serialize_memory_tags(request->tags);
 
-	values[Anum_pg_qx_memory_oid - 1] = ObjectIdGetDatum(memoryoid);
-	values[Anum_pg_qx_memory_qxmemorydbid - 1] = ObjectIdGetDatum(MyDatabaseId);
-	values[Anum_pg_qx_memory_qxmemoryagentid - 1] =
-		ObjectIdGetDatum(request->agentoid);
-	values[Anum_pg_qx_memory_qxmemorysessionid - 1] =
-		ObjectIdGetDatum(request->sessionoid);
-	values[Anum_pg_qx_memory_qxmemorytaskid - 1] = ObjectIdGetDatum(InvalidOid);
-	values[Anum_pg_qx_memory_qxmemoryowner - 1] =
-		ObjectIdGetDatum(request->ownerid);
-	values[Anum_pg_qx_memory_qxmemoryscope - 1] =
-		CharGetDatum(request->scope);
-	qx_set_text_datum(values, nulls, Anum_pg_qx_memory_qxmemorykey,
-					  request->memory_key);
-	qx_set_text_datum(values, nulls, Anum_pg_qx_memory_qxmemoryvalue,
-					  serialized_value);
-	qx_set_text_datum(values, nulls, Anum_pg_qx_memory_qxmemorytags,
-					  serialized_tags);
-
-	tup = heap_form_tuple(RelationGetDescr(memoryrel), values, nulls);
-	CatalogTupleInsert(memoryrel, tup);
-	heap_freetuple(tup);
+	insert_params.agentoid = request->agentoid;
+	insert_params.sessionoid = request->sessionoid;
+	insert_params.ownerid = request->ownerid;
+	insert_params.scope = request->scope;
+	insert_params.memory_key = request->memory_key;
+	insert_params.serialized_value = serialized_value;
+	insert_params.serialized_tags = serialized_tags;
+	memoryoid = QxCatalogInsertMemory(memoryrel, &insert_params);
 
 	event_payload = psprintf("memory=%u;scope=%s;key=%s",
 							 memoryoid,
 							 QxMemoryScopeLabel(request->scope),
 							 request->memory_key);
-	(void) qx_insert_memory_event(eventrel, request->sessionoid,
-								  request->ownerid,
-								  "MEMORY_RECORDED", event_payload);
+	(void) QxCatalogInsertEvent(eventrel, request->sessionoid, InvalidOid,
+								InvalidOid, request->ownerid, NULL,
+								"MEMORY_RECORDED", event_payload);
 	pfree(event_payload);
 
 	ObjectAddressSet(myself, QxMemoryRelationId, memoryoid);

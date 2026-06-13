@@ -39,14 +39,7 @@ static void QxRecoveryPopulateReport(QxRecoveryReport *report,
 									 List *attempt_summaries,
 									 List *checkpoint_summaries);
 static char *qx_recovery_copy_string(const char *value);
-static bool qx_recovery_task_has_scheduler_recovery_queue(Oid databaseoid,
-														  Oid ownerid,
-														  Oid taskoid,
-														  Oid attemptoid);
-static bool qx_recovery_attempt_has_scheduler_reclaim(Oid databaseoid,
-													  Oid ownerid,
-													  Oid taskoid,
-													  Oid attemptoid);
+
 
 static Oid
 qx_recovery_effective_database_oid(const QxRecoveryStartupRequest *request)
@@ -75,98 +68,38 @@ qx_recovery_copy_string(const char *value)
 	return pstrdup(value);
 }
 
-/*
- * Startup/failover recovery is a rare maintenance path, so use simple durable
- * ledger scans here to keep requeue/fence decisions idempotent against the
- * autonomous scheduler supervisor.
- */
 static bool
 qx_recovery_task_has_scheduler_recovery_queue(Oid databaseoid, Oid ownerid,
 											  Oid taskoid, Oid attemptoid)
 {
-	Relation	rel;
-	TableScanDesc scan;
-	HeapTuple	tup;
-	Oid			bestoid = InvalidOid;
-	int16		bestkind = (int16) QX_SCHEDULER_QUEUE_PRIMARY;
+	QxSchedulerQueueSnapshot queue_snapshot;
 
 	if (!OidIsValid(taskoid) || !OidIsValid(attemptoid))
 		return false;
 
-	rel = table_open(QxSchedulerQueueRelationId, AccessShareLock);
-	scan = table_beginscan_catalog(rel, 0, NULL);
+	if (!QxCatalogLookupLatestSchedulerQueue(databaseoid, ownerid, taskoid,
+											 attemptoid, &queue_snapshot))
+		return false;
 
-	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
-	{
-		Form_pg_qx_scheduler_queue form =
-			(Form_pg_qx_scheduler_queue) GETSTRUCT(tup);
-
-		if (form->qxqueueledgerdbid != databaseoid ||
-			form->qxqueueledgertaskid != taskoid ||
-			form->qxqueueledgerattemptid != attemptoid)
-			continue;
-
-		if (OidIsValid(ownerid) && form->qxqueueledgerowner != ownerid)
-			continue;
-
-		if (!OidIsValid(bestoid) || form->oid > bestoid)
-		{
-			bestoid = form->oid;
-			bestkind = form->qxqueueledgerkind;
-		}
-	}
-
-	table_endscan(scan);
-	table_close(rel, AccessShareLock);
-
-	return OidIsValid(bestoid) &&
-		bestkind == (int16) QX_SCHEDULER_QUEUE_RECOVERY;
+	return queue_snapshot.queue_kind == QX_SCHEDULER_QUEUE_RECOVERY;
 }
 
 static bool
 qx_recovery_attempt_has_scheduler_reclaim(Oid databaseoid, Oid ownerid,
 										  Oid taskoid, Oid attemptoid)
 {
-	Relation	rel;
-	TableScanDesc scan;
-	HeapTuple	tup;
-	Oid			bestoid = InvalidOid;
-	int16		beststate = (int16) QX_SCHEDULER_LEASE_AVAILABLE;
-	bool		bestneedsrecovery = false;
+	QxSchedulerLeaseSnapshot lease_snapshot;
 
 	if (!OidIsValid(taskoid) || !OidIsValid(attemptoid))
 		return false;
 
-	rel = table_open(QxSchedulerLeaseRelationId, AccessShareLock);
-	scan = table_beginscan_catalog(rel, 0, NULL);
+	if (!QxCatalogLookupLatestSchedulerLease(databaseoid, ownerid, taskoid,
+											 attemptoid, &lease_snapshot,
+											 NULL))
+		return false;
 
-	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
-	{
-		Form_pg_qx_scheduler_lease form =
-			(Form_pg_qx_scheduler_lease) GETSTRUCT(tup);
-
-		if (form->qxleaseledgerdbid != databaseoid ||
-			form->qxleaseledgertaskid != taskoid ||
-			form->qxleaseledgerattemptid != attemptoid)
-			continue;
-
-		if (OidIsValid(ownerid) && form->qxleaseledgerowner != ownerid)
-			continue;
-
-		if (!OidIsValid(bestoid) || form->oid > bestoid)
-		{
-			bestoid = form->oid;
-			beststate = form->qxleaseledgerstate;
-			bestneedsrecovery = form->qxleaseledgerneedsrecovery;
-		}
-	}
-
-	table_endscan(scan);
-	table_close(rel, AccessShareLock);
-
-	return OidIsValid(bestoid) &&
-		(beststate == (int16) QX_SCHEDULER_LEASE_RECLAIMED ||
-		 bestneedsrecovery);
+	return lease_snapshot.state == QX_SCHEDULER_LEASE_RECLAIMED ||
+		lease_snapshot.needs_recovery;
 }
 
 static QxRecoveryTaskSummary *
