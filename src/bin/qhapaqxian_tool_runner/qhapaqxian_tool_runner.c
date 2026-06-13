@@ -507,7 +507,7 @@ run_real_container_backend(const Request *request, char *detail, size_t detail_l
 		ZeroMemory(&si, sizeof(si));
 		ZeroMemory(&pi, sizeof(pi));
 		si.cb = sizeof(si);
-		started = CreateProcessA(docker_cli,
+		started = CreateProcessA(NULL,
 								 command,
 								 NULL,
 								 NULL,

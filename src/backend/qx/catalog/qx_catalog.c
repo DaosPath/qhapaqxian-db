@@ -9,6 +9,7 @@
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
+#include "catalog/indexing.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_qx_agent.h"
 #include "catalog/pg_qx_attempt.h"
@@ -1472,4 +1473,142 @@ QxCatalogFreeSchedulerLeaseSnapshot(QxSchedulerLeaseSnapshot *snapshot)
 	QxCatalogFreeString(&snapshot->provider_kind);
 	QxCatalogFreeString(&snapshot->principal_runtime);
 	MemSet(snapshot, 0, sizeof(QxSchedulerLeaseSnapshot));
+}
+
+void
+QxCatalogUpdateTaskRuntime(Relation taskrel, Oid taskoid, char state,
+						   Oid lastattemptid, bool replace_attempt,
+						   Oid lastcheckpointid, bool replace_checkpoint)
+{
+	HeapTuple	tasktup;
+	HeapTuple	newtup;
+	Datum		values[Natts_pg_qx_task];
+	bool		nulls[Natts_pg_qx_task];
+	bool		replaces[Natts_pg_qx_task];
+
+	tasktup = SearchSysCache1(QXTASKOID, ObjectIdGetDatum(taskoid));
+	if (!HeapTupleIsValid(tasktup))
+		elog(ERROR, "cache lookup failed for QhapaqXian task %u", taskoid);
+
+	memset(values, 0, sizeof(values));
+	memset(nulls, false, sizeof(nulls));
+	memset(replaces, false, sizeof(replaces));
+
+	values[Anum_pg_qx_task_qxtaskstate - 1] = CharGetDatum(state);
+	replaces[Anum_pg_qx_task_qxtaskstate - 1] = true;
+
+	if (replace_attempt)
+	{
+		values[Anum_pg_qx_task_qxtasklastattemptid - 1] =
+			ObjectIdGetDatum(lastattemptid);
+		replaces[Anum_pg_qx_task_qxtasklastattemptid - 1] = true;
+	}
+
+	if (replace_checkpoint)
+	{
+		values[Anum_pg_qx_task_qxtasklastcheckpointid - 1] =
+			ObjectIdGetDatum(lastcheckpointid);
+		replaces[Anum_pg_qx_task_qxtasklastcheckpointid - 1] = true;
+	}
+
+	newtup = heap_modify_tuple(tasktup, RelationGetDescr(taskrel),
+							   values, nulls, replaces);
+	CatalogTupleUpdate(taskrel, &tasktup->t_self, newtup);
+
+	heap_freetuple(newtup);
+	ReleaseSysCache(tasktup);
+	CommandCounterIncrement();
+}
+
+void
+QxCatalogUpdateAttemptState(Relation attemptrel, Oid attemptoid, char state)
+{
+	HeapTuple	attempttup;
+	HeapTuple	newtup;
+	Datum		values[Natts_pg_qx_attempt];
+	bool		nulls[Natts_pg_qx_attempt];
+	bool		replaces[Natts_pg_qx_attempt];
+
+	attempttup = SearchSysCache1(QXATTEMPTOID, ObjectIdGetDatum(attemptoid));
+	if (!HeapTupleIsValid(attempttup))
+		elog(ERROR, "cache lookup failed for QhapaqXian attempt %u", attemptoid);
+
+	memset(values, 0, sizeof(values));
+	memset(nulls, false, sizeof(nulls));
+	memset(replaces, false, sizeof(replaces));
+
+	values[Anum_pg_qx_attempt_qxattemptstate - 1] = CharGetDatum(state);
+	replaces[Anum_pg_qx_attempt_qxattemptstate - 1] = true;
+
+	newtup = heap_modify_tuple(attempttup, RelationGetDescr(attemptrel),
+							   values, nulls, replaces);
+	CatalogTupleUpdate(attemptrel, &attempttup->t_self, newtup);
+
+	heap_freetuple(newtup);
+	ReleaseSysCache(attempttup);
+	CommandCounterIncrement();
+}
+
+void
+QxCatalogChargeTaskBudget(Relation taskrel, Oid taskoid,
+						  int32 token_delta, int32 cost_delta,
+						  const char *charge_name)
+{
+	QxCatalogTaskInfo task;
+	HeapTuple	tasktup;
+	HeapTuple	newtup;
+	Datum		values[Natts_pg_qx_task];
+	bool		nulls[Natts_pg_qx_task];
+	bool		replaces[Natts_pg_qx_task];
+	int32		new_tokens;
+	int32		new_cost;
+
+	if (!QxCatalogLookupTaskByOid(taskoid, &task))
+		elog(ERROR, "cache lookup failed for QhapaqXian task %u", taskoid);
+
+	new_tokens = task.consumed_tokens + token_delta;
+	new_cost = task.consumed_cost + cost_delta;
+
+	if (task.budget_tokens > 0 && new_tokens > task.budget_tokens)
+	{
+		QxCatalogFreeTaskInfo(&task);
+		ereport(ERROR,
+				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+				 errmsg("runtime token budget exceeded for task %u", taskoid),
+				 errdetail("Charge \"%s\" would move token usage to %d, above the ceiling %d.",
+						   charge_name, new_tokens, task.budget_tokens)));
+	}
+
+	if (task.budget_cost > 0 && new_cost > task.budget_cost)
+	{
+		QxCatalogFreeTaskInfo(&task);
+		ereport(ERROR,
+				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+				 errmsg("runtime cost budget exceeded for task %u", taskoid),
+				 errdetail("Charge \"%s\" would move cost usage to %d, above the ceiling %d.",
+						   charge_name, new_cost, task.budget_cost)));
+	}
+
+	QxCatalogFreeTaskInfo(&task);
+
+	tasktup = SearchSysCache1(QXTASKOID, ObjectIdGetDatum(taskoid));
+	if (!HeapTupleIsValid(tasktup))
+		elog(ERROR, "cache lookup failed for QhapaqXian task %u", taskoid);
+
+	memset(values, 0, sizeof(values));
+	memset(nulls, false, sizeof(nulls));
+	memset(replaces, false, sizeof(replaces));
+
+	values[Anum_pg_qx_task_qxtaskconsumedtokens - 1] = Int32GetDatum(new_tokens);
+	values[Anum_pg_qx_task_qxtaskconsumedcost - 1] = Int32GetDatum(new_cost);
+	replaces[Anum_pg_qx_task_qxtaskconsumedtokens - 1] = true;
+	replaces[Anum_pg_qx_task_qxtaskconsumedcost - 1] = true;
+
+	newtup = heap_modify_tuple(tasktup, RelationGetDescr(taskrel),
+							   values, nulls, replaces);
+	CatalogTupleUpdate(taskrel, &tasktup->t_self, newtup);
+
+	heap_freetuple(newtup);
+	ReleaseSysCache(tasktup);
+	CommandCounterIncrement();
 }

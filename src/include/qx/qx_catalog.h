@@ -17,6 +17,9 @@
 #include "nodes/pg_list.h"
 #include "qx/qx_scheduler.h"
 
+struct RelationData;
+typedef struct RelationData *Relation;
+
 typedef struct QxCatalogAgentInfo
 {
 	Oid			oid;
@@ -263,5 +266,14 @@ extern bool QxCatalogLookupLatestSchedulerLease(Oid dboid, Oid taskoid,
 extern int16 QxCatalogMaxStepSeqnoForTask(Oid dboid, Oid taskoid);
 extern void QxCatalogFreeSchedulerQueueSnapshot(QxSchedulerQueueSnapshot *snapshot);
 extern void QxCatalogFreeSchedulerLeaseSnapshot(QxSchedulerLeaseSnapshot *snapshot);
+
+extern void QxCatalogUpdateTaskRuntime(Relation taskrel, Oid taskoid, char state,
+									   Oid lastattemptid, bool replace_attempt,
+									   Oid lastcheckpointid, bool replace_checkpoint);
+extern void QxCatalogUpdateAttemptState(Relation attemptrel, Oid attemptoid,
+										char state);
+extern void QxCatalogChargeTaskBudget(Relation taskrel, Oid taskoid,
+									  int32 token_delta, int32 cost_delta,
+									  const char *charge_name);
 
 #endif							/* QX_CATALOG_H */

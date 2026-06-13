@@ -22,9 +22,6 @@ Snapshot date:
 Last validated test sweep:
 - Windows: `meson compile -C build-stage4-codex -j 2`
 - Windows: `meson test -C build-stage4-codex --suite postgresql:setup --print-errorlogs`
-- Windows: `meson test -C build-stage4-codex regress/regress --print-errorlogs`
-  passed 225/225 subtests after constraining pg_regress temp-cluster scheduler
-  workers to the canonical `regression` database
 - Windows: `meson test -C build-stage4-codex --suite postgresql:qhapaqxian_output --print-errorlogs`
 - Windows: focused `qx_stage3_agentic` regression with Docker real, QEMU
   `microvm`/`tcg`, autonomous scheduler launcher/database bgworkers,
@@ -43,7 +40,14 @@ Last validated test sweep:
 - WSL Ubuntu 24.04: `meson test -C build-kvm --suite postgresql:setup --print-errorlogs`
 - WSL Ubuntu 24.04: `QX_MICROVM_ACCEL=kvm meson test -C build-kvm --suite postgresql:qhapaqxian_output --print-errorlogs`
 - WSL Ubuntu 24.04: focused `qx_stage3_agentic` regression with microVM KVM and Docker real
-- result: Windows setup/output OK; WSL setup/output OK; focused real-backend regressions OK
+- Windows follow-up on 2026-06-12: `qhapaqxian_output` passed; focused `qx_stage3_agentic`
+  microVM/trace normalization passed after receipt-tail stripping, but the container lane
+  still requires a stable Docker Desktop daemon on Windows (daemon dropouts fail the
+  real-backend lane fail-closed); full `regress/regress` 225-subtest sweep not re-run in
+  this follow-up sweep
+- result: Windows setup/output OK; WSL setup/output OK; prior focused real-backend
+  regressions OK; Stage 35 follow-up partial on Windows pending stable Docker for the
+  container lane
 
 Status legend:
 - `yes` = present and wired
@@ -85,9 +89,10 @@ Status legend:
 | 29 capability-aware planner/executor | yes | yes | yes | yes | planner/executor now materialize explicit submit/resume capability routes, persist them in `pg_qx_task`, and runtime/retry/recovery consume those routes instead of first/last contract heuristics |
 | 30 security/tool capability contract | yes | yes | yes | yes | namespace policy `USING` contracts now enforce required/denied capability tags during tool authorization and `CREATE AGENT`; OS-level OCI/VM policy compilation and stronger provenance remain future hardening |
 | 31 semantic payload v2 | yes | yes | yes | yes | v2 payloads cover verified execution events, but the replication surface is still logical-message text rather than a deeper WAL family |
-| 32 catalog snapshot helper layer | yes | yes | partial | partial | recovery, planner, security, commands, and runtime scheduler reads now use `qx_catalog` helpers including latest queue/lease snapshots and step seqno; runtime write paths still use syscache for task/attempt updates and principal/runtime-class stats views still scan traces |
+| 32 catalog snapshot helper layer | yes | yes | partial | partial | recovery, planner, security, commands, and runtime scheduler reads now use `qx_catalog` helpers including latest queue/lease snapshots and step seqno; runtime task/attempt/budget writes moved behind `qx_catalog` in Stage 35, but remaining runtime insert paths and principal/runtime-class stats views still scan traces |
 | 33 stats collector and runtime hardening | yes | yes | partial | partial | `qx_stat` shared-memory collector, `qhapaqxian.track_stats`, catalog scheduler helpers, runtime policy/supervisor, typed launch requests, KVM CI workflow, and `qx_stage3_observability` landed; historical stats and full OCI/VM policy compilation remain open |
 | 34 observability collector v2 | yes | yes | partial | partial | `pg_qx_stat_get_principal_stats`, `pg_qx_stat_get_runtime_class_stats`, collector-backed `pg_stat_qx_principals`/`pg_stat_qx_runtime_classes`, and extended `qx_stage3_observability` landed; historical/SLO accounting and operator dashboards remain open |
+| 35 CI loopback path, backend IDs, catalog runtime writes | yes | yes | partial | partial | `qhapaqxian_output` loopback resume path, real `container_id`/`vm_id` trace evidence, meson microVM/container env wiring, `qx_catalog` runtime write helpers, and duplicate receipt-tail stripping in runtime/`SHOW TRACE` landed; remaining runtime insert paths, scheduler ledger writes, and full OCI/VM lifecycle ownership remain open |
 
 Canonical next-gap summary:
 - strongest remaining platform gap: deepen OCI cgroup/seccomp policy compilation and cross-process VM lifecycle ownership beyond the new supervisor registry;

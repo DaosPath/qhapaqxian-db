@@ -275,10 +275,39 @@ qx_replace_trace_delimited_value_all(const char *source, const char *key,
 }
 
 static char *
+qx_normalize_trace_detail_strip_receipt_tail(const char *source)
+{
+	const char *cursor;
+	const char *duplicate;
+
+	if (source == NULL)
+		return NULL;
+
+	cursor = strstr(source, ";tokens=");
+	if (cursor != NULL)
+	{
+		duplicate = strstr(cursor + strlen(";tokens="), ";tokens=");
+		if (duplicate != NULL)
+			return pnstrdup(source, duplicate - source);
+	}
+
+	cursor = strstr(source, ";detail=");
+	if (cursor != NULL)
+	{
+		duplicate = strstr(cursor + strlen(";detail="), ";detail=");
+		if (duplicate != NULL)
+			return pnstrdup(source, duplicate - source);
+	}
+
+	return pstrdup(source);
+}
+
+static char *
 qx_normalize_trace_detail(const char *detail, Oid taskoid)
 {
 	char	   *task_fragment;
 	char	   *task_equals_fragment;
+	char	   *stripped;
 	char	   *normalized;
 	char	   *rewritten;
 	char	   *microvm_accel;
@@ -291,9 +320,11 @@ qx_normalize_trace_detail(const char *detail, Oid taskoid)
 	if (detail == NULL)
 		return NULL;
 
+	stripped = qx_normalize_trace_detail_strip_receipt_tail(detail);
+
 	task_fragment = psprintf("task %u", taskoid);
 	task_equals_fragment = psprintf("task=%u", taskoid);
-	normalized = qx_replace_trace_fragment(detail, task_fragment, "task <task>");
+	normalized = qx_replace_trace_fragment(stripped, task_fragment, "task <task>");
 	rewritten = qx_replace_trace_fragment(normalized, task_equals_fragment,
 										  "task=<task>");
 	microvm_accel = qx_replace_trace_delimited_value(rewritten,
@@ -305,15 +336,26 @@ qx_normalize_trace_detail(const char *detail, Oid taskoid)
 	container_id = qx_replace_trace_delimited_value_all(microvm_kernel,
 													  "container_id=",
 													  "<container_id>");
-	vm_id = qx_replace_trace_delimited_value_all(container_id,
-												 "vm_id=",
-												 "<vm_id>");
+	{
+		char	   *vm_id_pass2;
+
+		vm_id = qx_replace_trace_delimited_value_all(container_id,
+													 "vm_id=",
+													 "<vm_id>");
+		vm_id_pass2 = qx_replace_trace_delimited_value_all(vm_id,
+														   "vm_id=",
+														   "<vm_id>");
+		if (vm_id_pass2 != vm_id)
+			pfree(vm_id);
+		vm_id = vm_id_pass2;
+	}
 	restricted_identity = qx_replace_trace_delimited_value(vm_id,
 														   "restricted_identity=",
 														   "<identity>");
 	final_detail = qx_replace_trace_numeric_value(restricted_identity, "wall_ms=", "<ms>");
 	pfree(task_fragment);
 	pfree(task_equals_fragment);
+	pfree(stripped);
 	pfree(normalized);
 	pfree(rewritten);
 	pfree(microvm_accel);
@@ -321,6 +363,11 @@ qx_normalize_trace_detail(const char *detail, Oid taskoid)
 	pfree(container_id);
 	pfree(vm_id);
 	pfree(restricted_identity);
+
+	stripped = qx_normalize_trace_detail_strip_receipt_tail(final_detail);
+	pfree(final_detail);
+	final_detail = qx_replace_trace_delimited_value_all(stripped, "vm_id=", "<vm_id>");
+	pfree(stripped);
 
 	return final_detail;
 }
