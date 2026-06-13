@@ -502,7 +502,15 @@ SELECT qxtracename::text AS trace_name,
       END AS expected_attestation,
        qxtracedetail LIKE '%launch_mode=profiled_process%' AS has_launch_mode,
        qxtracedetail LIKE '%restricted_identity=%' AS has_restricted_identity,
-       qxtracedetail LIKE '%wall_ms=%' AS has_wall_time
+       qxtracedetail LIKE '%wall_ms=%' AS has_wall_time,
+       CASE
+         WHEN qxtracename = 'runtime.external_resume' THEN qxtracedetail LIKE '%vm_id=%'
+         ELSE true
+       END AS has_vm_id,
+       CASE
+         WHEN qxtracename = 'runtime.external_resume' THEN qxtracedetail NOT LIKE '%vm_id=;%'
+         ELSE true
+       END AS vm_id_populated
 FROM pg_qx_trace
 WHERE qxtracename IN ('runtime.external_submit', 'runtime.external_resume')
 ORDER BY oid;

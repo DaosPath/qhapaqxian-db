@@ -3,7 +3,7 @@
 ## Stage intent
 
 Stage 35 stabilizes hosted CI for `qhapaqxian_output`, surfaces real
-container/microVM instance IDs in runtime traces, and moves the first runtime
+container/microVM instance IDs in runtime traces, and moves runtime catalog
 write paths behind `qx_catalog` helpers.
 
 ## What landed
@@ -23,8 +23,13 @@ write paths behind `qx_catalog` helpers.
 - `qx_catalog` gained `QxCatalogUpdateTaskRuntime`,
   `QxCatalogUpdateAttemptState`, and `QxCatalogChargeTaskBudget`; runtime no
   longer open-codes those syscache writes.
-- `qx_stage3_agentic` asserts `has_container_id` and
-  `container_id_populated` on the real Docker submit trace.
+- Stage 32 follow-up migrated all runtime insert paths and scheduler ledger
+  writes to `QxCatalogInsert*` helpers.
+- Runner responses emit top-level `CONTAINER_ID` / `VM_ID` lines; runtime
+  parses them into trace payloads and supervisor lease registration.
+- `qx_stage3_agentic` asserts `has_container_id` / `container_id_populated`
+  on the real Docker submit trace and `has_vm_id` / `vm_id_populated` on the
+  real QEMU microVM resume trace.
 
 ## What is intentionally deferred
 
@@ -32,8 +37,6 @@ write paths behind `qx_catalog` helpers.
 - Deeper cross-process microVM lifecycle ownership beyond supervisor
   register/release.
 - Historical/SLO accounting and operator dashboards (Stage 34 follow-up).
-- Remaining runtime insert paths (`qx_insert_*`) and scheduler ledger writes
-  still live in `qx_runtime.c`.
 
 ## Why this stage matters
 
@@ -50,7 +53,6 @@ catalog writes now follow the same consolidation direction as Stage 32 reads.
   `PG_TEST_EXTRA=docker`, `QX_CONTAINER_IMAGE=alpine:3.20`, and TCG microVM
   assets under `build-stage4-codex/microvm-assets/`
 - Windows: `meson test -C build-stage4-codex regress/regress --print-errorlogs`
-  (full 225-subtest sweep)
 
 ## Files touched
 
@@ -64,8 +66,6 @@ catalog writes now follow the same consolidation direction as Stage 32 reads.
 
 ## Next stage handoff
 
-- Migrate remaining runtime catalog inserts and scheduler ledger writes into
-  `qx_catalog`.
-- Extend receipt/trace contracts so runner receipts include `container_id` /
-  `vm_id` at the top level consistently.
+- Deepen OCI cgroup/seccomp policy compilation and cross-process VM lifecycle
+  ownership beyond the in-memory supervisor registry.
 - Add historical stats persistence on top of the Stage 34 collector surfaces.
