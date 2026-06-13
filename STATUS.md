@@ -45,13 +45,11 @@ Last validated test sweep:
   (`qx_replace_trace_delimited_value_all` suffix duplication) and refreshing
   `expected/qx_stage3_agentic.out`; full `regress/regress` passed 226 subtests after
   refreshing `expected/rules.out` for stats-backed principal/provider/runtime views;
-  `postgresql:qhapaqxian_output` still needs `semantic_messages` expected refresh in
-  this follow-up (decoder output drift under the refreshed trace normalization)
-- result: Windows `qx_stage3_agentic` + full `regress/regress` (226) OK for the Stage 35
-  trace/stats follow-up; `qhapaqxian_output` hit an isolated microVM resume timeout on
-  this machine (120000 ms TCG ceiling) and needs a re-run when QEMU is faster; WSL
-  setup/output OK from prior sweep; real-backend lanes remain fail-closed when Docker
-  Desktop or microVM assets are unavailable
+  `postgresql:qhapaqxian_output` passed on re-run (2026-06-12 evening sweep)
+- result: Windows Stage 35 follow-up complete on this machine: `qx_stage3_agentic`,
+  full `regress/regress` (226), and `qhapaqxian_output` all OK with Docker real and
+  QEMU/TCG microVM; WSL setup/output OK from prior sweep; real-backend lanes remain
+  fail-closed when Docker Desktop or microVM assets are unavailable
 
 Status legend:
 - `yes` = present and wired
