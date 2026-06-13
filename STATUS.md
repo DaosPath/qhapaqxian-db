@@ -17,7 +17,7 @@ Documentation hierarchy:
 - `docs/stage-*/README.md` = stage-local landed contracts and notes
 
 Snapshot date:
-- `2026-06-12`
+- `2026-06-13`
 
 Last validated test sweep:
 - Windows: `meson compile -C build-stage4-codex -j 2`
@@ -58,6 +58,12 @@ Last validated test sweep:
 - Windows sweep on 2026-06-12 (Stages 26–27): collector-backed scheduler/recovery stats
   plane, `pg_qx_recovery_scan()`, `qx_stage26_scheduler`, and `qx_stage27_recovery`
   landed; load-adaptive slot scaling and semantic replay remain intentional deferrals
+- Windows sweep on 2026-06-13 (hygiene after Stages 26–27): refreshed
+  `expected/rules.out` and `expected/qx_stage3_agentic.out` for recovery suppressed-count
+  trace fields and rules display ordering; full `regress/regress` passed **231/231**
+  subtests with Docker real and QEMU/TCG microVM
+- result: hygiene sweep complete on this machine; canonical regress ledger is 231/231
+  with Stages 26–27 landed and expected outputs synchronized
 
 Status legend:
 - `yes` = present and wired
@@ -73,12 +79,12 @@ Status legend:
 | 3 parser/AST/utility | yes | yes | yes | partial | agent surface still enters through utility path, not deep core execution |
 | 4 engine catalogs | yes | yes | yes | partial | durable agent/session/task catalogs are in-tree, and the stage now has a dedicated doc; the remaining gap is a standalone runtime demo |
 | 5 vertical slice | yes | yes | yes | yes | still single-node and synthetic in shape compared to final runtime model |
-| 6 embedded runtime boundary | yes | yes | yes | yes | runtime is embedded, but not yet a full autonomous scheduler plane |
+| 6 embedded runtime boundary | yes | yes | yes | yes | embedded runtime is real and Stage 26 adds autonomous launcher/database bgworkers; load-adaptive slot scaling remains an intentional deferral |
 | 7 checkpoints/resume | yes | yes | yes | yes | semantics are durable, but compensation/long-horizon recovery are still shallow |
 | 8 planner/executor boundary | yes | yes | yes | yes | `AgentPlan` is real, but still narrower than a full agent-aware optimizer |
 | 9 semantic WAL/decoder | yes | yes | yes | yes | logical-message boundary exists; no dedicated WAL record family or downstream subscription control |
 | 10 memory/trace surface | yes | yes | yes | yes | memory still lives on ordinary catalogs/storage; no deeper AM/vector specialization |
-| 11 operability surface | yes | yes | yes | partial | system views now include scheduler queue/worker/activity rollups plus retry-backoff and worker-balance visibility, but there is still no dedicated stats collector or broader operator dashboard |
+| 11 operability surface | yes | yes | yes | partial | `qx_stat` collector and `pg_stat_qx_*` views now cover scheduler queue/worker/activity, retry-backoff, worker-balance, principal/runtime-class, and recovery rollups (Stages 26–27, 33–34); historical/SLO accounting and a broader operator dashboard remain open |
 | 12 security seed | yes | yes | yes | partial | owner filtering/revocation landed, but not full namespace isolation |
 | 13 identity snapshots | yes | yes | yes | yes | identity is durable, but policy evaluation still snapshots rather than fully dynamic |
 | 14 namespace policy/runtime metering | yes | yes | yes | yes | metering is engine-owned; not yet reconciled with external provider billing truth |
@@ -95,13 +101,13 @@ Status legend:
 | 25 microVM backend scaffold | yes | yes | yes | yes | MicroVM asset policy resolves kernel/initrd/snapshot refs with allowlist validation, launch payloads emit `kernel_ref`/`initrd_ref`, `qx_stage25_microvm_policy` regress, and self-hosted KVM CI; hypervisor process ownership and snapshot lifecycle remain intentional deferrals |
 | 26 scheduler scaffold | yes | yes | yes | yes | durable queue/lease/heartbeat catalogs, autonomous launcher/database bgworkers, configurable bounded per-database slot ownership with default 2, lease renewal/reclaim/retry/dead-letter supervision, ledger-backed queue/worker/activity/backoff/balance views, dedicated collector-backed scheduler stats via `pg_qx_stat_get_scheduler_activity_stats()` and `pg_stat_qx_scheduler_collected`, and `qx_stage26_scheduler` regress; load-adaptive slot scaling remains an intentional deferral |
 | 27 recovery scanner scaffold | yes | yes | yes | yes | startup recovery, failover rebuild, and autonomous scheduler supervision drive real scheduler requeue/reclaim writes with ledger-local dedupe, read-only `pg_qx_recovery_scan()` exposes suppressed requeue/fence counts, collector-backed recovery stats via `pg_qx_stat_get_recovery_stats()` and `pg_stat_qx_recovery`, and `qx_stage27_recovery` regress; deeper semantic replay and replication-fed supervision remain intentional deferrals |
-| 28 observability scaffold | yes | yes | partial | partial | `qx_observe` backs `SHOW TRACE` summaries and scheduler activity views; Stage 33–34 add shared-memory `qx_stat`, provider/principal/runtime-class SRFs, collector-backed `pg_stat_qx_*` views, and `qx_stage3_observability`; historical/SLO accounting remains open |
+| 28 observability scaffold | yes | yes | partial | partial | `qx_observe` backs `SHOW TRACE` summaries; Stages 26–27 add collector-backed scheduler/recovery stats and `pg_stat_qx_scheduler_collected`/`pg_stat_qx_recovery`; Stages 33–34 add shared-memory `qx_stat`, provider/principal/runtime-class SRFs, and `qx_stage3_observability`; historical/SLO accounting remains open |
 | 29 capability-aware planner/executor | yes | yes | yes | yes | planner/executor now materialize explicit submit/resume capability routes, persist them in `pg_qx_task`, and runtime/retry/recovery consume those routes instead of first/last contract heuristics |
 | 30 security/tool capability contract | yes | yes | yes | yes | namespace policy `USING` contracts now enforce required/denied capability tags during tool authorization and `CREATE AGENT`; OS-level OCI/VM policy compilation and stronger provenance remain future hardening |
 | 31 semantic payload v2 | yes | yes | yes | yes | v2 payloads cover verified execution events, but the replication surface is still logical-message text rather than a deeper WAL family |
 | 32 catalog snapshot helper layer | yes | yes | yes | partial | recovery, planner, security, commands, runtime scheduler reads/writes, DDL tuple inserts for identity/agent/session/memory/policy objects, provider/principal/runtime-class stats SRFs, and `qx_stage32_catalog` regression now use `qx_catalog` helpers; ALTER-command catalog updates remain in command layers |
-| 33 stats collector and runtime hardening | yes | yes | partial | partial | `qx_stat` shared-memory collector, `qhapaqxian.track_stats`, catalog scheduler helpers, runtime policy/supervisor, typed launch requests, KVM CI workflow, and `qx_stage3_observability` landed; historical stats and full OCI/VM policy compilation remain open |
-| 34 observability collector v2 | yes | yes | partial | partial | `pg_qx_stat_get_principal_stats`, `pg_qx_stat_get_runtime_class_stats`, collector-backed `pg_stat_qx_principals`/`pg_stat_qx_runtime_classes`, and extended `qx_stage3_observability` landed; historical/SLO accounting and operator dashboards remain open |
+| 33 stats collector and runtime hardening | yes | yes | partial | partial | `qx_stat` shared-memory collector, `qhapaqxian.track_stats`, catalog scheduler helpers, runtime policy/supervisor, typed launch requests, KVM CI workflow, `qx_stage3_observability`, and Stage 26–27 scheduler/recovery collector SRFs landed; historical stats and full OCI/VM policy compilation remain open |
+| 34 observability collector v2 | yes | yes | partial | partial | `pg_qx_stat_get_principal_stats`, `pg_qx_stat_get_runtime_class_stats`, collector-backed `pg_stat_qx_principals`/`pg_stat_qx_runtime_classes`, Stage 26–27 scheduler/recovery collector views, and extended `qx_stage3_observability` landed; historical/SLO accounting and operator dashboards remain open |
 | 35 CI loopback path, backend IDs, catalog runtime writes | yes | yes | yes | partial | `qhapaqxian_output` loopback resume path, real `container_id`/`vm_id` trace evidence (runner top-level IDs + trace assertions), meson microVM/container env wiring, `qx_catalog` runtime update/insert helpers (Stage 32 follow-up), duplicate receipt-tail stripping in runtime/`SHOW TRACE`, and post-Stage-32 validation sweep landed; full OCI cgroup/seccomp and cross-process VM lifecycle ownership remain future work |
 
 Canonical next-gap summary:
