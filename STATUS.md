@@ -47,7 +47,9 @@ Last validated test sweep:
   refreshing `expected/rules.out` for stats-backed principal/provider/runtime views;
   `postgresql:qhapaqxian_output` still needs `semantic_messages` expected refresh in
   this follow-up (decoder output drift under the refreshed trace normalization)
-- result: Windows setup/output/regress OK for the Stage 35 trace/stats follow-up; WSL
+- result: Windows `qx_stage3_agentic` + full `regress/regress` (226) OK for the Stage 35
+  trace/stats follow-up; `qhapaqxian_output` hit an isolated microVM resume timeout on
+  this machine (120000 ms TCG ceiling) and needs a re-run when QEMU is faster; WSL
   setup/output OK from prior sweep; real-backend lanes remain fail-closed when Docker
   Desktop or microVM assets are unavailable
 
