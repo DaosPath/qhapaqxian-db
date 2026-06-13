@@ -230,13 +230,13 @@ QxObserveRecordPrincipalExecution(QxObservePrincipalStats *stats, bool resume,
 		}
 		if (OidIsValid(principaloid))
 			QxStatReportPrincipalExecution(MyDatabaseId, principaloid, resume,
-										   checkpointed);
+										   checkpointed, false);
 	}
 
 	if (qhapaqxian_track_stats && stats->runtime_class != NULL &&
 		stats->runtime_class[0] != '\0')
 		QxStatReportRuntimeClassExecution(MyDatabaseId, stats->runtime_class,
-										  resume, checkpointed);
+										  resume, checkpointed, false);
 }
 
 void
@@ -260,7 +260,7 @@ QxObserveRecordRuntimeClassExecution(QxObserveRuntimeClassStats *stats,
 	if (qhapaqxian_track_stats && stats->runtime_class != NULL &&
 		stats->runtime_class[0] != '\0')
 		QxStatReportRuntimeClassExecution(MyDatabaseId, stats->runtime_class,
-										  resume, checkpointed);
+										  resume, checkpointed, false);
 }
 
 char *

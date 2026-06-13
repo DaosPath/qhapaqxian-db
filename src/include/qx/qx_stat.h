@@ -42,10 +42,12 @@ extern void QxStatShmemInit(void);
 extern void QxStatReportProviderExecution(Oid dboid, Oid provideroid,
 										  bool resume, bool receipt_verified);
 extern void QxStatReportPrincipalExecution(Oid dboid, Oid principaloid,
-										   bool resume, bool checkpointed);
+										   bool resume, bool checkpointed,
+										   bool receipt_verified);
 extern void QxStatReportRuntimeClassExecution(Oid dboid,
 											  const char *runtime_class,
-											  bool resume, bool checkpointed);
+											  bool resume, bool checkpointed,
+											  bool receipt_verified);
 extern void QxStatReportSchedulerEvent(Oid dboid, const char *event_name);
 extern void QxStatFlushPending(void);
 extern void QxStatReset(QxStatKind kind);

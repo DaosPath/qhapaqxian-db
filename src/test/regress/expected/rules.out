@@ -2100,21 +2100,19 @@ pg_stat_qx_principals| SELECT p.oid AS principal_oid,
     p.qxprincipalreceiptsigner AS receipt_signer,
     p.qxprincipalenabled AS enabled,
     (p.qxprincipalreceiptsigner IS NOT NULL) AS has_signer,
-    ( SELECT count(DISTINCT tr.qxtracetaskid) AS count
-           FROM pg_qx_trace tr
-          WHERE ((tr.qxtracename = ANY (ARRAY['runtime.external_submit'::text, 'runtime.external_resume'::text])) AND (pg_qx_trace_detail_value(tr.qxtracedetail, 'principal'::text) = p.qxprincipalname))) AS task_count,
-    ( SELECT count(*) AS count
-           FROM pg_qx_trace tr
-          WHERE ((tr.qxtracename = 'runtime.external_submit'::text) AND (pg_qx_trace_detail_value(tr.qxtracedetail, 'principal'::text) = p.qxprincipalname))) AS submit_count,
-    ( SELECT count(*) AS count
-           FROM pg_qx_trace tr
-          WHERE ((tr.qxtracename = 'runtime.external_resume'::text) AND (pg_qx_trace_detail_value(tr.qxtracedetail, 'principal'::text) = p.qxprincipalname))) AS resume_count,
-    ( SELECT count(*) AS count
-           FROM pg_qx_trace tr
-          WHERE ((tr.qxtracename = ANY (ARRAY['runtime.external_submit'::text, 'runtime.external_resume'::text])) AND (pg_qx_trace_detail_value(tr.qxtracedetail, 'principal'::text) = p.qxprincipalname) AND (pg_qx_trace_detail_value(tr.qxtracedetail, 'receipt_sig'::text) = 'verified'::text))) AS verified_receipt_count
-   FROM ((pg_qx_principal p
+    COALESCE(stats.execution_count, (0)::bigint) AS task_count,
+    COALESCE(stats.submit_count, (0)::bigint) AS submit_count,
+    COALESCE(stats.resume_count, (0)::bigint) AS resume_count,
+    COALESCE(stats.verified_receipts, (0)::bigint) AS verified_receipt_count
+   FROM (((pg_qx_principal p
      LEFT JOIN pg_namespace n ON ((n.oid = p.qxprincipalnamespace)))
      LEFT JOIN pg_qx_provider prov ON ((prov.oid = p.qxprincipalproviderid)))
+     LEFT JOIN LATERAL ( SELECT s.submit_count,
+            s.resume_count,
+            s.verified_receipts,
+            s.execution_count
+           FROM pg_qx_stat_get_principal_stats() s(principal_oid oid, principal_name text, provider_name text, provider_kind text, runtime_class text, sandbox_name text, program_name text, enabled boolean, has_signer boolean, submit_count bigint, resume_count bigint, verified_receipts bigint, rejected_receipts bigint, checkpoint_count bigint, execution_count bigint)
+          WHERE (s.principal_oid = p.oid)) stats ON (true))
   WHERE (pg_has_role(SESSION_USER, p.qxprincipalowner, 'USAGE'::text) OR pg_has_role(SESSION_USER, 'pg_read_all_stats'::name, 'MEMBER'::text));
 pg_stat_qx_providers| SELECT p.oid AS provider_oid,
     n.nspname AS schemaname,
@@ -2128,39 +2126,38 @@ pg_stat_qx_providers| SELECT p.oid AS provider_oid,
     ( SELECT count(*) AS count
            FROM pg_qx_principal pr
           WHERE (pr.qxprincipalproviderid = p.oid)) AS principal_count,
-    ( SELECT count(DISTINCT tr.qxtracetaskid) AS count
-           FROM pg_qx_trace tr
-          WHERE ((tr.qxtracename = ANY (ARRAY['runtime.external_submit'::text, 'runtime.external_resume'::text])) AND (pg_qx_trace_detail_value(tr.qxtracedetail, 'provider'::text) = p.qxprovidername))) AS task_count,
-    ( SELECT count(*) AS count
-           FROM pg_qx_trace tr
-          WHERE ((tr.qxtracename = 'runtime.external_submit'::text) AND (pg_qx_trace_detail_value(tr.qxtracedetail, 'provider'::text) = p.qxprovidername))) AS submit_count,
-    ( SELECT count(*) AS count
-           FROM pg_qx_trace tr
-          WHERE ((tr.qxtracename = 'runtime.external_resume'::text) AND (pg_qx_trace_detail_value(tr.qxtracedetail, 'provider'::text) = p.qxprovidername))) AS resume_count,
-    ( SELECT count(*) AS count
-           FROM pg_qx_trace tr
-          WHERE ((tr.qxtracename = ANY (ARRAY['runtime.external_submit'::text, 'runtime.external_resume'::text])) AND (pg_qx_trace_detail_value(tr.qxtracedetail, 'provider'::text) = p.qxprovidername) AND (pg_qx_trace_detail_value(tr.qxtracedetail, 'receipt_sig'::text) = 'verified'::text))) AS verified_receipt_count
-   FROM (pg_qx_provider p
+    COALESCE(stats.execution_count, (0)::bigint) AS task_count,
+    COALESCE(stats.submit_count, (0)::bigint) AS submit_count,
+    COALESCE(stats.resume_count, (0)::bigint) AS resume_count,
+    COALESCE(stats.verified_receipts, (0)::bigint) AS verified_receipt_count
+   FROM ((pg_qx_provider p
      LEFT JOIN pg_namespace n ON ((n.oid = p.qxprovidernamespace)))
+     LEFT JOIN LATERAL ( SELECT s.submit_count,
+            s.resume_count,
+            s.verified_receipts,
+            s.execution_count
+           FROM pg_qx_stat_get_provider_stats() s(provider_oid oid, provider_name text, provider_kind text, provider_endpoint text, enabled boolean, attestation_required boolean, submit_count bigint, resume_count bigint, verified_receipts bigint, rejected_receipts bigint, checkpoint_count bigint, execution_count bigint, task_count bigint, reserved bigint)
+          WHERE (s.provider_oid = p.oid)) stats ON (true))
   WHERE (pg_has_role(SESSION_USER, p.qxproviderowner, 'USAGE'::text) OR pg_has_role(SESSION_USER, 'pg_read_all_stats'::name, 'MEMBER'::text));
-pg_stat_qx_runtime_classes| SELECT qxprincipalruntimeclass AS runtime_class,
-    count(*) AS principal_count,
-    count(DISTINCT qxprincipalproviderid) AS provider_count,
-    ( SELECT count(DISTINCT tr.qxtracetaskid) AS count
-           FROM pg_qx_trace tr
-          WHERE ((tr.qxtracename = ANY (ARRAY['runtime.external_submit'::text, 'runtime.external_resume'::text])) AND (pg_qx_trace_detail_value(tr.qxtracedetail, 'principal_runtime'::text) = p.qxprincipalruntimeclass))) AS task_count,
-    ( SELECT count(*) AS count
-           FROM pg_qx_trace tr
-          WHERE ((tr.qxtracename = 'runtime.external_submit'::text) AND (pg_qx_trace_detail_value(tr.qxtracedetail, 'principal_runtime'::text) = p.qxprincipalruntimeclass))) AS submit_count,
-    ( SELECT count(*) AS count
-           FROM pg_qx_trace tr
-          WHERE ((tr.qxtracename = 'runtime.external_resume'::text) AND (pg_qx_trace_detail_value(tr.qxtracedetail, 'principal_runtime'::text) = p.qxprincipalruntimeclass))) AS resume_count,
-    ( SELECT count(*) AS count
-           FROM pg_qx_trace tr
-          WHERE ((tr.qxtracename = ANY (ARRAY['runtime.external_submit'::text, 'runtime.external_resume'::text])) AND (pg_qx_trace_detail_value(tr.qxtracedetail, 'principal_runtime'::text) = p.qxprincipalruntimeclass) AND (pg_qx_trace_detail_value(tr.qxtracedetail, 'receipt_sig'::text) = 'verified'::text))) AS verified_receipt_count
-   FROM pg_qx_principal p
-  WHERE (pg_has_role(SESSION_USER, qxprincipalowner, 'USAGE'::text) OR pg_has_role(SESSION_USER, 'pg_read_all_stats'::name, 'MEMBER'::text))
-  GROUP BY qxprincipalruntimeclass;
+pg_stat_qx_runtime_classes| SELECT catalog.runtime_class,
+    catalog.principal_count,
+    catalog.provider_count,
+    COALESCE(stats.execution_count, (0)::bigint) AS task_count,
+    COALESCE(stats.submit_count, (0)::bigint) AS submit_count,
+    COALESCE(stats.resume_count, (0)::bigint) AS resume_count,
+    COALESCE(stats.verified_receipts, (0)::bigint) AS verified_receipt_count
+   FROM (( SELECT p.qxprincipalruntimeclass AS runtime_class,
+            count(*) AS principal_count,
+            count(DISTINCT p.qxprincipalproviderid) AS provider_count
+           FROM pg_qx_principal p
+          WHERE (pg_has_role(SESSION_USER, p.qxprincipalowner, 'USAGE'::text) OR pg_has_role(SESSION_USER, 'pg_read_all_stats'::name, 'MEMBER'::text))
+          GROUP BY p.qxprincipalruntimeclass) catalog
+     LEFT JOIN LATERAL ( SELECT s.submit_count,
+            s.resume_count,
+            s.verified_receipts,
+            s.execution_count
+           FROM pg_qx_stat_get_runtime_class_stats() s(runtime_class text, submit_count bigint, resume_count bigint, verified_receipts bigint, rejected_receipts bigint, checkpoint_count bigint, execution_count bigint, reserved bigint)
+          WHERE (s.runtime_class = catalog.runtime_class)) stats ON (true));
 pg_stat_qx_scheduler_activity| WITH visible_queue AS (
          SELECT q.oid,
             q.qxqueueledgerdbid,

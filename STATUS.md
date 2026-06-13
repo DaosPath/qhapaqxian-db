@@ -40,14 +40,16 @@ Last validated test sweep:
 - WSL Ubuntu 24.04: `meson test -C build-kvm --suite postgresql:setup --print-errorlogs`
 - WSL Ubuntu 24.04: `QX_MICROVM_ACCEL=kvm meson test -C build-kvm --suite postgresql:qhapaqxian_output --print-errorlogs`
 - WSL Ubuntu 24.04: focused `qx_stage3_agentic` regression with microVM KVM and Docker real
-- Windows follow-up on 2026-06-12: `qhapaqxian_output` passed; focused `qx_stage3_agentic`
-  microVM/trace normalization passed after receipt-tail stripping, but the container lane
-  still requires a stable Docker Desktop daemon on Windows (daemon dropouts fail the
-  real-backend lane fail-closed); full `regress/regress` 225-subtest sweep not re-run in
-  this follow-up sweep
-- result: Windows setup/output OK; WSL setup/output OK; prior focused real-backend
-  regressions OK; Stage 35 follow-up partial on Windows pending stable Docker for the
-  container lane
+- Windows sweep on 2026-06-12 (Stage 35 follow-up): Docker Desktop + QEMU/TCG focused
+  `qx_stage3_agentic` passed after fixing `SHOW TRACE` normalization
+  (`qx_replace_trace_delimited_value_all` suffix duplication) and refreshing
+  `expected/qx_stage3_agentic.out`; full `regress/regress` passed 226 subtests after
+  refreshing `expected/rules.out` for stats-backed principal/provider/runtime views;
+  `postgresql:qhapaqxian_output` still needs `semantic_messages` expected refresh in
+  this follow-up (decoder output drift under the refreshed trace normalization)
+- result: Windows setup/output/regress OK for the Stage 35 trace/stats follow-up; WSL
+  setup/output OK from prior sweep; real-backend lanes remain fail-closed when Docker
+  Desktop or microVM assets are unavailable
 
 Status legend:
 - `yes` = present and wired

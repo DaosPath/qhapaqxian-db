@@ -886,7 +886,7 @@ main(int argc, char **argv)
 	const char *receipt_schema;
 	const char *receipt_alg;
 	const char *attestation_mode;
-	char		detail[512];
+	char		detail[2048];
 	char		payload[4096];
 	char		receipt_sig[QX_RECEIPT_SIG_HEX_MAXLEN];
 #ifdef USE_OPENSSL

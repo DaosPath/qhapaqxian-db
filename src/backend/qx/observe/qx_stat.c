@@ -248,6 +248,7 @@ typedef struct QxStatPrincipalMutation
 {
 	bool		resume;
 	bool		checkpointed;
+	bool		receipt_verified;
 } QxStatPrincipalMutation;
 
 static void
@@ -261,11 +262,13 @@ qx_stat_mutate_principal(QxStatCounters *counters, void *ctx)
 		counters->submit_count++;
 	if (mutation->checkpointed)
 		counters->checkpoint_count++;
+	if (mutation->receipt_verified)
+		counters->verified_receipts++;
 }
 
 void
 QxStatReportPrincipalExecution(Oid dboid, Oid principaloid, bool resume,
-							   bool checkpointed)
+							   bool checkpointed, bool receipt_verified)
 {
 	QxStatPrincipalMutation mutation;
 
@@ -274,6 +277,7 @@ QxStatReportPrincipalExecution(Oid dboid, Oid principaloid, bool resume,
 
 	mutation.resume = resume;
 	mutation.checkpointed = checkpointed;
+	mutation.receipt_verified = receipt_verified;
 	qx_stat_with_entry(dboid, QX_STAT_PRINCIPAL, principaloid, NULL, true,
 					   qx_stat_mutate_principal, &mutation);
 }
@@ -289,11 +293,14 @@ qx_stat_mutate_runtime_class(QxStatCounters *counters, void *ctx)
 		counters->submit_count++;
 	if (mutation->checkpointed)
 		counters->checkpoint_count++;
+	if (mutation->receipt_verified)
+		counters->verified_receipts++;
 }
 
 void
 QxStatReportRuntimeClassExecution(Oid dboid, const char *runtime_class,
-								  bool resume, bool checkpointed)
+								  bool resume, bool checkpointed,
+								  bool receipt_verified)
 {
 	QxStatPrincipalMutation mutation;
 
@@ -304,6 +311,7 @@ QxStatReportRuntimeClassExecution(Oid dboid, const char *runtime_class,
 
 	mutation.resume = resume;
 	mutation.checkpointed = checkpointed;
+	mutation.receipt_verified = receipt_verified;
 	qx_stat_with_entry(dboid, QX_STAT_RUNTIME_CLASS, InvalidOid,
 					   runtime_class, true, qx_stat_mutate_runtime_class,
 					   &mutation);
@@ -462,17 +470,18 @@ qx_stat_report_from_trace(const char *trace_name, const char *trace_detail)
 		principaloid = qx_stat_lookup_principal_oid(principal_name);
 		if (OidIsValid(principaloid))
 			QxStatReportPrincipalExecution(MyDatabaseId, principaloid, resume,
-										   checkpointed);
+										   checkpointed, receipt_verified);
 
 		if (principal_runtime != NULL && principal_runtime[0] != '\0')
 			QxStatReportRuntimeClassExecution(MyDatabaseId, principal_runtime,
-											  resume, checkpointed);
+											  resume, checkpointed,
+											  receipt_verified);
 	}
 	else if (trace_name != NULL && checkpointed &&
 			 principal_runtime != NULL && principal_runtime[0] != '\0')
 	{
 		QxStatReportRuntimeClassExecution(MyDatabaseId, principal_runtime,
-										  false, true);
+										  false, true, false);
 	}
 	else if (trace_name != NULL && strcmp(trace_name, "runtime.retry_dispatch") == 0)
 		QxStatReportSchedulerEvent(MyDatabaseId, "retry_dispatch");

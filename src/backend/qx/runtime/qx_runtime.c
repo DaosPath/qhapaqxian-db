@@ -2448,7 +2448,7 @@ static void
 qx_read_external_result(const char *path, QxExternalToolResult *result)
 {
 	FILE	   *file;
-	char		line[1024];
+	char		line[8192];
 
 	file = AllocateFile(path, "r");
 	if (file == NULL)
@@ -2463,6 +2463,8 @@ qx_read_external_result(const char *path, QxExternalToolResult *result)
 		char	   *eq;
 		char	   *key;
 		char	   *value;
+		size_t		value_len;
+		bool		partial_line;
 
 		eq = strchr(line, '=');
 		if (eq == NULL)
@@ -2470,14 +2472,33 @@ qx_read_external_result(const char *path, QxExternalToolResult *result)
 		*eq = '\0';
 		key = line;
 		value = eq + 1;
-		value[strcspn(value, "\r\n")] = '\0';
+		value_len = strcspn(value, "\r\n");
+		value[value_len] = '\0';
+		partial_line = (value_len == sizeof(line) - (value - line) - 1 &&
+						strchr(value, '\n') == NULL &&
+						!feof(file));
 
 		if (strcmp(key, "TOKENS") == 0)
 			result->token_charge = pg_strtoint32(value);
 		else if (strcmp(key, "COST") == 0)
 			result->cost_charge = pg_strtoint32(value);
 		else if (strcmp(key, "DETAIL") == 0)
-			result->detail = pstrdup(value);
+		{
+			StringInfoData detail_buf;
+
+			initStringInfo(&detail_buf);
+			appendStringInfoString(&detail_buf, value);
+			while (partial_line && fgets(line, sizeof(line), file) != NULL)
+			{
+				char	   *newline = strchr(line, '\n');
+
+				if (newline != NULL)
+					*newline = '\0';
+				appendStringInfoString(&detail_buf, line);
+				partial_line = (newline == NULL);
+			}
+			result->detail = detail_buf.data;
+		}
 		else if (strcmp(key, "TOOL") == 0)
 			result->tool_name = pstrdup(value);
 		else if (strcmp(key, "PRINCIPAL") == 0)
@@ -2532,21 +2553,13 @@ qx_read_external_result(const char *path, QxExternalToolResult *result)
 }
 
 static char *
-qx_strip_duplicate_receipt_tail(const char *source)
+qx_strip_duplicate_receipt_tail_once(const char *source)
 {
 	const char *cursor;
 	const char *duplicate;
 
 	if (source == NULL)
 		return NULL;
-
-	cursor = strstr(source, ";tokens=");
-	if (cursor != NULL)
-	{
-		duplicate = strstr(cursor + strlen(";tokens="), ";tokens=");
-		if (duplicate != NULL)
-			return pnstrdup(source, duplicate - source);
-	}
 
 	cursor = strstr(source, ";detail=");
 	if (cursor != NULL)
@@ -2556,7 +2569,116 @@ qx_strip_duplicate_receipt_tail(const char *source)
 			return pnstrdup(source, duplicate - source);
 	}
 
-	return pstrdup(source);
+	cursor = strstr(source, ";tokens=");
+	if (cursor != NULL)
+	{
+		duplicate = strstr(cursor + strlen(";tokens="), ";tokens=");
+		if (duplicate != NULL)
+			return pnstrdup(source, duplicate - source);
+	}
+
+	cursor = strstr(source, ";launch_mode=");
+	if (cursor != NULL)
+	{
+		duplicate = strstr(cursor + strlen(";launch_mode="), ";launch_mode=");
+		if (duplicate != NULL)
+			return pnstrdup(source, duplicate - source);
+	}
+
+	return NULL;
+}
+
+static char *
+qx_strip_duplicate_receipt_tail(const char *source)
+{
+	char	   *stripped;
+	char	   *next;
+
+	if (source == NULL)
+		return NULL;
+
+	stripped = pstrdup(source);
+	for (;;)
+	{
+		next = qx_strip_duplicate_receipt_tail_once(stripped);
+		if (next == NULL)
+			break;
+		pfree(stripped);
+		stripped = next;
+	}
+
+	return stripped;
+}
+
+static char *
+qx_truncate_detail_after_wall_ms(const char *source)
+{
+	const char *wall_ms;
+	const char *cursor;
+
+	if (source == NULL)
+		return NULL;
+
+	wall_ms = strstr(source, ";wall_ms=");
+	if (wall_ms == NULL)
+		return pstrdup(source);
+
+	cursor = wall_ms + strlen(";wall_ms=");
+	while (*cursor >= '0' && *cursor <= '9')
+		cursor++;
+
+	return pnstrdup(source, cursor - source);
+}
+
+static char *
+qx_strip_external_trace_payload(const char *source)
+{
+	char	   *stripped;
+	const char *detail_marker;
+
+	if (source == NULL)
+		return NULL;
+
+	stripped = qx_strip_duplicate_receipt_tail(source);
+	detail_marker = strstr(stripped, ";detail=");
+	if (detail_marker != NULL)
+	{
+		const char *inner_detail = detail_marker + strlen(";detail=");
+		const char *tokens_in_inner = strstr(inner_detail, ";tokens=");
+		const char *detail_dup = strstr(inner_detail, ";detail=");
+		const char *truncate_at = NULL;
+		char	   *clean_inner;
+		char	   *rewritten;
+
+		if (tokens_in_inner != NULL &&
+			(detail_dup == NULL || tokens_in_inner < detail_dup))
+			truncate_at = tokens_in_inner;
+		else if (detail_dup != NULL)
+			truncate_at = detail_dup;
+
+		if (truncate_at != NULL)
+		{
+			rewritten = pnstrdup(stripped, truncate_at - stripped);
+			pfree(stripped);
+			stripped = rewritten;
+		}
+		else
+		{
+			clean_inner = qx_truncate_detail_after_wall_ms(inner_detail);
+			if (strcmp(clean_inner, inner_detail) != 0)
+			{
+				rewritten = psprintf("%.*s%s",
+									 (int) (inner_detail - stripped),
+									 stripped,
+									 clean_inner);
+				pfree(stripped);
+				stripped = rewritten;
+			}
+			pfree(clean_inner);
+		}
+	}
+
+	return stripped;
 }
 
 static char *
@@ -2566,30 +2688,53 @@ qx_format_external_execution_payload(const char *phase,
 	char	   *payload;
 	char	   *stripped;
 
-	payload = psprintf("phase=%s;tool=%s;principal=%s;principal_runtime=%s;provider=%s;provider_kind=%s;effective_sandbox=%s;profile=%s;env=%s;cwd=%s;process_limit=%d;timeout_ms=%d;receipt_schema=%s;receipt_alg=%s;receipt_nonce=%s;receipt_sig=%s;attestation=%s;container_id=%s;vm_id=%s;tokens=%d;cost=%d;detail=%s",
-					phase != NULL ? phase : "submit",
-					result->tool_name != NULL ? result->tool_name : "<unknown>",
-					result->principal_name != NULL ? result->principal_name : "<unknown>",
-					result->principal_runtime != NULL ? result->principal_runtime : "<unknown>",
-					result->provider_name != NULL ? result->provider_name : "<unknown>",
-					result->provider_kind != NULL ? result->provider_kind : "<unknown>",
-					result->sandbox_name != NULL ? result->sandbox_name : "<unknown>",
-					result->profile_name != NULL ? result->profile_name : "<unknown>",
-					result->environment_mode != NULL ? result->environment_mode : "<unknown>",
-					result->workdir_name != NULL ? result->workdir_name : "<unknown>",
-					result->process_limit,
-					result->timeout_ms,
-					result->receipt_schema != NULL ? result->receipt_schema : "<unknown>",
-					result->receipt_alg != NULL ? result->receipt_alg : "<unknown>",
-					result->receipt_nonce != NULL ? result->receipt_nonce : "<unknown>",
-					result->receipt_signature != NULL ? "verified" : "missing",
-					result->attestation_mode != NULL ? result->attestation_mode : "<unknown>",
-					result->container_id != NULL ? result->container_id : "",
-					result->vm_id != NULL ? result->vm_id : "",
-					result->token_charge,
-					result->cost_charge,
-					result->detail != NULL ? result->detail : "<none>");
-	stripped = qx_strip_duplicate_receipt_tail(payload);
+	{
+		char	   *detail_for_payload;
+		const char *tokens_in_detail;
+
+		detail_for_payload = qx_strip_duplicate_receipt_tail(result->detail);
+		{
+			char	   *truncated_detail;
+
+			tokens_in_detail = strstr(detail_for_payload, ";tokens=");
+			if (tokens_in_detail != NULL)
+			{
+				truncated_detail = pnstrdup(detail_for_payload,
+											tokens_in_detail - detail_for_payload);
+				pfree(detail_for_payload);
+				detail_for_payload = truncated_detail;
+			}
+			truncated_detail = qx_truncate_detail_after_wall_ms(detail_for_payload);
+			pfree(detail_for_payload);
+			detail_for_payload = truncated_detail;
+		}
+		payload = psprintf("phase=%s;tool=%s;principal=%s;principal_runtime=%s;provider=%s;provider_kind=%s;effective_sandbox=%s;profile=%s;env=%s;cwd=%s;process_limit=%d;timeout_ms=%d;receipt_schema=%s;receipt_alg=%s;receipt_nonce=%s;receipt_sig=%s;attestation=%s;container_id=%s;vm_id=%s;tokens=%d;cost=%d;detail=%s",
+							phase != NULL ? phase : "submit",
+							result->tool_name != NULL ? result->tool_name : "<unknown>",
+							result->principal_name != NULL ? result->principal_name : "<unknown>",
+							result->principal_runtime != NULL ? result->principal_runtime : "<unknown>",
+							result->provider_name != NULL ? result->provider_name : "<unknown>",
+							result->provider_kind != NULL ? result->provider_kind : "<unknown>",
+							result->sandbox_name != NULL ? result->sandbox_name : "<unknown>",
+							result->profile_name != NULL ? result->profile_name : "<unknown>",
+							result->environment_mode != NULL ? result->environment_mode : "<unknown>",
+							result->workdir_name != NULL ? result->workdir_name : "<unknown>",
+							result->process_limit,
+							result->timeout_ms,
+							result->receipt_schema != NULL ? result->receipt_schema : "<unknown>",
+							result->receipt_alg != NULL ? result->receipt_alg : "<unknown>",
+							result->receipt_nonce != NULL ? result->receipt_nonce : "<unknown>",
+							result->receipt_signature != NULL ? "verified" : "missing",
+							result->attestation_mode != NULL ? result->attestation_mode : "<unknown>",
+							result->container_id != NULL ? result->container_id : "",
+							result->vm_id != NULL ? result->vm_id : "",
+							result->token_charge,
+							result->cost_charge,
+							detail_for_payload != NULL ? detail_for_payload : "<none>");
+		if (detail_for_payload != NULL)
+			pfree(detail_for_payload);
+	}
+	stripped = qx_strip_external_trace_payload(payload);
 	pfree(payload);
 
 	return stripped;
@@ -3341,25 +3486,29 @@ qx_execute_tool_contract(const char *contract, const char *phase, Oid taskoid,
 		result->process_limit = profile->process_limit;
 	result->restricted_identity = observation.restricted_identity;
 	result->wall_time_ms = observation.wall_time_ms;
-	if (qhapaqxian_track_stats && OidIsValid(provideroid))
-	{
-		bool		resume = (phase != NULL && strcmp(phase, "resume") == 0);
-		bool		receipt_verified =
-			(result->receipt_signature != NULL &&
-			 strcmp(result->receipt_signature, "verified") == 0);
-
-		QxStatReportProviderExecution(MyDatabaseId, provideroid, resume,
-									  receipt_verified);
-	}
 	if (result->detail != NULL)
 	{
 		char	   *augmented_detail;
 		char	   *clean_detail;
-		const char *launch_tail = strstr(result->detail, ";launch_mode=");
+		const char *launch_tail;
 
 		clean_detail = qx_strip_duplicate_receipt_tail(result->detail);
+		{
+			const char *tokens_in_detail = strstr(clean_detail, ";tokens=");
+
+			if (tokens_in_detail != NULL)
+			{
+				char	   *truncated_detail;
+
+				truncated_detail = pnstrdup(clean_detail,
+											tokens_in_detail - clean_detail);
+				pfree(clean_detail);
+				clean_detail = truncated_detail;
+			}
+		}
 		pfree(result->detail);
 		result->detail = clean_detail;
+		launch_tail = strstr(result->detail, ";launch_mode=");
 
 		if (launch_tail != NULL)
 		{
@@ -3377,7 +3526,8 @@ qx_execute_tool_contract(const char *contract, const char *phase, Oid taskoid,
 									observation.restricted_identity ? "true" : "false",
 									observation.wall_time_ms);
 		pfree(result->detail);
-		result->detail = augmented_detail;
+		result->detail = qx_truncate_detail_after_wall_ms(augmented_detail);
+		pfree(augmented_detail);
 	}
 
 	if (result->container_id != NULL && result->container_id[0] != '\0')
@@ -3617,6 +3767,17 @@ qx_insert_trace(Relation rel, Oid sessionoid, Oid taskoid, Oid stepoid,
 	Oid			traceoid;
 	HeapTuple	tup;
 	XLogRecPtr	tracelsn;
+	const char *trace_detail = detail;
+	char	   *stripped_detail = NULL;
+
+	if (detail != NULL &&
+		name != NULL &&
+		(strcmp(name, "runtime.external_submit") == 0 ||
+		 strcmp(name, "runtime.external_resume") == 0))
+	{
+		stripped_detail = qx_strip_external_trace_payload(detail);
+		trace_detail = stripped_detail;
+	}
 
 	memset(values, 0, sizeof(values));
 	memset(nulls, false, sizeof(nulls));
@@ -3636,22 +3797,25 @@ qx_insert_trace(Relation rel, Oid sessionoid, Oid taskoid, Oid stepoid,
 		tracelsn = QxEmitSemanticTraceRecordV2(traceoid, sessionoid, taskoid,
 											   stepoid, ownerid, metadata,
 											   QX_TRACE_STATE_CLOSED, name,
-											   detail);
+											   trace_detail);
 	else
 		tracelsn = QxEmitSemanticTraceRecord(traceoid, sessionoid, taskoid,
 											 stepoid, ownerid,
 											 QX_TRACE_STATE_CLOSED, name,
-											 detail);
+											 trace_detail);
 	values[Anum_pg_qx_trace_qxtracelsn - 1] = LSNGetDatum(tracelsn);
 	qx_set_text_datum(values, nulls, Anum_pg_qx_trace_qxtracename, name);
-	qx_set_text_datum(values, nulls, Anum_pg_qx_trace_qxtracedetail, detail);
+	qx_set_text_datum(values, nulls, Anum_pg_qx_trace_qxtracedetail, trace_detail);
 
 	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
 	CatalogTupleInsert(rel, tup);
 	heap_freetuple(tup);
 
 	if (qhapaqxian_track_stats)
-		QxStatReportTrace(name, detail);
+		QxStatReportTrace(name, trace_detail);
+
+	if (stripped_detail != NULL)
+		pfree(stripped_detail);
 
 	return traceoid;
 }
