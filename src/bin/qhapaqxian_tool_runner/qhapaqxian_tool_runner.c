@@ -69,6 +69,8 @@ typedef struct Request
 	int		require_attestation;
 	int		allow_network;
 	int		allow_privilege_escalation;
+	int		readonly_rootfs;
+	char	seccomp_mode[64];
 	char	launch_request_file[260];
 	char	container_id[128];
 	char	vm_id[128];
@@ -201,6 +203,12 @@ parse_launch_request_file(const char *path, Request *request)
 					request->allow_network = (strcmp(value, "true") == 0);
 				else if (strcmp(key, "allow_privilege_escalation") == 0)
 					request->allow_privilege_escalation = (strcmp(value, "true") == 0);
+				else if (strcmp(key, "readonly_rootfs") == 0)
+					request->readonly_rootfs = (strcmp(value, "true") == 0);
+				else if (strcmp(key, "seccomp_mode") == 0 &&
+						 request->seccomp_mode[0] == '\0')
+					snprintf(request->seccomp_mode, sizeof(request->seccomp_mode),
+							 "%s", value);
 				else if (strcmp(key, "image_ref") == 0 &&
 						 request->container_image[0] == '\0')
 					snprintf(request->container_image, sizeof(request->container_image),
@@ -486,16 +494,34 @@ run_real_container_backend(const Request *request, char *detail, size_t detail_l
 			 request->memory_kb > 0 ? request->memory_kb : 65536);
 	snprintf(request->container_id, sizeof(request->container_id),
 			 "qx-container-%ld", request->task_oid);
-	snprintf(command, sizeof(command),
-			 "\"%s\" run --rm --name %s --network %s --read-only --cap-drop ALL --security-opt %s --pids-limit %s --memory %s %s true",
-			 docker_cli,
-			 request->container_id,
-			 request->allow_network ? "bridge" : "none",
-			 request->allow_privilege_escalation ?
-			 "seccomp=unconfined" : "no-new-privileges",
-			 pids_limit,
-			 memory_limit,
-			 image);
+	{
+		const char *seccomp_opt;
+		const char *readonly_flag;
+
+		if (request->seccomp_mode[0] != '\0')
+		{
+			if (strcmp(request->seccomp_mode, "unconfined") == 0)
+				seccomp_opt = "seccomp=unconfined";
+			else
+				seccomp_opt = "no-new-privileges";
+		}
+		else
+			seccomp_opt = request->allow_privilege_escalation ?
+				"seccomp=unconfined" : "no-new-privileges";
+
+		readonly_flag = request->readonly_rootfs ? "--read-only " : "";
+
+		snprintf(command, sizeof(command),
+				 "\"%s\" run --rm --name %s --network %s %s--cap-drop ALL --security-opt %s --pids-limit %s --memory %s %s true",
+				 docker_cli,
+				 request->container_id,
+				 request->allow_network ? "bridge" : "none",
+				 readonly_flag,
+				 seccomp_opt,
+				 pids_limit,
+				 memory_limit,
+				 image);
+	}
 
 #if defined(_WIN32)
 	{
@@ -772,6 +798,7 @@ parse_request(const char *path, Request *request)
 	char	line[512];
 
 	memset(request, 0, sizeof(*request));
+	request->readonly_rootfs = 1;
 
 	file = fopen(path, "r");
 	if (file == NULL)

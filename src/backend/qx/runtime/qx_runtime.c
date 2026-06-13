@@ -1283,6 +1283,8 @@ qx_validate_microvm_runtime_contract(const char *phase,
 									accel,
 									kernel_path,
 									initrd_path);
+	request.kernel_ref = pstrdup(kernel_path);
+	request.initrd_ref = pstrdup(initrd_path);
 	request.image_ref = image_ref;
 	request.snapshot_ref = NULL;
 	request.receipt_schema = pstrdup(qx_safe_runtime_text(receipt_schema));
@@ -3135,6 +3137,12 @@ qx_execute_tool_contract(const char *contract, const char *phase, Oid taskoid,
 			microvm_profile.memory_kb = 262144;
 		execution_profile = &microvm_profile;
 	}
+	if (use_container_backend)
+		qx_runtime_policy_compile_container(&runtime_policy);
+	if (use_microvm_backend)
+		qx_runtime_policy_resolve_microvm_assets(&runtime_policy,
+												 microvm_kernel_path,
+												 microvm_initrd_path);
 	qx_validate_container_runtime_contract(phase,
 										   taskoid,
 										   tool_name,
@@ -3234,6 +3242,13 @@ qx_execute_tool_contract(const char *contract, const char *phase, Oid taskoid,
 		backend_request.allow_network = runtime_policy.allow_network;
 		backend_request.allow_privilege_escalation =
 			runtime_policy.allow_privilege_escalation;
+		backend_request.readonly_rootfs = runtime_policy.readonly_rootfs;
+		backend_request.seccomp_mode =
+			pstrdup(runtime_policy.seccomp_mode != NULL ?
+					runtime_policy.seccomp_mode : "no-new-privileges");
+		backend_request.oci_profile =
+			pstrdup(runtime_policy.oci_profile != NULL ?
+					runtime_policy.oci_profile : "");
 		launch_request_payload =
 			qx_container_backend_build_launch_request(&backend_request);
 		qx_container_backend_request_free(&backend_request);
@@ -3258,12 +3273,16 @@ qx_execute_tool_contract(const char *contract, const char *phase, Oid taskoid,
 		backend_request.workdir_name = pstrdup("pg_qx_runtime");
 		backend_request.command_line = psprintf("%s -M microvm -kernel %s -initrd %s",
 											  microvm_qemu_path,
-											  microvm_kernel_path,
-											  microvm_initrd_path);
+											  runtime_policy.kernel_ref,
+											  runtime_policy.initrd_ref);
+		backend_request.kernel_ref = pstrdup(runtime_policy.kernel_ref);
+		backend_request.initrd_ref = pstrdup(runtime_policy.initrd_ref);
 		backend_request.image_ref = psprintf("kernel=%s;initrd=%s",
-											 microvm_kernel_path,
-											 microvm_initrd_path);
-		backend_request.snapshot_ref = NULL;
+											 runtime_policy.kernel_ref,
+											 runtime_policy.initrd_ref);
+		backend_request.snapshot_ref =
+			runtime_policy.snapshot_ref != NULL ?
+			pstrdup(runtime_policy.snapshot_ref) : NULL;
 		backend_request.receipt_schema = pstrdup(receipt_schema != NULL ? receipt_schema : "qx.receipt.v1");
 		backend_request.receipt_alg = pstrdup(receipt_alg != NULL ? receipt_alg : "hmac-sha256");
 		backend_request.receipt_nonce = pstrdup(receipt_nonce);
@@ -6301,4 +6320,46 @@ QxRuntimeResumeTask(Oid taskoid, const char *checkpoint_label, Oid ownerid)
 	table_close(taskrel, RowExclusiveLock);
 
 	return taskoid;
+}
+
+Datum
+pg_qx_policy_compile_container(PG_FUNCTION_ARGS)
+{
+	char	   *capability_tags;
+	QxRuntimePolicy policy;
+	char	   *profile;
+
+	capability_tags = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	qx_runtime_policy_init(&policy);
+	qx_runtime_policy_from_authz(NULL, capability_tags, &policy);
+	qx_runtime_policy_compile_container(&policy);
+	profile = policy.oci_profile != NULL ? pstrdup(policy.oci_profile) : pstrdup("");
+	qx_runtime_policy_free(&policy);
+	pfree(capability_tags);
+	PG_RETURN_TEXT_P(cstring_to_text(profile));
+}
+
+Datum
+pg_qx_policy_validate_image(PG_FUNCTION_ARGS)
+{
+	char	   *image_ref;
+
+	image_ref = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	qx_runtime_policy_validate_image_ref(image_ref);
+	pfree(image_ref);
+	PG_RETURN_VOID();
+}
+
+Datum
+pg_qx_policy_validate_microvm_assets(PG_FUNCTION_ARGS)
+{
+	char	   *kernel;
+	char	   *initrd;
+
+	kernel = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	initrd = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	qx_runtime_policy_validate_microvm_assets(kernel, initrd, NULL);
+	pfree(kernel);
+	pfree(initrd);
+	PG_RETURN_VOID();
 }

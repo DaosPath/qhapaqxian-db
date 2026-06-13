@@ -12241,5 +12241,17 @@
   proname => 'pg_qx_stat_get_runtime_class_stats', prorows => '16', proretset => 't',
   provolatile => 's', proparallel => 'r', prorettype => 'record', proargtypes => '',
   prosrc => 'pg_qx_stat_get_runtime_class_stats' },
+{ oid => '9214', descr => 'compile container OCI policy from capability tags',
+  proname => 'pg_qx_policy_compile_container', provolatile => 'i',
+  proparallel => 'r', proisstrict => 't', prorettype => 'text',
+  proargtypes => 'text', prosrc => 'pg_qx_policy_compile_container' },
+{ oid => '9215', descr => 'validate container image against runtime allowlist',
+  proname => 'pg_qx_policy_validate_image', provolatile => 'i',
+  proparallel => 'r', proisstrict => 't', prorettype => 'void',
+  proargtypes => 'text', prosrc => 'pg_qx_policy_validate_image' },
+{ oid => '9216', descr => 'validate microVM kernel/initrd against runtime allowlists',
+  proname => 'pg_qx_policy_validate_microvm_assets', provolatile => 'i',
+  proparallel => 'r', proisstrict => 't', prorettype => 'void',
+  proargtypes => 'text text', prosrc => 'pg_qx_policy_validate_microvm_assets' },
 
 ]

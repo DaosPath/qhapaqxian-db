@@ -88,6 +88,23 @@ qx_backend_supervisor_release(Oid taskoid, const char *instance_id)
 	}
 }
 
+int
+qx_backend_supervisor_count_for_task(Oid taskoid)
+{
+	ListCell   *lc;
+	int			count = 0;
+
+	foreach(lc, qx_backend_supervisor_leases)
+	{
+		QxBackendLeaseEntry *entry = lfirst(lc);
+
+		if (entry->taskoid == taskoid)
+			count++;
+	}
+
+	return count;
+}
+
 void
 qx_backend_supervisor_fence_stale(Oid taskoid)
 {

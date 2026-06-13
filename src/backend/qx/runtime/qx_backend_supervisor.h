@@ -21,5 +21,6 @@ extern void qx_backend_supervisor_register(Oid taskoid, const char *instance_id,
 										   QxBackendLeaseKind kind);
 extern void qx_backend_supervisor_release(Oid taskoid, const char *instance_id);
 extern void qx_backend_supervisor_fence_stale(Oid taskoid);
+extern int	qx_backend_supervisor_count_for_task(Oid taskoid);
 
 #endif							/* QX_BACKEND_SUPERVISOR_H */

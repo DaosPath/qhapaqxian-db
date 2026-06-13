@@ -145,3 +145,5 @@ test: tablespace
 test: qx_stage3_agentic
 test: qx_stage3_observability
 test: qx_stage32_catalog
+test: qx_stage24_container_policy
+test: qx_stage25_microvm_policy

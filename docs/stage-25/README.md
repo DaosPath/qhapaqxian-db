@@ -8,6 +8,8 @@ contract shape, validation helpers, and receipt/attestation vocabulary that
 What landed:
 - `qx_microvm_backend.c` and `qx_microvm_backend.h` define the microVM backend
   request/response contract;
+- `qx_runtime_policy_resolve_microvm_assets()` maps capability tags and env
+  defaults to `kernel_ref`, `initrd_ref`, and optional `snapshot_ref`;
 - broker-facing request data is normalized into a stable launch payload;
 - provider/runtime compatibility checks are centralized for `microvm` flows;
 - receipt payloads include provider, principal, runtime class, sandbox,
@@ -15,6 +17,16 @@ What landed:
 - attestation placeholders are explicit rather than implied;
 - the runtime build now owns the microVM backend object file so the scaffold is
   part of the fork build.
+
+Asset policy (Stage 25 gap closure):
+- capability tags `kernel:`, `initrd:`, and `snapshot:` override env defaults;
+- `QX_MICROVM_KERNEL` and `QX_MICROVM_INITRD` provide fallback paths;
+- `QX_MICROVM_KERNEL_ALLOWLIST` and `QX_MICROVM_INITRD_ALLOWLIST` are enforced
+  before microVM launch;
+- optional `QX_MICROVM_SNAPSHOT_ALLOWLIST` validates `snapshot_ref` when present;
+- `kernel_ref` and `initrd_ref` are emitted in `QxMicrovmBackendRequest` launch
+  payloads;
+- `qx_microvm_backend_validate_request()` rejects malformed snapshot references.
 
 Backend responsibilities:
 - validate `microvm://` provider contracts before the runtime accepts them;
@@ -42,7 +54,9 @@ How this maps to `provider kind = microvm`:
 Validation:
 - build should include `src/backend/qx/runtime/qx_microvm_backend.c`;
 - current runtime integration covers provider-contract validation, receipt
-  serialization, attestation mode mapping, and real QEMU launch evidence.
+  serialization, attestation mode mapping, and real QEMU launch evidence;
+- SQL regress helpers: `pg_qx_policy_validate_microvm_assets(text, text)`;
+- `src/test/regress/sql/qx_stage25_microvm_policy.sql`.
 
 Post-stage integration note:
 - a later integration pass wired this contract into `qx_runtime.c` as a real
@@ -53,6 +67,7 @@ Post-stage integration note:
 - hosted CI should continue to use `tcg` unless a self-hosted runner exposes
   KVM;
 - the remaining gap is not "no real microVM launch" anymore, but stronger VM
-  lifecycle ownership, image/snapshot policy, and a dedicated KVM CI lane.
+  lifecycle ownership, hypervisor process ownership, and dedicated snapshot
+  lifecycle management.
 - operational setup and validation commands live in
   `../real-runtime-backends.md`.

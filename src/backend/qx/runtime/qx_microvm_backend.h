@@ -38,6 +38,8 @@ typedef struct QxMicrovmBackendRequest
 	char	   *workdir_name;
 	char	   *command_line;
 	char	   *image_ref;
+	char	   *kernel_ref;
+	char	   *initrd_ref;
 	char	   *snapshot_ref;
 	char	   *receipt_schema;
 	char	   *receipt_alg;

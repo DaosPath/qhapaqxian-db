@@ -1,0 +1,15 @@
+-- Stage 24 container policy regression (no Docker required)
+
+SELECT pg_qx_policy_compile_container(
+  'network:deny|privilege_escalation:deny|readonly_rootfs:true|image:alpine:3.20'
+) AS default_container_profile;
+
+SELECT pg_qx_policy_compile_container(
+  'network:allow|privilege_escalation:allow|readonly_rootfs:false|seccomp_mode:unconfined|image:busybox:1.36'
+) AS permissive_container_profile;
+
+SELECT pg_qx_policy_compile_container(
+  'network:deny|privilege_escalation:deny|seccomp_mode:no-new-privileges'
+) LIKE '%seccomp=no-new-privileges%' AS seccomp_tag_honored;
+
+SELECT pg_qx_policy_validate_image('alpine:3.20');

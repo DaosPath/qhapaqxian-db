@@ -2355,3 +2355,6 @@ REVOKE ALL ON FUNCTION pg_qx_test_start_recovery_attempt(oid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION pg_qx_test_run_startup_recovery() FROM PUBLIC;
 REVOKE ALL ON FUNCTION pg_qx_test_run_failover_rebuild() FROM PUBLIC;
 REVOKE ALL ON FUNCTION pg_qx_test_run_scheduler_worker_tick() FROM PUBLIC;
+REVOKE ALL ON FUNCTION pg_qx_policy_compile_container(text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION pg_qx_policy_validate_image(text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION pg_qx_policy_validate_microvm_assets(text, text) FROM PUBLIC;

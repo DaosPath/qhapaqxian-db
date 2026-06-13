@@ -60,6 +60,8 @@ qx_microvm_backend_request_free(QxMicrovmBackendRequest *request)
 	qx_microvm_backend_free_string(&request->workdir_name);
 	qx_microvm_backend_free_string(&request->command_line);
 	qx_microvm_backend_free_string(&request->image_ref);
+	qx_microvm_backend_free_string(&request->kernel_ref);
+	qx_microvm_backend_free_string(&request->initrd_ref);
 	qx_microvm_backend_free_string(&request->snapshot_ref);
 	qx_microvm_backend_free_string(&request->receipt_schema);
 	qx_microvm_backend_free_string(&request->receipt_alg);
@@ -178,9 +180,17 @@ qx_microvm_backend_validate_request(const QxMicrovmBackendRequest *request)
 	qx_microvm_backend_require(request->command_line != NULL &&
 							   request->command_line[0] != '\0',
 							   "microVM backend requires a command line");
-	qx_microvm_backend_require(request->image_ref != NULL &&
-							   request->image_ref[0] != '\0',
-							   "microVM backend requires a guest image reference");
+	qx_microvm_backend_require(request->kernel_ref != NULL &&
+							   request->kernel_ref[0] != '\0',
+							   "microVM backend requires a kernel reference");
+	qx_microvm_backend_require(request->initrd_ref != NULL &&
+							   request->initrd_ref[0] != '\0',
+							   "microVM backend requires an initrd reference");
+	if (request->snapshot_ref != NULL && request->snapshot_ref[0] != '\0')
+		qx_microvm_backend_require(strchr(request->snapshot_ref, '/') != NULL ||
+								   strchr(request->snapshot_ref, '\\') != NULL ||
+								   strchr(request->snapshot_ref, ':') != NULL,
+								   "microVM backend requires a well-formed snapshot reference");
 	qx_microvm_backend_require(request->vcpu_count > 0,
 							   "microVM backend requires a positive vCPU count");
 }
@@ -346,6 +356,8 @@ qx_microvm_backend_build_launch_request(const QxMicrovmBackendRequest *request)
 	qx_microvm_backend_append_field(&buf, "workdir", request->workdir_name);
 	qx_microvm_backend_append_field(&buf, "command", request->command_line);
 	qx_microvm_backend_append_field(&buf, "image_ref", request->image_ref);
+	qx_microvm_backend_append_field(&buf, "kernel_ref", request->kernel_ref);
+	qx_microvm_backend_append_field(&buf, "initrd_ref", request->initrd_ref);
 	qx_microvm_backend_append_field(&buf, "receipt_schema",
 									request->receipt_schema);
 	qx_microvm_backend_append_field(&buf, "receipt_alg", request->receipt_alg);

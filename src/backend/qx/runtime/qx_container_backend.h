@@ -38,6 +38,8 @@ typedef struct QxContainerBackendRequest
 	char	   *workdir_name;
 	char	   *command_line;
 	char	   *image_ref;
+	char	   *seccomp_mode;
+	char	   *oci_profile;
 	char	   *receipt_schema;
 	char	   *receipt_alg;
 	char	   *receipt_nonce;
@@ -51,6 +53,7 @@ typedef struct QxContainerBackendRequest
 	bool		require_attestation;
 	bool		allow_network;
 	bool		allow_privilege_escalation;
+	bool		readonly_rootfs;
 } QxContainerBackendRequest;
 
 typedef struct QxContainerBackendResponse

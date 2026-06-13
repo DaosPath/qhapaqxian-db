@@ -38,6 +38,7 @@ qx_container_backend_request_init(QxContainerBackendRequest *request)
 {
 	Assert(request != NULL);
 	MemSet(request, 0, sizeof(QxContainerBackendRequest));
+	request->readonly_rootfs = true;
 }
 
 void
@@ -58,6 +59,8 @@ qx_container_backend_request_free(QxContainerBackendRequest *request)
 	qx_container_backend_free_string(&request->workdir_name);
 	qx_container_backend_free_string(&request->command_line);
 	qx_container_backend_free_string(&request->image_ref);
+	qx_container_backend_free_string(&request->seccomp_mode);
+	qx_container_backend_free_string(&request->oci_profile);
 	qx_container_backend_free_string(&request->receipt_schema);
 	qx_container_backend_free_string(&request->receipt_alg);
 	qx_container_backend_free_string(&request->receipt_nonce);
@@ -291,6 +294,12 @@ qx_container_backend_build_launch_request(const QxContainerBackendRequest *reque
 	qx_container_backend_append_bool_field(&buf,
 										   "allow_privilege_escalation",
 										   request->allow_privilege_escalation);
+	qx_container_backend_append_bool_field(&buf, "readonly_rootfs",
+										   request->readonly_rootfs);
+	qx_container_backend_append_field(&buf, "seccomp_mode",
+									  request->seccomp_mode);
+	qx_container_backend_append_field(&buf, "oci_profile",
+									  request->oci_profile);
 	qx_container_backend_append_field(&buf, "detail", request->detail);
 
 	return buf.data;
