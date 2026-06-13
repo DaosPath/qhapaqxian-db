@@ -617,3 +617,218 @@ pg_qx_stat_get_provider_stats(PG_FUNCTION_ARGS)
 
 	SRF_RETURN_DONE(funcctx);
 }
+
+typedef struct QxStatPrincipalSrfState
+{
+	int			index;
+	List	   *principals;
+} QxStatPrincipalSrfState;
+
+Datum
+pg_qx_stat_get_principal_stats(PG_FUNCTION_ARGS)
+{
+	FuncCallContext *funcctx;
+	QxStatPrincipalSrfState *state;
+
+	if (SRF_IS_FIRSTCALL())
+	{
+		TupleDesc	tupdesc;
+		MemoryContext oldcontext;
+
+		funcctx = SRF_FIRSTCALL_INIT();
+		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+		state = palloc0(sizeof(QxStatPrincipalSrfState));
+		state->index = 0;
+		state->principals = NIL;
+
+		{
+			Relation	rel;
+			TableScanDesc scan;
+			HeapTuple	tup;
+
+			rel = table_open(QxPrincipalRelationId, AccessShareLock);
+			scan = table_beginscan_catalog(rel, 0, NULL);
+			while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+			{
+				Form_pg_qx_principal form = (Form_pg_qx_principal) GETSTRUCT(tup);
+				QxCatalogPrincipalInfo *info = palloc(sizeof(QxCatalogPrincipalInfo));
+
+				if (QxCatalogLookupPrincipalByOid(form->oid, info))
+					state->principals = lappend(state->principals, info);
+			}
+			table_endscan(scan);
+			table_close(rel, AccessShareLock);
+		}
+
+		if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("function returning record called in context "
+							"that cannot accept type record")));
+		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
+		funcctx->user_fctx = state;
+		MemoryContextSwitchTo(oldcontext);
+	}
+
+	funcctx = SRF_PERCALL_SETUP();
+	state = (QxStatPrincipalSrfState *) funcctx->user_fctx;
+
+	while (state->index < list_length(state->principals))
+	{
+		QxCatalogPrincipalInfo *info = list_nth(state->principals, state->index++);
+		QxStatCounters *counters;
+		Datum		values[15];
+		bool		nulls[15];
+		HeapTuple	tuple;
+
+		counters = qx_stat_lookup_entry(MyDatabaseId, QX_STAT_PRINCIPAL,
+										info->oid, NULL, false);
+
+		MemSet(values, 0, sizeof(values));
+		MemSet(nulls, false, sizeof(nulls));
+
+		values[0] = ObjectIdGetDatum(info->oid);
+		values[1] = CStringGetTextDatum(info->name != NULL ? info->name : "");
+		values[2] = CStringGetTextDatum(info->provider_name != NULL ?
+										info->provider_name : "");
+		values[3] = CStringGetTextDatum(info->provider_kind != NULL ?
+										info->provider_kind : "");
+		values[4] = CStringGetTextDatum(info->runtime_class != NULL ?
+										info->runtime_class : "");
+		values[5] = CStringGetTextDatum(info->sandbox != NULL ? info->sandbox : "");
+		values[6] = CStringGetTextDatum(info->program != NULL ? info->program : "");
+		values[7] = BoolGetDatum(info->enabled);
+		values[8] = BoolGetDatum(info->receipt_signer != NULL &&
+								 info->receipt_signer[0] != '\0');
+		values[9] = Int64GetDatum(counters != NULL ? counters->submit_count : 0);
+		values[10] = Int64GetDatum(counters != NULL ? counters->resume_count : 0);
+		values[11] = Int64GetDatum(counters != NULL ? counters->verified_receipts : 0);
+		values[12] = Int64GetDatum(counters != NULL ? counters->rejected_receipts : 0);
+		values[13] = Int64GetDatum(counters != NULL ? counters->checkpoint_count : 0);
+		values[14] = Int64GetDatum(counters != NULL ?
+								   counters->submit_count + counters->resume_count : 0);
+
+		tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
+		SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
+	}
+
+	SRF_RETURN_DONE(funcctx);
+}
+
+static bool
+qx_stat_runtime_class_seen(List *runtime_classes, const char *runtime_class)
+{
+	ListCell   *lc;
+
+	if (runtime_class == NULL || runtime_class[0] == '\0')
+		return true;
+
+	foreach(lc, runtime_classes)
+	{
+		const char *existing = (const char *) lfirst(lc);
+
+		if (strcmp(existing, runtime_class) == 0)
+			return true;
+	}
+
+	return false;
+}
+
+typedef struct QxStatRuntimeClassSrfState
+{
+	int			index;
+	List	   *runtime_classes;
+} QxStatRuntimeClassSrfState;
+
+Datum
+pg_qx_stat_get_runtime_class_stats(PG_FUNCTION_ARGS)
+{
+	FuncCallContext *funcctx;
+	QxStatRuntimeClassSrfState *state;
+
+	if (SRF_IS_FIRSTCALL())
+	{
+		TupleDesc	tupdesc;
+		MemoryContext oldcontext;
+
+		funcctx = SRF_FIRSTCALL_INIT();
+		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+		state = palloc0(sizeof(QxStatRuntimeClassSrfState));
+		state->index = 0;
+		state->runtime_classes = NIL;
+
+		{
+			Relation	rel;
+			TableScanDesc scan;
+			HeapTuple	tup;
+
+			rel = table_open(QxPrincipalRelationId, AccessShareLock);
+			scan = table_beginscan_catalog(rel, 0, NULL);
+			while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+			{
+				Form_pg_qx_principal form = (Form_pg_qx_principal) GETSTRUCT(tup);
+				QxCatalogPrincipalInfo info;
+
+				if (QxCatalogLookupPrincipalByOid(form->oid, &info))
+				{
+					if (info.runtime_class != NULL &&
+						info.runtime_class[0] != '\0' &&
+						!qx_stat_runtime_class_seen(state->runtime_classes,
+													info.runtime_class))
+					{
+						state->runtime_classes =
+							lappend(state->runtime_classes,
+									pstrdup(info.runtime_class));
+					}
+					QxCatalogFreePrincipalInfo(&info);
+				}
+			}
+			table_endscan(scan);
+			table_close(rel, AccessShareLock);
+		}
+
+		if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("function returning record called in context "
+							"that cannot accept type record")));
+		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
+		funcctx->user_fctx = state;
+		MemoryContextSwitchTo(oldcontext);
+	}
+
+	funcctx = SRF_PERCALL_SETUP();
+	state = (QxStatRuntimeClassSrfState *) funcctx->user_fctx;
+
+	while (state->index < list_length(state->runtime_classes))
+	{
+		const char *runtime_class = list_nth(state->runtime_classes, state->index++);
+		QxStatCounters *counters;
+		Datum		values[8];
+		bool		nulls[8];
+		HeapTuple	tuple;
+
+		counters = qx_stat_lookup_entry(MyDatabaseId, QX_STAT_RUNTIME_CLASS,
+										InvalidOid, runtime_class, false);
+
+		MemSet(values, 0, sizeof(values));
+		MemSet(nulls, false, sizeof(nulls));
+
+		values[0] = CStringGetTextDatum(runtime_class);
+		values[1] = Int64GetDatum(counters != NULL ? counters->submit_count : 0);
+		values[2] = Int64GetDatum(counters != NULL ? counters->resume_count : 0);
+		values[3] = Int64GetDatum(counters != NULL ? counters->verified_receipts : 0);
+		values[4] = Int64GetDatum(counters != NULL ? counters->rejected_receipts : 0);
+		values[5] = Int64GetDatum(counters != NULL ? counters->checkpoint_count : 0);
+		values[6] = Int64GetDatum(counters != NULL ?
+								   counters->submit_count + counters->resume_count : 0);
+		values[7] = Int64GetDatum(0);
+
+		tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
+		SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
+	}
+
+	SRF_RETURN_DONE(funcctx);
+}

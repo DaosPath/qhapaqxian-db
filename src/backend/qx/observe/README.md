@@ -16,7 +16,8 @@ Current state:
 - `qx_stat` (Stage 33 v1) collects provider/principal/runtime-class/scheduler
   counters in shared memory when `qhapaqxian.track_stats` is enabled.
 - `QxObserveRecord*` delegates to `QxStatReport*` for live counter updates.
-- `pg_qx_stat_get_provider_stats()` and `pg_qx_stat_reset(text)` expose the
+- `pg_qx_stat_get_provider_stats()`, `pg_qx_stat_get_principal_stats()`,
+  `pg_qx_stat_get_runtime_class_stats()`, and `pg_qx_stat_reset(text)` expose the
   collector to SQL callers.
 - `pg_stat_qx_providers` now joins the shared-memory collector for submit,
   resume, and verified-receipt counters.

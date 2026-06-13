@@ -2256,56 +2256,73 @@ CREATE VIEW pg_stat_qx_principals WITH (security_barrier) AS
         p.qxprincipalreceiptsigner AS receipt_signer,
         p.qxprincipalenabled AS enabled,
         p.qxprincipalreceiptsigner IS NOT NULL AS has_signer,
-        (SELECT count(DISTINCT tr.qxtracetaskid)::bigint
-         FROM pg_qx_trace tr
-         WHERE tr.qxtracename IN ('runtime.external_submit', 'runtime.external_resume')
-           AND pg_qx_trace_detail_value(tr.qxtracedetail, 'principal') = p.qxprincipalname) AS task_count,
-        (SELECT count(*)::bigint
-         FROM pg_qx_trace tr
-         WHERE tr.qxtracename = 'runtime.external_submit'
-           AND pg_qx_trace_detail_value(tr.qxtracedetail, 'principal') = p.qxprincipalname) AS submit_count,
-        (SELECT count(*)::bigint
-         FROM pg_qx_trace tr
-         WHERE tr.qxtracename = 'runtime.external_resume'
-           AND pg_qx_trace_detail_value(tr.qxtracedetail, 'principal') = p.qxprincipalname) AS resume_count,
-        (SELECT count(*)::bigint
-         FROM pg_qx_trace tr
-         WHERE tr.qxtracename IN ('runtime.external_submit', 'runtime.external_resume')
-           AND pg_qx_trace_detail_value(tr.qxtracedetail, 'principal') = p.qxprincipalname
-           AND pg_qx_trace_detail_value(tr.qxtracedetail, 'receipt_sig') = 'verified') AS verified_receipt_count
+        COALESCE(stats.execution_count, 0::bigint) AS task_count,
+        COALESCE(stats.submit_count, 0::bigint) AS submit_count,
+        COALESCE(stats.resume_count, 0::bigint) AS resume_count,
+        COALESCE(stats.verified_receipts, 0::bigint) AS verified_receipt_count
     FROM pg_qx_principal p
          LEFT JOIN pg_namespace n ON (n.oid = p.qxprincipalnamespace)
          LEFT JOIN pg_qx_provider prov ON (prov.oid = p.qxprincipalproviderid)
+         LEFT JOIN LATERAL (
+            SELECT s.submit_count,
+                   s.resume_count,
+                   s.verified_receipts,
+                   s.execution_count
+            FROM pg_qx_stat_get_principal_stats() AS s(principal_oid oid,
+                                                         principal_name text,
+                                                         provider_name text,
+                                                         provider_kind text,
+                                                         runtime_class text,
+                                                         sandbox_name text,
+                                                         program_name text,
+                                                         enabled boolean,
+                                                         has_signer boolean,
+                                                         submit_count bigint,
+                                                         resume_count bigint,
+                                                         verified_receipts bigint,
+                                                         rejected_receipts bigint,
+                                                         checkpoint_count bigint,
+                                                         execution_count bigint)
+            WHERE s.principal_oid = p.oid
+         ) stats ON true
     WHERE pg_has_role(SESSION_USER, p.qxprincipalowner, 'USAGE')
        OR pg_has_role(SESSION_USER, 'pg_read_all_stats', 'MEMBER');
 
 
 CREATE VIEW pg_stat_qx_runtime_classes WITH (security_barrier) AS
     SELECT
-        p.qxprincipalruntimeclass AS runtime_class,
-        count(*)::bigint AS principal_count,
-        count(DISTINCT p.qxprincipalproviderid)::bigint AS provider_count,
-        (SELECT count(DISTINCT tr.qxtracetaskid)::bigint
-         FROM pg_qx_trace tr
-         WHERE tr.qxtracename IN ('runtime.external_submit', 'runtime.external_resume')
-           AND pg_qx_trace_detail_value(tr.qxtracedetail, 'principal_runtime') = p.qxprincipalruntimeclass) AS task_count,
-        (SELECT count(*)::bigint
-         FROM pg_qx_trace tr
-         WHERE tr.qxtracename = 'runtime.external_submit'
-           AND pg_qx_trace_detail_value(tr.qxtracedetail, 'principal_runtime') = p.qxprincipalruntimeclass) AS submit_count,
-        (SELECT count(*)::bigint
-         FROM pg_qx_trace tr
-         WHERE tr.qxtracename = 'runtime.external_resume'
-           AND pg_qx_trace_detail_value(tr.qxtracedetail, 'principal_runtime') = p.qxprincipalruntimeclass) AS resume_count,
-        (SELECT count(*)::bigint
-         FROM pg_qx_trace tr
-         WHERE tr.qxtracename IN ('runtime.external_submit', 'runtime.external_resume')
-           AND pg_qx_trace_detail_value(tr.qxtracedetail, 'principal_runtime') = p.qxprincipalruntimeclass
-           AND pg_qx_trace_detail_value(tr.qxtracedetail, 'receipt_sig') = 'verified') AS verified_receipt_count
-    FROM pg_qx_principal p
-    WHERE pg_has_role(SESSION_USER, p.qxprincipalowner, 'USAGE')
-       OR pg_has_role(SESSION_USER, 'pg_read_all_stats', 'MEMBER')
-    GROUP BY p.qxprincipalruntimeclass;
+        catalog.runtime_class,
+        catalog.principal_count,
+        catalog.provider_count,
+        COALESCE(stats.execution_count, 0::bigint) AS task_count,
+        COALESCE(stats.submit_count, 0::bigint) AS submit_count,
+        COALESCE(stats.resume_count, 0::bigint) AS resume_count,
+        COALESCE(stats.verified_receipts, 0::bigint) AS verified_receipt_count
+    FROM (
+        SELECT
+            p.qxprincipalruntimeclass AS runtime_class,
+            count(*)::bigint AS principal_count,
+            count(DISTINCT p.qxprincipalproviderid)::bigint AS provider_count
+        FROM pg_qx_principal p
+        WHERE pg_has_role(SESSION_USER, p.qxprincipalowner, 'USAGE')
+           OR pg_has_role(SESSION_USER, 'pg_read_all_stats', 'MEMBER')
+        GROUP BY p.qxprincipalruntimeclass
+    ) catalog
+         LEFT JOIN LATERAL (
+            SELECT s.submit_count,
+                   s.resume_count,
+                   s.verified_receipts,
+                   s.execution_count
+            FROM pg_qx_stat_get_runtime_class_stats() AS s(runtime_class text,
+                                                           submit_count bigint,
+                                                           resume_count bigint,
+                                                           verified_receipts bigint,
+                                                           rejected_receipts bigint,
+                                                           checkpoint_count bigint,
+                                                           execution_count bigint,
+                                                           reserved bigint)
+            WHERE s.runtime_class = catalog.runtime_class
+         ) stats ON true;
 
 GRANT SELECT ON pg_stat_qx_agents TO PUBLIC;
 GRANT SELECT ON pg_stat_qx_sessions TO PUBLIC;

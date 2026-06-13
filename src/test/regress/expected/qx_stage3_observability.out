@@ -77,6 +77,59 @@ WHERE provider_name = 'stats_loopback_provider';
  t
 (1 row)
 
+SELECT submit_count > 0 AS principal_submit_seen
+FROM pg_qx_stat_get_principal_stats() AS s(principal_oid oid,
+                                           principal_name text,
+                                           provider_name text,
+                                           provider_kind text,
+                                           runtime_class text,
+                                           sandbox_name text,
+                                           program_name text,
+                                           enabled boolean,
+                                           has_signer boolean,
+                                           submit_count bigint,
+                                           resume_count bigint,
+                                           verified_receipts bigint,
+                                           rejected_receipts bigint,
+                                           checkpoint_count bigint,
+                                           execution_count bigint)
+WHERE principal_name = 'stats_search_runner';
+ principal_submit_seen 
+-----------------------
+ t
+(1 row)
+
+SELECT submit_count > 0 AS principal_view_submit_seen
+FROM pg_stat_qx_principals
+WHERE principal_name = 'stats_search_runner';
+ principal_view_submit_seen 
+----------------------------
+ t
+(1 row)
+
+SELECT submit_count > 0 AS runtime_class_submit_seen
+FROM pg_qx_stat_get_runtime_class_stats() AS s(runtime_class text,
+                                               submit_count bigint,
+                                               resume_count bigint,
+                                               verified_receipts bigint,
+                                               rejected_receipts bigint,
+                                               checkpoint_count bigint,
+                                               execution_count bigint,
+                                               reserved bigint)
+WHERE runtime_class = 'host';
+ runtime_class_submit_seen 
+---------------------------
+ t
+(1 row)
+
+SELECT submit_count > 0 AS runtime_class_view_submit_seen
+FROM pg_stat_qx_runtime_classes
+WHERE runtime_class = 'host';
+ runtime_class_view_submit_seen 
+--------------------------------
+ t
+(1 row)
+
 SELECT pg_qx_stat_reset('provider');
  pg_qx_stat_reset 
 ------------------
@@ -103,3 +156,75 @@ WHERE provider_name = 'stats_loopback_provider';
 ------------------------
  t
 (1 row)
+
+SELECT COALESCE(max(submit_count), 0) > 0 AS principal_stats_survive_provider_reset
+FROM pg_qx_stat_get_principal_stats() AS s(principal_oid oid,
+                                             principal_name text,
+                                             provider_name text,
+                                             provider_kind text,
+                                             runtime_class text,
+                                             sandbox_name text,
+                                             program_name text,
+                                             enabled boolean,
+                                             has_signer boolean,
+                                             submit_count bigint,
+                                             resume_count bigint,
+                                             verified_receipts bigint,
+                                             rejected_receipts bigint,
+                                             checkpoint_count bigint,
+                                             execution_count bigint)
+WHERE principal_name = 'stats_search_runner';
+ principal_stats_survive_provider_reset 
+----------------------------------------
+ t
+(1 row)
+
+SELECT pg_qx_stat_reset('principal');
+ pg_qx_stat_reset 
+------------------
+ 
+(1 row)
+
+SELECT COALESCE(max(submit_count), 0) = 0 AS principal_stats_cleared
+FROM pg_qx_stat_get_principal_stats() AS s(principal_oid oid,
+                                             principal_name text,
+                                             provider_name text,
+                                             provider_kind text,
+                                             runtime_class text,
+                                             sandbox_name text,
+                                             program_name text,
+                                             enabled boolean,
+                                             has_signer boolean,
+                                             submit_count bigint,
+                                             resume_count bigint,
+                                             verified_receipts bigint,
+                                             rejected_receipts bigint,
+                                             checkpoint_count bigint,
+                                             execution_count bigint)
+WHERE principal_name = 'stats_search_runner';
+ principal_stats_cleared 
+-------------------------
+ t
+(1 row)
+
+SELECT pg_qx_stat_reset('runtime_class');
+ pg_qx_stat_reset 
+------------------
+ 
+(1 row)
+
+SELECT COALESCE(max(submit_count), 0) = 0 AS runtime_class_stats_cleared
+FROM pg_qx_stat_get_runtime_class_stats() AS s(runtime_class text,
+                                               submit_count bigint,
+                                               resume_count bigint,
+                                               verified_receipts bigint,
+                                               rejected_receipts bigint,
+                                               checkpoint_count bigint,
+                                               execution_count bigint,
+                                               reserved bigint)
+WHERE runtime_class = 'host';
+ runtime_class_stats_cleared 
+-----------------------------
+ t
+(1 row)
+
