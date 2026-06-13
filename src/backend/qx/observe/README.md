@@ -17,7 +17,8 @@ Current state:
   counters in shared memory when `qhapaqxian.track_stats` is enabled.
 - `QxObserveRecord*` delegates to `QxStatReport*` for live counter updates.
 - `pg_qx_stat_get_provider_stats()`, `pg_qx_stat_get_principal_stats()`,
-  `pg_qx_stat_get_runtime_class_stats()`, and `pg_qx_stat_reset(text)` expose the
+  `pg_qx_stat_get_runtime_class_stats()`, `pg_qx_stat_snapshot(text)`,
+  `pg_qx_stat_get_history(text, timestamptz)`, and `pg_qx_stat_reset(text)` expose the
   collector to SQL callers.
 - `pg_stat_qx_providers` now joins the shared-memory collector for submit,
   resume, and verified-receipt counters.
@@ -30,6 +31,6 @@ Current state:
   counts without opening the raw scheduler ledger tables directly.
 
 Integration debt:
-- principal/runtime-class stats SRFs and historical/SLO accounting remain open.
-- richer operator dashboards and pre-aggregated long-horizon rollups are still
+- durable `pg_qx_stat_history` snapshots and SQL SLO/dashboard views are landed.
+- long-horizon retention scheduling and external operator dashboards are still
   future work.

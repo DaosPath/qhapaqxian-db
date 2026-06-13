@@ -7,12 +7,19 @@
  */
 #include "postgres.h"
 
+#include <limits.h>
+
+#include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
+#include "access/tableam.h"
 
+#include "catalog/catalog.h"
+#include "catalog/indexing.h"
 #include "catalog/pg_qx_principal.h"
 #include "catalog/pg_qx_provider.h"
+#include "catalog/pg_qx_stat_history.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "qx/qx_catalog.h"
@@ -897,4 +904,374 @@ pg_qx_stat_get_recovery_stats(PG_FUNCTION_ARGS)
 
 	tuple = heap_form_tuple(tupdesc, values, nulls);
 	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+}
+
+static bool
+qx_stat_scope_matches(const char *requested, const char *candidate)
+{
+	if (requested == NULL || candidate == NULL)
+		return false;
+	if (pg_strcasecmp(requested, "all") == 0)
+		return true;
+	return pg_strcasecmp(requested, candidate) == 0;
+}
+
+static void
+qx_stat_insert_history_row(const char *scope, Oid entityoid, const char *entity,
+						   const QxStatCounters *counters)
+{
+	Relation	rel;
+	Datum		values[Natts_pg_qx_stat_history];
+	bool		nulls[Natts_pg_qx_stat_history];
+	HeapTuple	tup;
+	Oid			rowoid;
+	TimestampTz captured = GetCurrentTimestamp();
+
+	if (scope == NULL || counters == NULL)
+		return;
+
+	memset(values, 0, sizeof(values));
+	memset(nulls, false, sizeof(nulls));
+
+	rel = table_open(QxStatHistoryRelationId, RowExclusiveLock);
+
+	rowoid = GetNewOidWithIndex(rel, QxStatHistoryOidIndexId,
+								Anum_pg_qx_stat_history_oid);
+	values[Anum_pg_qx_stat_history_oid - 1] = ObjectIdGetDatum(rowoid);
+	values[Anum_pg_qx_stat_history_qxstathistorydbid - 1] =
+		ObjectIdGetDatum(MyDatabaseId);
+	values[Anum_pg_qx_stat_history_qxstathistorycaptured - 1] =
+		TimestampTzGetDatum(captured);
+	values[Anum_pg_qx_stat_history_qxstathistoryentityoid - 1] =
+		ObjectIdGetDatum(entityoid);
+	values[Anum_pg_qx_stat_history_qxstathistorysubmitcount - 1] =
+		Int32GetDatum((int32) Min(counters->submit_count, INT_MAX));
+	values[Anum_pg_qx_stat_history_qxstathistoryresumecount - 1] =
+		Int32GetDatum((int32) Min(counters->resume_count, INT_MAX));
+	values[Anum_pg_qx_stat_history_qxstathistoryverifiedreceipts - 1] =
+		Int32GetDatum((int32) Min(counters->verified_receipts, INT_MAX));
+	values[Anum_pg_qx_stat_history_qxstathistoryrejectedreceipts - 1] =
+		Int32GetDatum((int32) Min(counters->rejected_receipts, INT_MAX));
+	values[Anum_pg_qx_stat_history_qxstathistorycheckpointcount - 1] =
+		Int32GetDatum((int32) Min(counters->checkpoint_count, INT_MAX));
+	values[Anum_pg_qx_stat_history_qxstathistoryrenewcount - 1] =
+		Int32GetDatum((int32) Min(counters->renew_count, INT_MAX));
+	values[Anum_pg_qx_stat_history_qxstathistoryreclaimcount - 1] =
+		Int32GetDatum((int32) Min(counters->reclaim_count, INT_MAX));
+	values[Anum_pg_qx_stat_history_qxstathistoryreleasecount - 1] =
+		Int32GetDatum((int32) Min(counters->release_count, INT_MAX));
+	values[Anum_pg_qx_stat_history_qxstathistoryretrydispatchcount - 1] =
+		Int32GetDatum((int32) Min(counters->retry_dispatch_count, INT_MAX));
+	values[Anum_pg_qx_stat_history_qxstathistorydeadlettercount - 1] =
+		Int32GetDatum((int32) Min(counters->dead_letter_count, INT_MAX));
+	values[Anum_pg_qx_stat_history_qxstathistorystartupscancount - 1] =
+		Int32GetDatum((int32) Min(counters->recovery_startup_scans, INT_MAX));
+	values[Anum_pg_qx_stat_history_qxstathistoryfailoverrebuildcount - 1] =
+		Int32GetDatum((int32) Min(counters->recovery_failover_rebuilds, INT_MAX));
+	values[Anum_pg_qx_stat_history_qxstathistorytasksrequeued - 1] =
+		Int32GetDatum((int32) Min(counters->recovery_tasks_requeued, INT_MAX));
+	values[Anum_pg_qx_stat_history_qxstathistoryscope - 1] =
+		CStringGetTextDatum(scope);
+	if (entity != NULL && entity[0] != '\0')
+		values[Anum_pg_qx_stat_history_qxstathistoryentity - 1] =
+			CStringGetTextDatum(entity);
+	else
+		nulls[Anum_pg_qx_stat_history_qxstathistoryentity - 1] = true;
+
+	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
+	CatalogTupleInsert(rel, tup);
+	heap_freetuple(tup);
+	table_close(rel, RowExclusiveLock);
+}
+
+static int64
+qx_stat_snapshot_scope(const char *scope)
+{
+	int64		written = 0;
+	List	   *providers;
+	List	   *principals;
+	List	   *runtime_classes;
+	ListCell   *lc;
+
+	if (scope == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("QX stat snapshot scope must not be null")));
+
+	if (qx_stat_scope_matches(scope, "provider"))
+	{
+		providers = QxCatalogBuildProviderInfoList(InvalidOid, InvalidOid);
+		foreach(lc, providers)
+		{
+			QxCatalogProviderInfo *info = lfirst(lc);
+			QxStatCounters *counters;
+			QxStatCounters empty;
+
+			counters = qx_stat_lookup_entry(MyDatabaseId, QX_STAT_PROVIDER,
+											info->oid, NULL, false);
+			if (counters == NULL)
+			{
+				MemSet(&empty, 0, sizeof(empty));
+				counters = &empty;
+			}
+			qx_stat_insert_history_row("provider", info->oid, info->name, counters);
+			written++;
+		}
+		list_free_deep(providers);
+	}
+
+	if (qx_stat_scope_matches(scope, "principal"))
+	{
+		principals = QxCatalogBuildPrincipalInfoList(InvalidOid, InvalidOid);
+		foreach(lc, principals)
+		{
+			QxCatalogPrincipalInfo *info = lfirst(lc);
+			QxStatCounters *counters;
+			QxStatCounters empty;
+
+			counters = qx_stat_lookup_entry(MyDatabaseId, QX_STAT_PRINCIPAL,
+											info->oid, NULL, false);
+			if (counters == NULL)
+			{
+				MemSet(&empty, 0, sizeof(empty));
+				counters = &empty;
+			}
+			qx_stat_insert_history_row("principal", info->oid, info->name,
+									   counters);
+			written++;
+		}
+		list_free_deep(principals);
+	}
+
+	if (qx_stat_scope_matches(scope, "runtime_class"))
+	{
+		runtime_classes = QxCatalogBuildDistinctRuntimeClassList();
+		foreach(lc, runtime_classes)
+		{
+			const char *runtime_class = lfirst(lc);
+			QxStatCounters *counters;
+			QxStatCounters empty;
+
+			counters = qx_stat_lookup_entry(MyDatabaseId, QX_STAT_RUNTIME_CLASS,
+											InvalidOid, runtime_class, false);
+			if (counters == NULL)
+			{
+				MemSet(&empty, 0, sizeof(empty));
+				counters = &empty;
+			}
+			qx_stat_insert_history_row("runtime_class", InvalidOid,
+									   runtime_class, counters);
+			written++;
+		}
+		list_free_deep(runtime_classes);
+	}
+
+	if (qx_stat_scope_matches(scope, "scheduler") ||
+		qx_stat_scope_matches(scope, "scheduler_activity"))
+	{
+		QxStatCounters totals;
+
+		qx_stat_ensure_attached();
+		SpinLockAcquire(&QxStat->mutex);
+		qx_stat_aggregate_scheduler_locked(MyDatabaseId, &totals);
+		SpinLockRelease(&QxStat->mutex);
+		qx_stat_insert_history_row("scheduler", InvalidOid, "scheduler_activity",
+								   &totals);
+		written++;
+	}
+
+	if (qx_stat_scope_matches(scope, "recovery"))
+	{
+		QxStatCounters *counters;
+		QxStatCounters empty;
+
+		counters = qx_stat_lookup_entry(MyDatabaseId, QX_STAT_RECOVERY,
+										InvalidOid, NULL, false);
+		if (counters == NULL)
+		{
+			MemSet(&empty, 0, sizeof(empty));
+			counters = &empty;
+		}
+		qx_stat_insert_history_row("recovery", InvalidOid, "recovery", counters);
+		written++;
+	}
+
+	if (written == 0 &&
+		pg_strcasecmp(scope, "all") != 0 &&
+		pg_strcasecmp(scope, "provider") != 0 &&
+		pg_strcasecmp(scope, "principal") != 0 &&
+		pg_strcasecmp(scope, "runtime_class") != 0 &&
+		pg_strcasecmp(scope, "scheduler") != 0 &&
+		pg_strcasecmp(scope, "scheduler_activity") != 0 &&
+		pg_strcasecmp(scope, "recovery") != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid QX stat snapshot scope \"%s\"", scope)));
+
+	return written;
+}
+
+Datum
+pg_qx_stat_snapshot(PG_FUNCTION_ARGS)
+{
+	char	   *scope;
+	int64		written;
+
+	if (PG_ARGISNULL(0))
+		scope = pstrdup("all");
+	else
+		scope = text_to_cstring(PG_GETARG_TEXT_PP(0));
+
+	written = qx_stat_snapshot_scope(scope);
+	pfree(scope);
+	PG_RETURN_INT64(written);
+}
+
+typedef struct QxStatHistorySrfState
+{
+	Relation	rel;
+	TableScanDesc scan;
+	char	   *scope;
+	TimestampTz since;
+} QxStatHistorySrfState;
+
+static char *
+qx_stat_history_text_attr(TupleDesc tupdesc, HeapTuple tup, AttrNumber attnum)
+{
+	bool		isnull;
+	Datum		datum;
+
+	datum = heap_getattr(tup, attnum, tupdesc, &isnull);
+	if (isnull)
+		return NULL;
+
+	return TextDatumGetCString(datum);
+}
+
+static bool
+qx_stat_history_scope_matches(const char *requested, const char *row_scope)
+{
+	if (requested == NULL || row_scope == NULL)
+		return false;
+	if (pg_strcasecmp(requested, "all") == 0)
+		return true;
+	return pg_strcasecmp(requested, row_scope) == 0;
+}
+
+Datum
+pg_qx_stat_get_history(PG_FUNCTION_ARGS)
+{
+	FuncCallContext *funcctx;
+	QxStatHistorySrfState *state;
+
+	if (SRF_IS_FIRSTCALL())
+	{
+		TupleDesc	tupdesc;
+		MemoryContext oldcontext;
+		char	   *scope;
+		TimestampTz since;
+
+		funcctx = SRF_FIRSTCALL_INIT();
+		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+		state = palloc0(sizeof(QxStatHistorySrfState));
+		if (PG_ARGISNULL(0))
+			scope = pstrdup("all");
+		else
+			scope = text_to_cstring(PG_GETARG_TEXT_PP(0));
+		if (PG_ARGISNULL(1))
+			since = DT_NOBEGIN;
+		else
+			since = PG_GETARG_TIMESTAMPTZ(1);
+
+		state->scope = scope;
+		state->since = since;
+		state->rel = table_open(QxStatHistoryRelationId, AccessShareLock);
+		state->scan = table_beginscan_catalog(state->rel, 0, NULL);
+
+		if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("function returning record called in context "
+							"that cannot accept type record")));
+		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
+		funcctx->user_fctx = state;
+		MemoryContextSwitchTo(oldcontext);
+	}
+
+	funcctx = SRF_PERCALL_SETUP();
+	state = (QxStatHistorySrfState *) funcctx->user_fctx;
+
+	while (true)
+	{
+		HeapTuple	tup;
+
+		tup = heap_getnext(state->scan, ForwardScanDirection);
+		if (tup == NULL)
+			break;
+
+		Form_pg_qx_stat_history row = (Form_pg_qx_stat_history) GETSTRUCT(tup);
+		TupleDesc	histdesc = RelationGetDescr(state->rel);
+		Datum		values[18];
+		bool		nulls[18];
+		HeapTuple	outtuple;
+		char	   *row_scope;
+		char	   *row_entity;
+
+		if (row->qxstathistorydbid != MyDatabaseId)
+			continue;
+		if (!TIMESTAMP_IS_NOBEGIN(state->since) &&
+			row->qxstathistorycaptured < state->since)
+			continue;
+
+		row_scope = qx_stat_history_text_attr(histdesc, tup,
+											Anum_pg_qx_stat_history_qxstathistoryscope);
+		if (row_scope == NULL)
+			continue;
+		if (!qx_stat_history_scope_matches(state->scope, row_scope))
+		{
+			pfree(row_scope);
+			continue;
+		}
+
+		row_entity = qx_stat_history_text_attr(histdesc, tup,
+											   Anum_pg_qx_stat_history_qxstathistoryentity);
+
+		MemSet(values, 0, sizeof(values));
+		MemSet(nulls, false, sizeof(nulls));
+
+		values[0] = ObjectIdGetDatum(row->oid);
+		values[1] = TimestampTzGetDatum(row->qxstathistorycaptured);
+		values[2] = CStringGetTextDatum(row_scope);
+		if (row_entity != NULL)
+			values[3] = CStringGetTextDatum(row_entity);
+		else
+			nulls[3] = true;
+		pfree(row_scope);
+		if (row_entity != NULL)
+			pfree(row_entity);
+		values[4] = ObjectIdGetDatum(row->qxstathistoryentityoid);
+		values[5] = Int32GetDatum(row->qxstathistorysubmitcount);
+		values[6] = Int32GetDatum(row->qxstathistoryresumecount);
+		values[7] = Int32GetDatum(row->qxstathistoryverifiedreceipts);
+		values[8] = Int32GetDatum(row->qxstathistoryrejectedreceipts);
+		values[9] = Int32GetDatum(row->qxstathistorycheckpointcount);
+		values[10] = Int32GetDatum(row->qxstathistoryrenewcount);
+		values[11] = Int32GetDatum(row->qxstathistoryreclaimcount);
+		values[12] = Int32GetDatum(row->qxstathistoryreleasecount);
+		values[13] = Int32GetDatum(row->qxstathistoryretrydispatchcount);
+		values[14] = Int32GetDatum(row->qxstathistorydeadlettercount);
+		values[15] = Int32GetDatum(row->qxstathistorystartupscancount);
+		values[16] = Int32GetDatum(row->qxstathistoryfailoverrebuildcount);
+		values[17] = Int32GetDatum(row->qxstathistorytasksrequeued);
+
+		outtuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
+		SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(outtuple));
+	}
+
+	table_endscan(state->scan);
+	table_close(state->rel, AccessShareLock);
+	pfree(state->scope);
+	pfree(state);
+	SRF_RETURN_DONE(funcctx);
 }

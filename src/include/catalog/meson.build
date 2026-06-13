@@ -85,6 +85,7 @@ catalog_headers = [
   'pg_qx_scheduler_queue.h',
   'pg_qx_scheduler_lease.h',
   'pg_qx_scheduler_heartbeat.h',
+  'pg_qx_stat_history.h',
   'pg_qx_memory.h',
 ]
 

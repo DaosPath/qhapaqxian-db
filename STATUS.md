@@ -17,7 +17,7 @@ Documentation hierarchy:
 - `docs/stage-*/README.md` = stage-local landed contracts and notes
 
 Snapshot date:
-- `2026-06-13`
+- `2026-06-13` (Stage 34 historical/SLO follow-up)
 
 Last validated test sweep:
 - Windows: `meson compile -C build-stage4-codex -j 2`
@@ -64,6 +64,13 @@ Last validated test sweep:
   subtests with Docker real and QEMU/TCG microVM
 - result: hygiene sweep complete on this machine; canonical regress ledger is 231/231
   with Stages 26–27 landed and expected outputs synchronized
+- Windows sweep on 2026-06-13 (Stage 34 historical/SLO follow-up): durable
+  `pg_qx_stat_history`, `pg_qx_stat_snapshot()`, `pg_qx_stat_get_history()`,
+  `pg_stat_qx_stat_history`, `pg_stat_qx_slo_providers`,
+  `pg_stat_qx_operator_dashboard`, extended `qx_stage3_observability`, and
+  `docs/stage-34/README.md` landed; full `regress/regress` passed **231/231**
+- result: minimal historical/SLO operator layer is landed; long-horizon retention
+  scheduling and external dashboard export remain intentional deferrals
 
 Status legend:
 - `yes` = present and wired
@@ -84,7 +91,7 @@ Status legend:
 | 8 planner/executor boundary | yes | yes | yes | yes | `AgentPlan` is real, but still narrower than a full agent-aware optimizer |
 | 9 semantic WAL/decoder | yes | yes | yes | yes | logical-message boundary exists; no dedicated WAL record family or downstream subscription control |
 | 10 memory/trace surface | yes | yes | yes | yes | memory still lives on ordinary catalogs/storage; no deeper AM/vector specialization |
-| 11 operability surface | yes | yes | yes | partial | `qx_stat` collector and `pg_stat_qx_*` views now cover scheduler queue/worker/activity, retry-backoff, worker-balance, principal/runtime-class, and recovery rollups (Stages 26–27, 33–34); historical/SLO accounting and a broader operator dashboard remain open |
+| 11 operability surface | yes | yes | yes | partial | `qx_stat` collector and `pg_stat_qx_*` views cover scheduler queue/worker/activity, retry-backoff, worker-balance, principal/runtime-class, recovery rollups, durable stat snapshots, SLO provider rollups, and a SQL operator dashboard (Stages 26–27, 33–34); long-horizon retention policy and external dashboard export remain open |
 | 12 security seed | yes | yes | yes | partial | owner filtering/revocation landed, but not full namespace isolation |
 | 13 identity snapshots | yes | yes | yes | yes | identity is durable, but policy evaluation still snapshots rather than fully dynamic |
 | 14 namespace policy/runtime metering | yes | yes | yes | yes | metering is engine-owned; not yet reconciled with external provider billing truth |
@@ -101,16 +108,16 @@ Status legend:
 | 25 microVM backend scaffold | yes | yes | yes | yes | MicroVM asset policy resolves kernel/initrd/snapshot refs with allowlist validation, launch payloads emit `kernel_ref`/`initrd_ref`, `qx_stage25_microvm_policy` regress, and self-hosted KVM CI; hypervisor process ownership and snapshot lifecycle remain intentional deferrals |
 | 26 scheduler scaffold | yes | yes | yes | yes | durable queue/lease/heartbeat catalogs, autonomous launcher/database bgworkers, configurable bounded per-database slot ownership with default 2, lease renewal/reclaim/retry/dead-letter supervision, ledger-backed queue/worker/activity/backoff/balance views, dedicated collector-backed scheduler stats via `pg_qx_stat_get_scheduler_activity_stats()` and `pg_stat_qx_scheduler_collected`, and `qx_stage26_scheduler` regress; load-adaptive slot scaling remains an intentional deferral |
 | 27 recovery scanner scaffold | yes | yes | yes | yes | startup recovery, failover rebuild, and autonomous scheduler supervision drive real scheduler requeue/reclaim writes with ledger-local dedupe, read-only `pg_qx_recovery_scan()` exposes suppressed requeue/fence counts, collector-backed recovery stats via `pg_qx_stat_get_recovery_stats()` and `pg_stat_qx_recovery`, and `qx_stage27_recovery` regress; deeper semantic replay and replication-fed supervision remain intentional deferrals |
-| 28 observability scaffold | yes | yes | partial | partial | `qx_observe` backs `SHOW TRACE` summaries; Stages 26–27 add collector-backed scheduler/recovery stats and `pg_stat_qx_scheduler_collected`/`pg_stat_qx_recovery`; Stages 33–34 add shared-memory `qx_stat`, provider/principal/runtime-class SRFs, and `qx_stage3_observability`; historical/SLO accounting remains open |
+| 28 observability scaffold | yes | yes | partial | partial | `qx_observe` backs `SHOW TRACE` summaries; Stages 26–27 add collector-backed scheduler/recovery stats; Stages 33–34 add shared-memory `qx_stat`, provider/principal/runtime-class SRFs, durable `pg_qx_stat_history`, SLO/dashboard SQL views, and `qx_stage3_observability`; long-horizon retention and external operator UI remain open |
 | 29 capability-aware planner/executor | yes | yes | yes | yes | planner/executor now materialize explicit submit/resume capability routes, persist them in `pg_qx_task`, and runtime/retry/recovery consume those routes instead of first/last contract heuristics |
 | 30 security/tool capability contract | yes | yes | yes | yes | namespace policy `USING` contracts now enforce required/denied capability tags during tool authorization and `CREATE AGENT`; OS-level OCI/VM policy compilation and stronger provenance remain future hardening |
 | 31 semantic payload v2 | yes | yes | yes | yes | v2 payloads cover verified execution events, but the replication surface is still logical-message text rather than a deeper WAL family |
 | 32 catalog snapshot helper layer | yes | yes | yes | partial | recovery, planner, security, commands, runtime scheduler reads/writes, DDL tuple inserts for identity/agent/session/memory/policy objects, provider/principal/runtime-class stats SRFs, and `qx_stage32_catalog` regression now use `qx_catalog` helpers; ALTER-command catalog updates remain in command layers |
 | 33 stats collector and runtime hardening | yes | yes | partial | partial | `qx_stat` shared-memory collector, `qhapaqxian.track_stats`, catalog scheduler helpers, runtime policy/supervisor, typed launch requests, KVM CI workflow, `qx_stage3_observability`, and Stage 26–27 scheduler/recovery collector SRFs landed; historical stats and full OCI/VM policy compilation remain open |
-| 34 observability collector v2 | yes | yes | partial | partial | `pg_qx_stat_get_principal_stats`, `pg_qx_stat_get_runtime_class_stats`, collector-backed `pg_stat_qx_principals`/`pg_stat_qx_runtime_classes`, Stage 26–27 scheduler/recovery collector views, and extended `qx_stage3_observability` landed; historical/SLO accounting and operator dashboards remain open |
+| 34 observability collector v2 | yes | yes | yes | partial | `pg_qx_stat_get_principal_stats`, `pg_qx_stat_get_runtime_class_stats`, collector-backed `pg_stat_qx_principals`/`pg_stat_qx_runtime_classes`, Stage 26–27 scheduler/recovery collector views, durable `pg_qx_stat_history` with `pg_qx_stat_snapshot()`/`pg_qx_stat_get_history()`, `pg_stat_qx_slo_providers`, `pg_stat_qx_operator_dashboard`, extended `qx_stage3_observability`, and `docs/stage-34/README.md` landed; long-horizon retention scheduling and external dashboard export remain open |
 | 35 CI loopback path, backend IDs, catalog runtime writes | yes | yes | yes | partial | `qhapaqxian_output` loopback resume path, real `container_id`/`vm_id` trace evidence (runner top-level IDs + trace assertions), meson microVM/container env wiring, `qx_catalog` runtime update/insert helpers (Stage 32 follow-up), duplicate receipt-tail stripping in runtime/`SHOW TRACE`, and post-Stage-32 validation sweep landed; full OCI cgroup/seccomp and cross-process VM lifecycle ownership remain future work |
 
 Canonical next-gap summary:
 - strongest remaining platform gap: deepen OCI cgroup/seccomp policy compilation and cross-process VM lifecycle ownership beyond the new supervisor registry;
-- strongest observability gap: add historical/SLO accounting and operator dashboards on top of the Stage 34 collector-backed principal/runtime-class surfaces;
+- strongest observability gap: add long-horizon retention scheduling and external operator UI/export on top of the Stage 34 durable snapshot and SQL dashboard surfaces;
 - strongest documentation gap: older stage docs still vary in depth and shape; use `docs/stage-template.md` and `docs/README.md` as the cleanup baseline.

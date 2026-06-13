@@ -342,6 +342,7 @@ NOTICE:  checking pg_qx_scheduler_heartbeat {qxheartbeatledgerworkerid} => pg_qx
 NOTICE:  checking pg_qx_scheduler_heartbeat {qxheartbeatledgersessionid} => pg_qx_session {oid}
 NOTICE:  checking pg_qx_scheduler_heartbeat {qxheartbeatledgertaskid} => pg_qx_task {oid}
 NOTICE:  checking pg_qx_scheduler_heartbeat {qxheartbeatledgerattemptid} => pg_qx_attempt {oid}
+NOTICE:  checking pg_qx_stat_history {qxstathistorydbid} => pg_database {oid}
 NOTICE:  checking pg_qx_memory {qxmemorydbid} => pg_database {oid}
 NOTICE:  checking pg_qx_memory {qxmemoryagentid} => pg_qx_agent {oid}
 NOTICE:  checking pg_qx_memory {qxmemorysessionid} => pg_qx_session {oid}

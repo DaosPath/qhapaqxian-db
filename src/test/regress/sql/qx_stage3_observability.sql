@@ -111,6 +111,37 @@ SELECT submit_count > 0 AS runtime_class_view_submit_seen
 FROM pg_stat_qx_runtime_classes
 WHERE runtime_class = 'host';
 
+SELECT pg_qx_stat_snapshot('provider') > 0 AS provider_snapshot_written;
+
+SELECT count(*) > 0 AS provider_history_visible
+FROM pg_qx_stat_get_history('provider', now() - interval '1 day') AS h(snapshot_oid oid,
+                                                                       captured_at timestamptz,
+                                                                       scope text,
+                                                                       entity_name text,
+                                                                       entity_oid oid,
+                                                                       submit_count integer,
+                                                                       resume_count integer,
+                                                                       verified_receipts integer,
+                                                                       rejected_receipts integer,
+                                                                       checkpoint_count integer,
+                                                                       renew_count integer,
+                                                                       reclaim_count integer,
+                                                                       release_count integer,
+                                                                       retry_dispatch_count integer,
+                                                                       dead_letter_count integer,
+                                                                       startup_scan_count integer,
+                                                                       failover_rebuild_count integer,
+                                                                       tasks_requeued integer)
+WHERE entity_name = 'stats_loopback_provider';
+
+SELECT receipt_verification_pct IS NOT NULL AS provider_slo_visible
+FROM pg_stat_qx_slo_providers
+WHERE provider_name = 'stats_loopback_provider';
+
+SELECT entity_count > 0 AND last_snapshot_at IS NOT NULL AS dashboard_providers_row
+FROM pg_stat_qx_operator_dashboard
+WHERE surface = 'providers';
+
 SELECT pg_qx_stat_reset('provider');
 
 SELECT COALESCE(max(submit_count), 0) = 0 AS provider_stats_cleared

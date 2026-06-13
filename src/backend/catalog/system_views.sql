@@ -2368,6 +2368,199 @@ CREATE VIEW pg_stat_qx_recovery WITH (security_barrier) AS
                                                   attempts_fence_suppressed bigint);
 
 
+CREATE VIEW pg_stat_qx_stat_history WITH (security_barrier) AS
+    SELECT
+        h.snapshot_oid,
+        h.captured_at,
+        h.scope,
+        h.entity_name,
+        h.entity_oid,
+        h.submit_count,
+        h.resume_count,
+        h.verified_receipts,
+        h.rejected_receipts,
+        h.checkpoint_count,
+        h.renew_count,
+        h.reclaim_count,
+        h.release_count,
+        h.retry_dispatch_count,
+        h.dead_letter_count,
+        h.startup_scan_count,
+        h.failover_rebuild_count,
+        h.tasks_requeued
+    FROM pg_qx_stat_get_history('all', NULL::timestamptz) AS h(snapshot_oid oid,
+                                                                 captured_at timestamptz,
+                                                                 scope text,
+                                                                 entity_name text,
+                                                                 entity_oid oid,
+                                                                 submit_count integer,
+                                                                 resume_count integer,
+                                                                 verified_receipts integer,
+                                                                 rejected_receipts integer,
+                                                                 checkpoint_count integer,
+                                                                 renew_count integer,
+                                                                 reclaim_count integer,
+                                                                 release_count integer,
+                                                                 retry_dispatch_count integer,
+                                                                 dead_letter_count integer,
+                                                                 startup_scan_count integer,
+                                                                 failover_rebuild_count integer,
+                                                                 tasks_requeued integer);
+
+
+CREATE VIEW pg_stat_qx_slo_providers WITH (security_barrier) AS
+    SELECT
+        p.provider_oid,
+        p.provider_name,
+        p.provider_kind,
+        p.submit_count,
+        p.resume_count,
+        p.verified_receipt_count,
+        COALESCE(s.rejected_receipts, 0::bigint) AS rejected_receipt_count,
+        p.task_count AS execution_count,
+        CASE
+            WHEN COALESCE(s.verified_receipts, 0::bigint) +
+                 COALESCE(s.rejected_receipts, 0::bigint) > 0
+            THEN round(100.0 * COALESCE(s.verified_receipts, 0::bigint) /
+                       (COALESCE(s.verified_receipts, 0::bigint) +
+                        COALESCE(s.rejected_receipts, 0::bigint)), 2)
+            ELSE NULL::numeric
+        END AS receipt_verification_pct,
+        CASE
+            WHEN COALESCE(s.submit_count, 0::bigint) +
+                 COALESCE(s.resume_count, 0::bigint) > 0
+            THEN round(100.0 * COALESCE(s.checkpoint_count, 0::bigint) /
+                       (COALESCE(s.submit_count, 0::bigint) +
+                        COALESCE(s.resume_count, 0::bigint)), 2)
+            ELSE NULL::numeric
+        END AS checkpoint_coverage_pct
+    FROM pg_stat_qx_providers p
+         LEFT JOIN LATERAL (
+            SELECT s.submit_count,
+                   s.resume_count,
+                   s.verified_receipts,
+                   s.rejected_receipts,
+                   s.checkpoint_count
+            FROM pg_qx_stat_get_provider_stats() AS s(provider_oid oid,
+                                                      provider_name text,
+                                                      provider_kind text,
+                                                      provider_endpoint text,
+                                                      enabled boolean,
+                                                      attestation_required boolean,
+                                                      submit_count bigint,
+                                                      resume_count bigint,
+                                                      verified_receipts bigint,
+                                                      rejected_receipts bigint,
+                                                      checkpoint_count bigint,
+                                                      execution_count bigint,
+                                                      task_count bigint,
+                                                      reserved bigint)
+            WHERE s.provider_oid = p.provider_oid
+         ) s ON true;
+
+
+CREATE VIEW pg_stat_qx_operator_dashboard WITH (security_barrier) AS
+    SELECT
+        'providers'::text AS surface,
+        count(*)::bigint AS entity_count,
+        COALESCE(sum(s.execution_count), 0::bigint) AS execution_count,
+        COALESCE(sum(s.verified_receipts), 0::bigint) AS verified_receipts,
+        COALESCE(sum(s.rejected_receipts), 0::bigint) AS rejected_receipts,
+        (SELECT max(h.captured_at)
+         FROM pg_stat_qx_stat_history h
+         WHERE h.scope = 'provider') AS last_snapshot_at
+    FROM pg_qx_stat_get_provider_stats() AS s(provider_oid oid,
+                                              provider_name text,
+                                              provider_kind text,
+                                              provider_endpoint text,
+                                              enabled boolean,
+                                              attestation_required boolean,
+                                              submit_count bigint,
+                                              resume_count bigint,
+                                              verified_receipts bigint,
+                                              rejected_receipts bigint,
+                                              checkpoint_count bigint,
+                                              execution_count bigint,
+                                              task_count bigint,
+                                              reserved bigint)
+UNION ALL
+    SELECT
+        'principals'::text,
+        count(*)::bigint,
+        COALESCE(sum(s.execution_count), 0::bigint),
+        COALESCE(sum(s.verified_receipts), 0::bigint),
+        COALESCE(sum(s.rejected_receipts), 0::bigint),
+        (SELECT max(h.captured_at)
+         FROM pg_stat_qx_stat_history h
+         WHERE h.scope = 'principal')
+    FROM pg_qx_stat_get_principal_stats() AS s(principal_oid oid,
+                                               principal_name text,
+                                               provider_name text,
+                                               provider_kind text,
+                                               runtime_class text,
+                                               sandbox_name text,
+                                               program_name text,
+                                               enabled boolean,
+                                               has_signer boolean,
+                                               submit_count bigint,
+                                               resume_count bigint,
+                                               verified_receipts bigint,
+                                               rejected_receipts bigint,
+                                               checkpoint_count bigint,
+                                               execution_count bigint)
+UNION ALL
+    SELECT
+        'runtime_classes'::text,
+        count(*)::bigint,
+        COALESCE(sum(s.execution_count), 0::bigint),
+        COALESCE(sum(s.verified_receipts), 0::bigint),
+        COALESCE(sum(s.rejected_receipts), 0::bigint),
+        (SELECT max(h.captured_at)
+         FROM pg_stat_qx_stat_history h
+         WHERE h.scope = 'runtime_class')
+    FROM pg_qx_stat_get_runtime_class_stats() AS s(runtime_class text,
+                                                   submit_count bigint,
+                                                   resume_count bigint,
+                                                   verified_receipts bigint,
+                                                   rejected_receipts bigint,
+                                                   checkpoint_count bigint,
+                                                   execution_count bigint,
+                                                   reserved bigint)
+UNION ALL
+    SELECT
+        'scheduler'::text,
+        1::bigint,
+        COALESCE(stats.renew_count + stats.reclaim_count +
+                 stats.release_count + stats.retry_dispatch_count +
+                 stats.dead_letter_count, 0::bigint),
+        0::bigint,
+        0::bigint,
+        (SELECT max(h.captured_at)
+         FROM pg_stat_qx_stat_history h
+         WHERE h.scope = 'scheduler')
+    FROM pg_qx_stat_get_scheduler_activity_stats() AS stats(renew_count bigint,
+                                                            reclaim_count bigint,
+                                                            release_count bigint,
+                                                            retry_dispatch_count bigint,
+                                                            dead_letter_count bigint)
+UNION ALL
+    SELECT
+        'recovery'::text,
+        1::bigint,
+        COALESCE(stats.startup_scan_count + stats.failover_rebuild_count, 0::bigint),
+        COALESCE(stats.tasks_requeued, 0::bigint),
+        COALESCE(stats.attempts_fenced, 0::bigint),
+        (SELECT max(h.captured_at)
+         FROM pg_stat_qx_stat_history h
+         WHERE h.scope = 'recovery')
+    FROM pg_qx_stat_get_recovery_stats() AS stats(startup_scan_count bigint,
+                                                  failover_rebuild_count bigint,
+                                                  tasks_requeued bigint,
+                                                  attempts_fenced bigint,
+                                                  tasks_requeue_suppressed bigint,
+                                                  attempts_fence_suppressed bigint);
+
+
 GRANT SELECT ON pg_stat_qx_agents TO PUBLIC;
 GRANT SELECT ON pg_stat_qx_sessions TO PUBLIC;
 GRANT SELECT ON pg_stat_qx_tasks TO PUBLIC;
@@ -2384,6 +2577,9 @@ GRANT SELECT ON pg_stat_qx_scheduler_ledger_heartbeats TO PUBLIC;
 GRANT SELECT ON pg_stat_qx_providers TO PUBLIC;
 GRANT SELECT ON pg_stat_qx_principals TO PUBLIC;
 GRANT SELECT ON pg_stat_qx_runtime_classes TO PUBLIC;
+GRANT SELECT ON pg_stat_qx_stat_history TO PUBLIC;
+GRANT SELECT ON pg_stat_qx_slo_providers TO PUBLIC;
+GRANT SELECT ON pg_stat_qx_operator_dashboard TO PUBLIC;
 
 REVOKE ALL ON pg_qx_agent FROM PUBLIC;
 REVOKE ALL ON pg_qx_session FROM PUBLIC;
@@ -2396,6 +2592,7 @@ REVOKE ALL ON pg_qx_checkpoint FROM PUBLIC;
 REVOKE ALL ON pg_qx_scheduler_queue FROM PUBLIC;
 REVOKE ALL ON pg_qx_scheduler_lease FROM PUBLIC;
 REVOKE ALL ON pg_qx_scheduler_heartbeat FROM PUBLIC;
+REVOKE ALL ON pg_qx_stat_history FROM PUBLIC;
 REVOKE ALL ON pg_qx_memory FROM PUBLIC;
 REVOKE ALL ON FUNCTION pg_qx_test_start_recovery_attempt(oid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION pg_qx_recovery_scan() FROM PUBLIC;
