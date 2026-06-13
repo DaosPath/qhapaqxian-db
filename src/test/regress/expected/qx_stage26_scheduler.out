@@ -1,0 +1,97 @@
+-- Stage 26 scheduler stats plane regression (loopback, no Docker)
+CREATE PROVIDER public.sched_loopback_provider
+  KIND 'loopback'
+  ENDPOINT 'local://qhapaqxian-tool-runner'
+  RECEIPT KEY 'sched-loopback-key'
+  ATTESTATION PROFILE 'loopback.local'
+  VERSION 'v1'
+  POLICY loopback_attest
+  ATTESTATION ENABLE;
+CREATE PRINCIPAL public.sched_search_runner
+  PROGRAM 'qhapaqxian-tool-runner'
+  SANDBOX 'restricted'
+  RUNTIME 'host'
+  PROVIDER public.sched_loopback_provider
+  ATTESTATION PROFILE 'loopback.local'
+  VERSION 'v1'
+  POLICY loopback_attest;
+CREATE TOOL public.sched_search
+  HANDLER 'builtin.search'
+  SANDBOX 'builtin'
+  PRINCIPAL 'sched_search_runner'
+  TOKEN COST 5
+  COST 3;
+CREATE NAMESPACE POLICY sched_only FOR SCHEMA public
+  TOOLS (sched_search)
+  KNOWN TOOLS ENABLE
+  BUDGET ENABLE;
+CREATE AGENT sched_probe
+  IDENTITY sched_probe_identity
+  TOOLS (sched_search)
+  POLICY sched_only
+  BUDGET (tokens 2048, cost 128);
+START SESSION FOR AGENT sched_probe
+  WITH CONTEXT jsonb_build_object('mission', 'scheduler');
+SELECT oid AS qx_sched_session_oid
+FROM pg_qx_session
+WHERE qxsessionagentid = (SELECT oid FROM pg_qx_agent WHERE qxagentname = 'sched_probe')
+ORDER BY oid DESC
+LIMIT 1
+\gset
+SELECT pg_qx_stat_reset('scheduler_activity');
+ pg_qx_stat_reset 
+------------------
+ 
+(1 row)
+
+SELECT pg_qx_scheduler_worker_slot_count() BETWEEN 1 AND 8 AS slot_count_bounded;
+ slot_count_bounded 
+--------------------
+ t
+(1 row)
+
+SELECT renew_count = 0
+   AND reclaim_count = 0
+   AND release_count = 0
+   AND retry_dispatch_count = 0
+   AND dead_letter_count = 0 AS stats_zero_before_work
+FROM pg_qx_stat_get_scheduler_activity_stats() AS s(renew_count bigint,
+                                                    reclaim_count bigint,
+                                                    release_count bigint,
+                                                    retry_dispatch_count bigint,
+                                                    dead_letter_count bigint);
+ stats_zero_before_work 
+------------------------
+ t
+(1 row)
+
+RUN TASK sched_probe_task IN SESSION :qx_sched_session_oid
+  GOAL 'scheduler stats probe'
+  INPUT jsonb_build_object('topic', 'scheduler')
+  PRIORITY normal;
+SELECT release_count >= 1 AS saw_release_stat,
+       renew_event_count >= 0 AS ledger_visible,
+       release_event_count >= 1 AS saw_release_ledger
+FROM pg_stat_qx_scheduler_collected;
+ saw_release_stat | ledger_visible | saw_release_ledger 
+------------------+----------------+--------------------
+ t                | t              | t
+(1 row)
+
+SELECT pg_qx_stat_reset('scheduler_activity');
+ pg_qx_stat_reset 
+------------------
+ 
+(1 row)
+
+SELECT renew_count = 0 AS reset_ok
+FROM pg_qx_stat_get_scheduler_activity_stats() AS s(renew_count bigint,
+                                                    reclaim_count bigint,
+                                                    release_count bigint,
+                                                    retry_dispatch_count bigint,
+                                                    dead_letter_count bigint);
+ reset_ok 
+----------
+ t
+(1 row)
+

@@ -85,11 +85,19 @@ Acceptance criteria for the scaffold:
   inventing parallel ad hoc fields;
 - the phase document says what is real and what is still deferred.
 
+- `pg_qx_stat_get_scheduler_activity_stats()` now exposes the dedicated
+  scheduler-owned stats plane from the shared-memory `qx_stat` collector;
+- `pg_stat_qx_scheduler_collected` joins collector counters with durable
+  ledger rollups from `pg_stat_qx_scheduler_activity`;
+- runtime release paths now report `release` scheduler events into `qx_stat`;
+- `qx_stage26_scheduler` regression validates slot bounds, collector reset, and
+  release evidence across collector and ledger surfaces.
+
 Known gaps:
 - slot count is configurable, but not yet load-adaptive;
 - no queue preemption policy yet;
 - no distributed contention model beyond deterministic per-database ownership;
-- no dedicated scheduler stats collector or daemon-owned dashboard yet.
+- no daemon-owned scheduler dashboard beyond the collector-backed SQL surfaces.
 
 Integration debt left for later phases:
 - teach recovery to consume the durable scheduler ledger directly;

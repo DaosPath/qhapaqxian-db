@@ -69,6 +69,20 @@ qx_recovery_copy_string(const char *value)
 }
 
 static bool
+qx_recovery_task_would_requeue(const QxRecoveryTaskSummary *summary)
+{
+	if (summary == NULL)
+		return false;
+
+	if (summary->taskstate == QX_TASK_STATE_COMPLETED)
+		return false;
+
+	return summary->needs_requeue ||
+		summary->taskstate == QX_TASK_STATE_CHECKPOINTED ||
+		summary->taskstate == QX_TASK_STATE_RUNNING;
+}
+
+static bool
 qx_recovery_task_has_scheduler_recovery_queue(Oid databaseoid, Oid ownerid,
 											  Oid taskoid, Oid attemptoid)
 {
@@ -424,6 +438,9 @@ QxRecoveryPopulateReport(QxRecoveryReport *report,
 		report->tasks_scanned++;
 		if (QxRecoveryTaskNeedsRequeue(task))
 			report->tasks_requeued++;
+		else if (qx_recovery_task_would_requeue(task) &&
+				 task->scheduler_recovery_queued)
+			report->tasks_requeue_suppressed++;
 		if (task->needs_fence)
 			report->orphan_attempts++;
 	}
@@ -435,6 +452,9 @@ QxRecoveryPopulateReport(QxRecoveryReport *report,
 		report->attempts_scanned++;
 		if (QxRecoveryAttemptNeedsFence(attempt))
 			report->attempts_fenced++;
+		else if (attempt->state == QX_ATTEMPT_STATE_RUNNING &&
+				 attempt->scheduler_reclaimed)
+			report->attempts_fence_suppressed++;
 	}
 
 	foreach(lc, checkpoint_summaries)

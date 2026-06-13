@@ -12253,5 +12253,17 @@
   proname => 'pg_qx_policy_validate_microvm_assets', provolatile => 'i',
   proparallel => 'r', proisstrict => 't', prorettype => 'void',
   proargtypes => 'text text', prosrc => 'pg_qx_policy_validate_microvm_assets' },
+{ oid => '9217', descr => 'scheduler activity stats from QhapaqXian shared-memory collector',
+  proname => 'pg_qx_stat_get_scheduler_activity_stats', provolatile => 's',
+  proparallel => 'r', prorettype => 'record', proargtypes => '',
+  prosrc => 'pg_qx_stat_get_scheduler_activity_stats' },
+{ oid => '9218', descr => 'recovery scan stats from QhapaqXian shared-memory collector',
+  proname => 'pg_qx_stat_get_recovery_stats', provolatile => 's',
+  proparallel => 'r', prorettype => 'record', proargtypes => '',
+  prosrc => 'pg_qx_stat_get_recovery_stats' },
+{ oid => '9219', descr => 'catalog-driven startup recovery scan without ledger writes',
+  proname => 'pg_qx_recovery_scan', provolatile => 'v', proparallel => 'r',
+  prorettype => 'record', proargtypes => '',
+  prosrc => 'pg_qx_recovery_scan' },
 
 ]

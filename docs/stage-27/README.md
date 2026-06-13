@@ -64,12 +64,22 @@ Integration points to come:
 - observability should later expose the recovery report so operators can see
   how many tasks were scanned, fenced, or requeued.
 
+- `pg_qx_recovery_scan()` now exposes a read-only startup recovery report with
+  dedupe visibility (`tasks_requeue_suppressed`,
+  `attempts_fence_suppressed`) without writing scheduler ledger rows;
+- `pg_qx_stat_get_recovery_stats()` and `pg_stat_qx_recovery` now surface
+  startup/failover recovery counters from the shared-memory collector;
+- startup/failover recovery hooks report into `qx_stat` when durable ledger
+  writes complete;
+- `qx_stage27_recovery` regression validates pre/post-write dedupe behavior and
+  collector-backed recovery stats after startup and failover rebuild.
+
 Known gaps:
 - hooks are intentionally narrow and do not yet integrate with replication
   entrypoints;
 - the scanner is catalog-driven only and still assumes the catalogs are the
   authoritative reconstruction source;
-- recovery dedupe is still ledger-local and should grow richer semantic
+- recovery dedupe is ledger-local today and should grow richer semantic
   idempotence once replay enters the path.
 
 Validation plan:

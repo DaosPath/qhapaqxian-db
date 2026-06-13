@@ -39,6 +39,7 @@
 #include "common/openssl.h"
 #include "common/sha2.h"
 #include "fmgr.h"
+#include "funcapi.h"
 #include "lib/stringinfo.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
@@ -1043,7 +1044,8 @@ qx_runtime_recovery_finish(const QxRecoveryReport *report, void *userdata)
 {
 	QxRuntimeRecoveryHooksContext *context = userdata;
 
-	(void) report;
+	if (report != NULL)
+		QxStatReportRecoveryScan(MyDatabaseId, report, report->failover_rebuild);
 
 	if (context == NULL)
 		return;
@@ -1123,7 +1125,7 @@ qx_runtime_failover_recovery_payload(char *base_payload,
 	initStringInfo(&buf);
 	appendStringInfoString(&buf, base_payload != NULL ? base_payload : "");
 	appendStringInfo(&buf,
-					 ";recovery_startup_scan=%s;recovery_failover_rebuild=%s;recovery_tasks_scanned=%d;recovery_attempts_scanned=%d;recovery_checkpoints_scanned=%d;recovery_tasks_requeued=%d;recovery_attempts_fenced=%d;recovery_checkpoints_replayed=%d;recovery_orphan_attempts=%d;recovery_semantic_candidates=%d",
+					 ";recovery_startup_scan=%s;recovery_failover_rebuild=%s;recovery_tasks_scanned=%d;recovery_attempts_scanned=%d;recovery_checkpoints_scanned=%d;recovery_tasks_requeued=%d;recovery_attempts_fenced=%d;recovery_checkpoints_replayed=%d;recovery_orphan_attempts=%d;recovery_semantic_candidates=%d;recovery_tasks_requeue_suppressed=%d;recovery_attempts_fence_suppressed=%d",
 					 qx_bool_literal(report->startup_scan),
 					 qx_bool_literal(report->failover_rebuild),
 					 report->tasks_scanned,
@@ -1133,7 +1135,9 @@ qx_runtime_failover_recovery_payload(char *base_payload,
 					 report->attempts_fenced,
 					 report->checkpoints_replayed,
 					 report->orphan_attempts,
-					 report->semantic_replay_candidates);
+					 report->semantic_replay_candidates,
+					 report->tasks_requeue_suppressed,
+					 report->attempts_fence_suppressed);
 
 	if (base_payload != NULL)
 		pfree(base_payload);
@@ -1151,7 +1155,7 @@ qx_runtime_append_recovery_payload(char *base_payload)
 	initStringInfo(&buf);
 	appendStringInfoString(&buf, base_payload != NULL ? base_payload : "");
 	appendStringInfo(&buf,
-					 ";recovery_startup_scan=%s;recovery_tasks_scanned=%d;recovery_attempts_scanned=%d;recovery_checkpoints_scanned=%d;recovery_tasks_requeued=%d;recovery_attempts_fenced=%d;recovery_orphan_attempts=%d;recovery_semantic_candidates=%d",
+					 ";recovery_startup_scan=%s;recovery_tasks_scanned=%d;recovery_attempts_scanned=%d;recovery_checkpoints_scanned=%d;recovery_tasks_requeued=%d;recovery_attempts_fenced=%d;recovery_orphan_attempts=%d;recovery_semantic_candidates=%d;recovery_tasks_requeue_suppressed=%d;recovery_attempts_fence_suppressed=%d",
 					 qx_bool_literal(report->startup_scan),
 					 report->tasks_scanned,
 					 report->attempts_scanned,
@@ -1159,7 +1163,9 @@ qx_runtime_append_recovery_payload(char *base_payload)
 					 report->tasks_requeued,
 					 report->attempts_fenced,
 					 report->orphan_attempts,
-					 report->semantic_replay_candidates);
+					 report->semantic_replay_candidates,
+					 report->tasks_requeue_suppressed,
+					 report->attempts_fence_suppressed);
 
 	if (base_payload != NULL)
 		pfree(base_payload);
@@ -4747,6 +4753,7 @@ qx_runtime_dispatch_retry_task(Relation taskrel,
 	(void) QxCatalogInsertSchedulerHeartbeat(heartbeatledgerrel, leaseoid,
 										 final_heartbeat_snapshot);
 	CommandCounterIncrement();
+	QxStatReportSchedulerEvent(MyDatabaseId, "release");
 
 	(void) QxCatalogInsertEvent(eventrel, task->sessionoid, task->oid, InvalidOid,
 						   task->ownerid, NULL,
@@ -5726,10 +5733,67 @@ pg_qx_test_run_scheduler_worker_tick(PG_FUNCTION_ARGS)
 }
 
 Datum
+pg_qx_recovery_scan(PG_FUNCTION_ARGS)
+{
+	QxRecoveryStartupRequest request;
+	QxRecoveryReport *report;
+	TupleDesc	tupdesc;
+	Datum		values[12];
+	bool		nulls[12];
+	HeapTuple	tuple;
+
+	memset(&request, 0, sizeof(request));
+	request.databaseoid = MyDatabaseId;
+	request.ownerid = GetUserId();
+	request.include_attempts = true;
+	request.include_checkpoints = true;
+	request.fence_stale_attempts = true;
+	request.requeue_checkpointed_tasks = true;
+	request.rebuild_from_semantic_log = false;
+
+	report = QxRecoveryRunStartupScan(&request, NULL);
+	if (report == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("recovery scan did not produce a report")));
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("function returning record called in context "
+						"that cannot accept type record")));
+
+	MemSet(values, 0, sizeof(values));
+	MemSet(nulls, false, sizeof(nulls));
+
+	values[0] = BoolGetDatum(report->startup_scan);
+	values[1] = BoolGetDatum(report->failover_rebuild);
+	values[2] = Int32GetDatum(report->tasks_scanned);
+	values[3] = Int32GetDatum(report->attempts_scanned);
+	values[4] = Int32GetDatum(report->checkpoints_scanned);
+	values[5] = Int32GetDatum(report->tasks_requeued);
+	values[6] = Int32GetDatum(report->attempts_fenced);
+	values[7] = Int32GetDatum(report->checkpoints_replayed);
+	values[8] = Int32GetDatum(report->orphan_attempts);
+	values[9] = Int32GetDatum(report->semantic_replay_candidates);
+	values[10] = Int32GetDatum(report->tasks_requeue_suppressed);
+	values[11] = Int32GetDatum(report->attempts_fence_suppressed);
+
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	QxRecoveryFreeReport(report);
+	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+}
+
+Datum
 pg_qx_test_run_startup_recovery(PG_FUNCTION_ARGS)
 {
 	char	   *payload;
 
+	/*
+	 * Regression hook: force a fresh startup recovery pass so tests can observe
+	 * ledger writes and collector stats instead of reusing the per-backend cache.
+	 */
+	qx_runtime_recovery_snapshot.valid = false;
 	qx_runtime_ensure_startup_recovery_scan(GetUserId());
 	payload = qx_runtime_append_recovery_payload(pstrdup("test=startup_recovery"));
 
@@ -6005,6 +6069,7 @@ QxRuntimeSubmitTask(const QxRuntimeTaskRequest *request)
 	(void) QxCatalogInsertSchedulerHeartbeat(heartbeatledgerrel, leaseoid,
 										 final_heartbeat_snapshot);
 	CommandCounterIncrement();
+	QxStatReportSchedulerEvent(MyDatabaseId, "release");
 
 	(void) QxCatalogInsertEvent(eventrel, request->sessionoid, taskoid, InvalidOid,
 						   request->ownerid, NULL,
@@ -6291,6 +6356,7 @@ QxRuntimeResumeTask(Oid taskoid, const char *checkpoint_label, Oid ownerid)
 	(void) QxCatalogInsertSchedulerHeartbeat(heartbeatledgerrel, leaseoid,
 										 final_heartbeat_snapshot);
 	CommandCounterIncrement();
+	QxStatReportSchedulerEvent(MyDatabaseId, "release");
 
 	(void) QxCatalogInsertEvent(eventrel, task.sessionoid, taskoid,
 						   InvalidOid, ownerid, &semantic_meta,

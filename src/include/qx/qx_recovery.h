@@ -108,6 +108,8 @@ typedef struct QxRecoveryReport
 	int32		checkpoints_replayed;
 	int32		orphan_attempts;
 	int32		semantic_replay_candidates;
+	int32		tasks_requeue_suppressed;
+	int32		attempts_fence_suppressed;
 } QxRecoveryReport;
 
 typedef struct QxRecoveryHooks

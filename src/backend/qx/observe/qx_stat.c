@@ -17,6 +17,7 @@
 #include "miscadmin.h"
 #include "qx/qx_catalog.h"
 #include "qx/qx_observe.h"
+#include "qx/qx_recovery.h"
 #include "qx/qx_stat.h"
 #include "storage/ipc.h"
 #include "storage/shmem.h"
@@ -347,6 +348,70 @@ QxStatReportSchedulerEvent(Oid dboid, const char *event_name)
 					   (void *) event_name);
 }
 
+typedef struct QxStatRecoveryMutation
+{
+	bool		failover_rebuild;
+	const QxRecoveryReport *report;
+} QxStatRecoveryMutation;
+
+static void
+qx_stat_mutate_recovery(QxStatCounters *counters, void *ctx)
+{
+	QxStatRecoveryMutation *mutation = (QxStatRecoveryMutation *) ctx;
+
+	if (mutation->failover_rebuild)
+		counters->recovery_failover_rebuilds++;
+	else
+		counters->recovery_startup_scans++;
+
+	if (mutation->report != NULL)
+	{
+		counters->recovery_tasks_requeued += mutation->report->tasks_requeued;
+		counters->recovery_attempts_fenced += mutation->report->attempts_fenced;
+		counters->recovery_tasks_requeue_suppressed +=
+			mutation->report->tasks_requeue_suppressed;
+		counters->recovery_attempts_fence_suppressed +=
+			mutation->report->attempts_fence_suppressed;
+	}
+}
+
+void
+QxStatReportRecoveryScan(Oid dboid, const QxRecoveryReport *report,
+						 bool failover_rebuild)
+{
+	QxStatRecoveryMutation mutation;
+
+	if (!qhapaqxian_track_stats)
+		return;
+
+	mutation.failover_rebuild = failover_rebuild;
+	mutation.report = report;
+	qx_stat_with_entry(dboid, QX_STAT_RECOVERY, InvalidOid, NULL, true,
+					   qx_stat_mutate_recovery, &mutation);
+}
+
+static void
+qx_stat_aggregate_scheduler_locked(Oid dboid, QxStatCounters *totals)
+{
+	int			i;
+
+	MemSet(totals, 0, sizeof(QxStatCounters));
+	for (i = 0; i < QX_STAT_SLOT_COUNT; i++)
+	{
+		QxStatSlot   *slot = &QxStat->slots[i];
+
+		if (!slot->in_use || slot->kind != QX_STAT_SCHEDULER_ACTIVITY ||
+			slot->dboid != dboid)
+			continue;
+
+		totals->renew_count += slot->counters.renew_count;
+		totals->reclaim_count += slot->counters.reclaim_count;
+		totals->release_count += slot->counters.release_count;
+		totals->retry_dispatch_count += slot->counters.retry_dispatch_count;
+		totals->dead_letter_count += slot->counters.dead_letter_count;
+	}
+}
+
 void
 QxStatFlushPending(void)
 {
@@ -531,6 +596,8 @@ pg_qx_stat_reset(PG_FUNCTION_ARGS)
 	else if (pg_strcasecmp(scope, "scheduler") == 0 ||
 			 pg_strcasecmp(scope, "scheduler_activity") == 0)
 		QxStatReset(QX_STAT_SCHEDULER_ACTIVITY);
+	else if (pg_strcasecmp(scope, "recovery") == 0)
+		QxStatReset(QX_STAT_RECOVERY);
 	else
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -759,4 +826,75 @@ pg_qx_stat_get_runtime_class_stats(PG_FUNCTION_ARGS)
 	}
 
 	SRF_RETURN_DONE(funcctx);
+}
+
+Datum
+pg_qx_stat_get_scheduler_activity_stats(PG_FUNCTION_ARGS)
+{
+	TupleDesc	tupdesc;
+	Datum		values[5];
+	bool		nulls[5];
+	QxStatCounters totals;
+	HeapTuple	tuple;
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("function returning record called in context "
+						"that cannot accept type record")));
+
+	qx_stat_ensure_attached();
+	SpinLockAcquire(&QxStat->mutex);
+	qx_stat_aggregate_scheduler_locked(MyDatabaseId, &totals);
+	SpinLockRelease(&QxStat->mutex);
+
+	MemSet(values, 0, sizeof(values));
+	MemSet(nulls, false, sizeof(nulls));
+
+	values[0] = Int64GetDatum(totals.renew_count);
+	values[1] = Int64GetDatum(totals.reclaim_count);
+	values[2] = Int64GetDatum(totals.release_count);
+	values[3] = Int64GetDatum(totals.retry_dispatch_count);
+	values[4] = Int64GetDatum(totals.dead_letter_count);
+
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+}
+
+Datum
+pg_qx_stat_get_recovery_stats(PG_FUNCTION_ARGS)
+{
+	TupleDesc	tupdesc;
+	Datum		values[6];
+	bool		nulls[6];
+	QxStatCounters *counters;
+	HeapTuple	tuple;
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("function returning record called in context "
+						"that cannot accept type record")));
+
+	counters = qx_stat_lookup_entry(MyDatabaseId, QX_STAT_RECOVERY,
+									InvalidOid, NULL, false);
+
+	MemSet(values, 0, sizeof(values));
+	MemSet(nulls, false, sizeof(nulls));
+
+	values[0] = Int64GetDatum(counters != NULL ?
+							  counters->recovery_startup_scans : 0);
+	values[1] = Int64GetDatum(counters != NULL ?
+							  counters->recovery_failover_rebuilds : 0);
+	values[2] = Int64GetDatum(counters != NULL ?
+							  counters->recovery_tasks_requeued : 0);
+	values[3] = Int64GetDatum(counters != NULL ?
+							  counters->recovery_attempts_fenced : 0);
+	values[4] = Int64GetDatum(counters != NULL ?
+							  counters->recovery_tasks_requeue_suppressed : 0);
+	values[5] = Int64GetDatum(counters != NULL ?
+							  counters->recovery_attempts_fence_suppressed : 0);
+
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
 }

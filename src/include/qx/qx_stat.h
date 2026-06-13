@@ -11,6 +11,8 @@
 #include "nodes/nodes.h"
 #include "utils/timestamp.h"
 
+#include "qx/qx_recovery.h"
+
 #define QX_STAT_RUNTIME_CLASS_LEN	64
 
 typedef enum QxStatKind
@@ -18,7 +20,8 @@ typedef enum QxStatKind
 	QX_STAT_PROVIDER,
 	QX_STAT_PRINCIPAL,
 	QX_STAT_RUNTIME_CLASS,
-	QX_STAT_SCHEDULER_ACTIVITY
+	QX_STAT_SCHEDULER_ACTIVITY,
+	QX_STAT_RECOVERY
 } QxStatKind;
 
 typedef struct QxStatCounters
@@ -33,6 +36,12 @@ typedef struct QxStatCounters
 	int64		release_count;
 	int64		retry_dispatch_count;
 	int64		dead_letter_count;
+	int64		recovery_startup_scans;
+	int64		recovery_failover_rebuilds;
+	int64		recovery_tasks_requeued;
+	int64		recovery_attempts_fenced;
+	int64		recovery_tasks_requeue_suppressed;
+	int64		recovery_attempts_fence_suppressed;
 } QxStatCounters;
 
 extern bool qhapaqxian_track_stats;
@@ -49,6 +58,8 @@ extern void QxStatReportRuntimeClassExecution(Oid dboid,
 											  bool resume, bool checkpointed,
 											  bool receipt_verified);
 extern void QxStatReportSchedulerEvent(Oid dboid, const char *event_name);
+extern void QxStatReportRecoveryScan(Oid dboid, const QxRecoveryReport *report,
+									 bool failover_rebuild);
 extern void QxStatFlushPending(void);
 extern void QxStatReset(QxStatKind kind);
 extern void QxStatResetAll(void);

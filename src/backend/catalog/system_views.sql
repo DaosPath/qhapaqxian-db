@@ -2324,12 +2324,58 @@ CREATE VIEW pg_stat_qx_runtime_classes WITH (security_barrier) AS
             WHERE s.runtime_class = catalog.runtime_class
          ) stats ON true;
 
+CREATE VIEW pg_stat_qx_scheduler_collected WITH (security_barrier) AS
+    SELECT
+        stats.renew_count,
+        stats.reclaim_count,
+        stats.release_count,
+        stats.retry_dispatch_count,
+        stats.dead_letter_count,
+        ledger.renew_event_count,
+        ledger.reclaim_event_count,
+        ledger.release_event_count,
+        ledger.retry_queue_snapshot_count,
+        ledger.recovery_queue_snapshot_count
+    FROM pg_qx_stat_get_scheduler_activity_stats() AS stats(renew_count bigint,
+                                                           reclaim_count bigint,
+                                                           release_count bigint,
+                                                           retry_dispatch_count bigint,
+                                                           dead_letter_count bigint)
+         CROSS JOIN (
+            SELECT
+                COALESCE(sum(renew_event_count), 0::bigint) AS renew_event_count,
+                COALESCE(sum(reclaim_event_count), 0::bigint) AS reclaim_event_count,
+                COALESCE(sum(release_event_count), 0::bigint) AS release_event_count,
+                COALESCE(sum(retry_queue_snapshot_count), 0::bigint) AS retry_queue_snapshot_count,
+                COALESCE(sum(recovery_queue_snapshot_count), 0::bigint) AS recovery_queue_snapshot_count
+            FROM pg_stat_qx_scheduler_activity
+         ) ledger;
+
+
+CREATE VIEW pg_stat_qx_recovery WITH (security_barrier) AS
+    SELECT
+        stats.startup_scan_count,
+        stats.failover_rebuild_count,
+        stats.tasks_requeued,
+        stats.attempts_fenced,
+        stats.tasks_requeue_suppressed,
+        stats.attempts_fence_suppressed
+    FROM pg_qx_stat_get_recovery_stats() AS stats(startup_scan_count bigint,
+                                                  failover_rebuild_count bigint,
+                                                  tasks_requeued bigint,
+                                                  attempts_fenced bigint,
+                                                  tasks_requeue_suppressed bigint,
+                                                  attempts_fence_suppressed bigint);
+
+
 GRANT SELECT ON pg_stat_qx_agents TO PUBLIC;
 GRANT SELECT ON pg_stat_qx_sessions TO PUBLIC;
 GRANT SELECT ON pg_stat_qx_tasks TO PUBLIC;
 GRANT SELECT ON pg_stat_qx_scheduler_queues TO PUBLIC;
 GRANT SELECT ON pg_stat_qx_scheduler_workers TO PUBLIC;
 GRANT SELECT ON pg_stat_qx_scheduler_activity TO PUBLIC;
+GRANT SELECT ON pg_stat_qx_scheduler_collected TO PUBLIC;
+GRANT SELECT ON pg_stat_qx_recovery TO PUBLIC;
 GRANT SELECT ON pg_stat_qx_scheduler_retry_backoff TO PUBLIC;
 GRANT SELECT ON pg_stat_qx_scheduler_worker_balance TO PUBLIC;
 GRANT SELECT ON pg_stat_qx_scheduler_ledger_queues TO PUBLIC;
@@ -2352,6 +2398,7 @@ REVOKE ALL ON pg_qx_scheduler_lease FROM PUBLIC;
 REVOKE ALL ON pg_qx_scheduler_heartbeat FROM PUBLIC;
 REVOKE ALL ON pg_qx_memory FROM PUBLIC;
 REVOKE ALL ON FUNCTION pg_qx_test_start_recovery_attempt(oid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION pg_qx_recovery_scan() FROM PUBLIC;
 REVOKE ALL ON FUNCTION pg_qx_test_run_startup_recovery() FROM PUBLIC;
 REVOKE ALL ON FUNCTION pg_qx_test_run_failover_rebuild() FROM PUBLIC;
 REVOKE ALL ON FUNCTION pg_qx_test_run_scheduler_worker_tick() FROM PUBLIC;
