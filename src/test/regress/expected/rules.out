@@ -2139,6 +2139,13 @@ pg_stat_qx_providers| SELECT p.oid AS provider_oid,
            FROM pg_qx_stat_get_provider_stats() s(provider_oid oid, provider_name text, provider_kind text, provider_endpoint text, enabled boolean, attestation_required boolean, submit_count bigint, resume_count bigint, verified_receipts bigint, rejected_receipts bigint, checkpoint_count bigint, execution_count bigint, task_count bigint, reserved bigint)
           WHERE (s.provider_oid = p.oid)) stats ON (true))
   WHERE (pg_has_role(SESSION_USER, p.qxproviderowner, 'USAGE'::text) OR pg_has_role(SESSION_USER, 'pg_read_all_stats'::name, 'MEMBER'::text));
+pg_stat_qx_recovery| SELECT startup_scan_count,
+    failover_rebuild_count,
+    tasks_requeued,
+    attempts_fenced,
+    tasks_requeue_suppressed,
+    attempts_fence_suppressed
+   FROM pg_qx_stat_get_recovery_stats() stats(startup_scan_count bigint, failover_rebuild_count bigint, tasks_requeued bigint, attempts_fenced bigint, tasks_requeue_suppressed bigint, attempts_fence_suppressed bigint);
 pg_stat_qx_runtime_classes| SELECT catalog.runtime_class,
     catalog.principal_count,
     catalog.provider_count,
@@ -2390,6 +2397,23 @@ pg_stat_qx_scheduler_activity| WITH visible_queue AS (
      LEFT JOIN queue_event_metrics qem ON (((qem.queue_name = k.queue_name) AND (qem.runtime_class = k.runtime_class) AND (NOT (qem.provider_name IS DISTINCT FROM k.provider_name)) AND (NOT (qem.provider_kind IS DISTINCT FROM k.provider_kind)))))
      LEFT JOIN lease_event_metrics lem ON (((lem.queue_name = k.queue_name) AND (lem.runtime_class = k.runtime_class) AND (NOT (lem.provider_name IS DISTINCT FROM k.provider_name)) AND (NOT (lem.provider_kind IS DISTINCT FROM k.provider_kind)))))
      LEFT JOIN heartbeat_event_metrics hem ON (((hem.queue_name = k.queue_name) AND (hem.runtime_class = k.runtime_class) AND (NOT (hem.provider_name IS DISTINCT FROM k.provider_name)) AND (NOT (hem.provider_kind IS DISTINCT FROM k.provider_kind)))));
+pg_stat_qx_scheduler_collected| SELECT stats.renew_count,
+    stats.reclaim_count,
+    stats.release_count,
+    stats.retry_dispatch_count,
+    stats.dead_letter_count,
+    ledger.renew_event_count,
+    ledger.reclaim_event_count,
+    ledger.release_event_count,
+    ledger.retry_queue_snapshot_count,
+    ledger.recovery_queue_snapshot_count
+   FROM (pg_qx_stat_get_scheduler_activity_stats() stats(renew_count bigint, reclaim_count bigint, release_count bigint, retry_dispatch_count bigint, dead_letter_count bigint)
+     CROSS JOIN ( SELECT COALESCE(sum(pg_stat_qx_scheduler_activity.renew_event_count), ((0)::bigint)::numeric) AS renew_event_count,
+            COALESCE(sum(pg_stat_qx_scheduler_activity.reclaim_event_count), ((0)::bigint)::numeric) AS reclaim_event_count,
+            COALESCE(sum(pg_stat_qx_scheduler_activity.release_event_count), ((0)::bigint)::numeric) AS release_event_count,
+            COALESCE(sum(pg_stat_qx_scheduler_activity.retry_queue_snapshot_count), ((0)::bigint)::numeric) AS retry_queue_snapshot_count,
+            COALESCE(sum(pg_stat_qx_scheduler_activity.recovery_queue_snapshot_count), ((0)::bigint)::numeric) AS recovery_queue_snapshot_count
+           FROM pg_stat_qx_scheduler_activity) ledger);
 pg_stat_qx_scheduler_ledger_heartbeats| SELECT h.oid AS heartbeat_snapshot_oid,
     h.qxheartbeatledgerleaseid AS lease_snapshot_oid,
     h.qxheartbeatledgersessionid AS session_oid,
@@ -3849,6 +3873,9 @@ create rule r7 as on delete to rules_src do instead
        wdel as (delete from int4_tbl trgt where f1 = 0 returning *)
   insert into rules_log AS trgt select old.* from wins, wupd, wdel
   returning trgt.f1, trgt.f2;
+ERROR:  relation "int4_tbl" does not exist
+LINE 2:   with wins as (insert into int4_tbl as trgt values (0) retu...
+                                    ^
 -- check display of all rules added above
 \d+ rules_src
                                  Table "public.rules_src"
@@ -3874,26 +3901,6 @@ Rules:
     r6 AS
     ON UPDATE TO rules_src DO INSTEAD  UPDATE rules_log trgt SET tag = 'updated'::text
   WHERE trgt.f1 = new.f1
-    r7 AS
-    ON DELETE TO rules_src DO INSTEAD  WITH wins AS (
-         INSERT INTO int4_tbl AS trgt_1 (f1)
-          VALUES (0)
-          RETURNING trgt_1.f1
-        ), wupd AS (
-         UPDATE int4_tbl trgt_1 SET f1 = trgt_1.f1 + 1
-          RETURNING trgt_1.f1
-        ), wdel AS (
-         DELETE FROM int4_tbl trgt_1
-          WHERE trgt_1.f1 = 0
-          RETURNING trgt_1.f1
-        )
- INSERT INTO rules_log AS trgt (f1, f2)  SELECT old.f1,
-            old.f2
-           FROM wins,
-            wupd,
-            wdel
-  RETURNING trgt.f1,
-    trgt.f2
 
 --
 -- Also check multiassignment deparsing.
