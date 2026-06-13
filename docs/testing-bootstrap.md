@@ -184,6 +184,62 @@ Focused local command shape:
   coverage and autonomous retry dead-letter coverage to the same focused
   `qx_stage3_agentic` lane.
 
+Catalog change sync before regress:
+- Any bootstrap stage that touches catalog metadata must refresh the temp
+  install before trusting regress output. Typical triggers are
+  `src/include/catalog/{catversion.h,*.dat}`, catalog headers consumed by
+  `genbki.pl`, new or changed entries in `pg_proc.dat`, and
+  `src/backend/catalog/system_views.sql`.
+- `postgresql:setup` runs `meson install` into `tmp_install` with
+  `--only-changed --no-rebuild`. After catalog edits, `meson compile` regenerates
+  `src/include/catalog/postgres.bki` in the build tree, but Meson may skip
+  recopying `postgres.bki` or `system_views.sql` into
+  `tmp_install/usr/local/pgsql/share/` even though `initdb` and
+  `initdb-template` still read those share files.
+- Stale share metadata shows up as missing `pg_qx_*` functions or views,
+  initdb/bootstrap failures, focused tests that pass only after a manual sync,
+  or full `regress/regress` drift unrelated to the code under test.
+- Default recovery sequence after catalog changes:
+  1. `meson compile -C build-stage4-codex -j 2`
+  2. `meson test -C build-stage4-codex --suite postgresql:setup --print-errorlogs`
+     to refresh `tmp_install` and rebuild `tmp_install/initdb-template`
+  3. If regress still sees stale catalogs, force-sync the share files, then
+     rerun `initdb_cache`:
+     - generated BKI:
+       `build-stage4-codex/src/include/catalog/postgres.bki`
+     - installed BKI:
+       `build-stage4-codex/tmp_install/usr/local/pgsql/share/postgres.bki`
+     - source views:
+       `src/backend/catalog/system_views.sql`
+     - installed views:
+       `build-stage4-codex/tmp_install/usr/local/pgsql/share/system_views.sql`
+  4. Run `regress/regress` or the focused QX suite only after setup is green.
+
+Force-sync examples when step 2 is not enough:
+
+```powershell
+$bd = "build-stage4-codex"
+$share = "$bd/tmp_install/usr/local/pgsql/share"
+Copy-Item -Force "$bd/src/include/catalog/postgres.bki" "$share/postgres.bki"
+Copy-Item -Force "src/backend/catalog/system_views.sql" "$share/system_views.sql"
+meson test -C $bd initdb_cache --print-errorlogs
+```
+
+```bash
+bd=build-stage4-codex
+share="$bd/tmp_install/usr/local/pgsql/share"
+cp -f "$bd/src/include/catalog/postgres.bki" "$share/postgres.bki"
+cp -f src/backend/catalog/system_views.sql "$share/system_views.sql"
+meson test -C "$bd" initdb_cache --print-errorlogs
+```
+
+- Treat `initdb-template` as part of the same contract: if share metadata
+  changes, rerun `postgresql:setup` (or at least `initdb_cache`) before a
+  full sweep. Reusing an old template leaves every regress cluster on the
+  previous bootstrap catalog even when binaries and expected files are current.
+- This is especially common after Stages that bump `catversion`, add SRFs to
+  `pg_proc.dat`, or extend `pg_stat_qx_*` views in `system_views.sql`.
+
 Validated real-backend sweep on 2026-04-20:
 - Windows: `meson compile -C build-stage4-codex -j 2`
 - Windows: `meson test -C build-stage4-codex --suite postgresql:setup --print-errorlogs`
