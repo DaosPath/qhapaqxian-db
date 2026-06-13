@@ -16,6 +16,7 @@
 #include "nodes/nodes.h"
 #include "nodes/pg_list.h"
 #include "qx/qx_scheduler.h"
+#include "qx/qx_semantic_log.h"
 
 struct RelationData;
 typedef struct RelationData *Relation;
@@ -208,6 +209,28 @@ typedef struct QxCatalogCheckpointInfo
 	char	   *data;
 } QxCatalogCheckpointInfo;
 
+typedef struct QxCatalogTaskInsertParams
+{
+	Oid			sessionoid;
+	Oid			agentoid;
+	Oid			identityoid;
+	Oid			namespace_policy_oid;
+	Oid			ownerid;
+	const char *task_name;
+	const char *goal;
+	Node	   *input;
+	const char *priority;
+	List	   *authorized_tools;
+	const char *submit_contract;
+	const char *resume_contract;
+	int32		budget_tokens;
+	int32		budget_cost;
+	int32		authorized_tool_tokens;
+	int32		authorized_tool_cost;
+	int32		estimated_tokens;
+	int32		estimated_cost;
+} QxCatalogTaskInsertParams;
+
 extern void QxCatalogFreeAgentInfo(QxCatalogAgentInfo *info);
 extern void QxCatalogFreeIdentityInfo(QxCatalogIdentityInfo *info);
 extern void QxCatalogFreeProviderInfo(QxCatalogProviderInfo *info);
@@ -221,6 +244,9 @@ extern void QxCatalogFreeCheckpointInfo(QxCatalogCheckpointInfo *info);
 extern void QxCatalogFreeTaskInfoList(List *tasks);
 extern void QxCatalogFreeAttemptInfoList(List *attempts);
 extern void QxCatalogFreeCheckpointInfoList(List *checkpoints);
+extern void QxCatalogFreeProviderInfoList(List *providers);
+extern void QxCatalogFreePrincipalInfoList(List *principals);
+extern void QxCatalogFreeStringList(List *strings);
 
 extern bool QxCatalogLookupAgentByOid(Oid agentoid, QxCatalogAgentInfo *info);
 extern bool QxCatalogLookupAgentByName(Oid namespaceoid, const char *name,
@@ -255,6 +281,9 @@ extern bool QxCatalogLookupCheckpointByOid(Oid checkpointoid,
 extern List *QxCatalogBuildTaskInfoList(Oid databaseoid, Oid ownerid);
 extern List *QxCatalogBuildAttemptInfoList(Oid databaseoid, Oid ownerid);
 extern List *QxCatalogBuildCheckpointInfoList(Oid databaseoid, Oid ownerid);
+extern List *QxCatalogBuildProviderInfoList(Oid namespaceoid, Oid ownerid);
+extern List *QxCatalogBuildPrincipalInfoList(Oid namespaceoid, Oid ownerid);
+extern List *QxCatalogBuildDistinctRuntimeClassList(void);
 
 extern bool QxCatalogLookupLatestSchedulerQueue(Oid dboid, Oid taskoid,
 												Oid attemptoid,
@@ -275,5 +304,32 @@ extern void QxCatalogUpdateAttemptState(Relation attemptrel, Oid attemptoid,
 extern void QxCatalogChargeTaskBudget(Relation taskrel, Oid taskoid,
 									  int32 token_delta, int32 cost_delta,
 									  const char *charge_name);
+
+extern Oid QxCatalogInsertAttempt(Relation rel, Oid sessionoid, Oid taskoid,
+								  Oid ownerid, Oid resumecheckpointid, int16 seqno,
+								  char state, const char *strategy);
+extern Oid QxCatalogInsertStep(Relation rel, Oid sessionoid, Oid taskoid,
+								 int16 seqno, const char *name, const char *detail);
+extern Oid QxCatalogInsertEvent(Relation rel, Oid sessionoid, Oid taskoid,
+								  Oid stepoid, Oid ownerid,
+								  const QxSemanticExecutionMetadata *metadata,
+								  const char *kind, const char *payload);
+extern Oid QxCatalogInsertTrace(Relation rel, Oid sessionoid, Oid taskoid,
+								 Oid stepoid, Oid ownerid,
+								 const QxSemanticExecutionMetadata *metadata,
+								 const char *name, const char *detail);
+extern Oid QxCatalogInsertCheckpoint(Relation rel, Oid sessionoid, Oid taskoid,
+									   Oid attemptoid, Oid stepoid, Oid ownerid,
+									   const QxSemanticExecutionMetadata *metadata,
+									   char taskstate, int16 nextstepseqno,
+									   const char *label, const char *data);
+extern Oid QxCatalogInsertSchedulerQueue(Relation rel,
+										 const QxSchedulerQueueSnapshot *snapshot);
+extern Oid QxCatalogInsertSchedulerLease(Relation rel, Oid queueoid,
+										 const QxSchedulerLeaseSnapshot *snapshot);
+extern Oid QxCatalogInsertSchedulerHeartbeat(Relation rel, Oid leaseoid,
+											 const QxSchedulerHeartbeatSnapshot *snapshot);
+extern Oid QxCatalogInsertTask(Relation taskrel,
+							   const QxCatalogTaskInsertParams *params);
 
 #endif							/* QX_CATALOG_H */

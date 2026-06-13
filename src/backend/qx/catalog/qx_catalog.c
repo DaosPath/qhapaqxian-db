@@ -1,4 +1,4 @@
-/*-------------------------------------------------------------------------
+﻿/*-------------------------------------------------------------------------
  *
  * qx_catalog.c
  *	  catalog helper snapshots for QhapaqXian Engine
@@ -9,8 +9,11 @@
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
+#include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
+#include "catalog/objectaccess.h"
+#include "catalog/objectaddress.h"
 #include "catalog/pg_qx_agent.h"
 #include "catalog/pg_qx_attempt.h"
 #include "catalog/pg_qx_checkpoint.h"
@@ -19,14 +22,22 @@
 #include "catalog/pg_qx_principal.h"
 #include "catalog/pg_qx_provider.h"
 #include "catalog/pg_qx_session.h"
+#include "catalog/pg_qx_event.h"
+#include "catalog/pg_qx_scheduler_heartbeat.h"
 #include "catalog/pg_qx_scheduler_lease.h"
 #include "catalog/pg_qx_scheduler_queue.h"
 #include "catalog/pg_qx_step.h"
 #include "catalog/pg_qx_task.h"
 #include "catalog/pg_qx_tool.h"
+#include "catalog/pg_qx_trace.h"
+#include "miscadmin.h"
 #include "qx/qx_catalog.h"
+#include "qx/qx_observe.h"
 #include "qx/qx_scheduler.h"
+#include "qx/qx_semantic_log.h"
+#include "qx/qx_stat.h"
 #include "utils/builtins.h"
+#include "utils/pg_lsn.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
@@ -62,6 +73,13 @@ static HeapTuple qx_catalog_lookup_tool_tuple(Oid namespaceoid,
 											  const char *name);
 static bool qx_catalog_matches_filter(Oid rowdbid, Oid rowownerid,
 									  Oid databaseoid, Oid ownerid);
+static bool qx_catalog_matches_namespace_filter(Oid rownamespaceoid,
+												Oid rowownerid,
+												Oid namespaceoid, Oid ownerid);
+static void qx_catalog_set_text_datum(Datum *values, bool *nulls,
+									  AttrNumber attnum, const char *value);
+static void qx_catalog_set_nodetree_datum(Datum *values, bool *nulls,
+										  AttrNumber attnum, const void *node);
 static char *qx_catalog_merge_optional_pair(const char *left,
 											const char *right);
 
@@ -123,6 +141,49 @@ qx_catalog_matches_filter(Oid rowdbid, Oid rowownerid,
 		return false;
 
 	return true;
+}
+
+static bool
+qx_catalog_matches_namespace_filter(Oid rownamespaceoid, Oid rowownerid,
+									Oid namespaceoid, Oid ownerid)
+{
+	if (OidIsValid(namespaceoid) && rownamespaceoid != namespaceoid)
+		return false;
+
+	if (OidIsValid(ownerid) && rowownerid != ownerid)
+		return false;
+
+	return true;
+}
+
+static void
+qx_catalog_set_text_datum(Datum *values, bool *nulls, AttrNumber attnum,
+						  const char *value)
+{
+	if (value == NULL)
+	{
+		nulls[attnum - 1] = true;
+		return;
+	}
+
+	values[attnum - 1] = CStringGetTextDatum(value);
+}
+
+static void
+qx_catalog_set_nodetree_datum(Datum *values, bool *nulls, AttrNumber attnum,
+							  const void *node)
+{
+	char	   *serialized;
+
+	if (node == NULL)
+	{
+		nulls[attnum - 1] = true;
+		return;
+	}
+
+	serialized = nodeToString(node);
+	values[attnum - 1] = CStringGetTextDatum(serialized);
+	pfree(serialized);
 }
 
 static void
@@ -957,6 +1018,54 @@ QxCatalogFreeCheckpointInfoList(List *checkpoints)
 	list_free(checkpoints);
 }
 
+void
+QxCatalogFreeProviderInfoList(List *providers)
+{
+	ListCell   *lc;
+
+	foreach(lc, providers)
+	{
+		QxCatalogProviderInfo *info = lfirst(lc);
+
+		QxCatalogFreeProviderInfo(info);
+		pfree(info);
+	}
+
+	list_free(providers);
+}
+
+void
+QxCatalogFreePrincipalInfoList(List *principals)
+{
+	ListCell   *lc;
+
+	foreach(lc, principals)
+	{
+		QxCatalogPrincipalInfo *info = lfirst(lc);
+
+		QxCatalogFreePrincipalInfo(info);
+		pfree(info);
+	}
+
+	list_free(principals);
+}
+
+void
+QxCatalogFreeStringList(List *strings)
+{
+	ListCell   *lc;
+
+	foreach(lc, strings)
+	{
+		char	   *value = lfirst(lc);
+
+		if (value != NULL)
+			pfree(value);
+	}
+
+	list_free(strings);
+}
+
 bool
 QxCatalogLookupNamespacePolicyByOid(Oid policyoid,
 									QxCatalogNamespacePolicyInfo *info)
@@ -1218,6 +1327,109 @@ QxCatalogBuildCheckpointInfoList(Oid databaseoid, Oid ownerid)
 	table_close(rel, AccessShareLock);
 
 	return checkpoints;
+}
+
+List *
+QxCatalogBuildProviderInfoList(Oid namespaceoid, Oid ownerid)
+{
+	Relation	rel;
+	TableScanDesc scan;
+	HeapTuple	tup;
+	List	   *providers = NIL;
+
+	rel = table_open(QxProviderRelationId, AccessShareLock);
+	scan = table_beginscan_catalog(rel, 0, NULL);
+
+	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	{
+		Form_pg_qx_provider form = (Form_pg_qx_provider) GETSTRUCT(tup);
+		QxCatalogProviderInfo *info;
+
+		if (!qx_catalog_matches_namespace_filter(form->qxprovidernamespace,
+												 form->qxproviderowner,
+												 namespaceoid,
+												 ownerid))
+			continue;
+
+		info = palloc0(sizeof(QxCatalogProviderInfo));
+		qx_catalog_fill_provider_info(tup, info);
+		providers = lappend(providers, info);
+	}
+
+	table_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	return providers;
+}
+
+List *
+QxCatalogBuildPrincipalInfoList(Oid namespaceoid, Oid ownerid)
+{
+	Relation	rel;
+	TableScanDesc scan;
+	HeapTuple	tup;
+	List	   *principals = NIL;
+
+	rel = table_open(QxPrincipalRelationId, AccessShareLock);
+	scan = table_beginscan_catalog(rel, 0, NULL);
+
+	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	{
+		Form_pg_qx_principal form = (Form_pg_qx_principal) GETSTRUCT(tup);
+		QxCatalogPrincipalInfo *info;
+
+		if (!qx_catalog_matches_namespace_filter(form->qxprincipalnamespace,
+												 form->qxprincipalowner,
+												 namespaceoid,
+												 ownerid))
+			continue;
+
+		info = palloc0(sizeof(QxCatalogPrincipalInfo));
+		qx_catalog_fill_principal_info(tup, info);
+		principals = lappend(principals, info);
+	}
+
+	table_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	return principals;
+}
+
+List *
+QxCatalogBuildDistinctRuntimeClassList(void)
+{
+	List	   *principals;
+	List	   *runtime_classes = NIL;
+	ListCell   *lc;
+
+	principals = QxCatalogBuildPrincipalInfoList(InvalidOid, InvalidOid);
+	foreach(lc, principals)
+	{
+		QxCatalogPrincipalInfo *info = lfirst(lc);
+		ListCell   *seen;
+		bool		already_seen = false;
+
+		if (info->runtime_class == NULL || info->runtime_class[0] == '\0')
+			continue;
+
+		foreach(seen, runtime_classes)
+		{
+			const char *existing = (const char *) lfirst(seen);
+
+			if (strcmp(existing, info->runtime_class) == 0)
+			{
+				already_seen = true;
+				break;
+			}
+		}
+
+		if (!already_seen)
+			runtime_classes = lappend(runtime_classes,
+									  pstrdup(info->runtime_class));
+	}
+
+	QxCatalogFreePrincipalInfoList(principals);
+	return runtime_classes;
 }
 
 static char *
@@ -1611,4 +1823,548 @@ QxCatalogChargeTaskBudget(Relation taskrel, Oid taskoid,
 	heap_freetuple(newtup);
 	ReleaseSysCache(tasktup);
 	CommandCounterIncrement();
+}
+
+Oid
+QxCatalogInsertAttempt(Relation rel, Oid sessionoid, Oid taskoid, Oid ownerid,
+					   Oid resumecheckpointid, int16 seqno, char state,
+					   const char *strategy)
+{
+	Datum		values[Natts_pg_qx_attempt];
+	bool		nulls[Natts_pg_qx_attempt];
+	Oid			attemptoid;
+	HeapTuple	tup;
+
+	memset(values, 0, sizeof(values));
+	memset(nulls, false, sizeof(nulls));
+
+	attemptoid = GetNewOidWithIndex(rel, QxAttemptOidIndexId,
+									Anum_pg_qx_attempt_oid);
+	values[Anum_pg_qx_attempt_oid - 1] = ObjectIdGetDatum(attemptoid);
+	values[Anum_pg_qx_attempt_qxattemptdbid - 1] =
+		ObjectIdGetDatum(MyDatabaseId);
+	values[Anum_pg_qx_attempt_qxattemptsessionid - 1] =
+		ObjectIdGetDatum(sessionoid);
+	values[Anum_pg_qx_attempt_qxattempttaskid - 1] = ObjectIdGetDatum(taskoid);
+	values[Anum_pg_qx_attempt_qxattemptowner - 1] = ObjectIdGetDatum(ownerid);
+	values[Anum_pg_qx_attempt_qxattemptresumecheckpointid - 1] =
+		ObjectIdGetDatum(resumecheckpointid);
+	values[Anum_pg_qx_attempt_qxattemptseqno - 1] = Int16GetDatum(seqno);
+	values[Anum_pg_qx_attempt_qxattemptstate - 1] = CharGetDatum(state);
+	qx_catalog_set_text_datum(values, nulls, Anum_pg_qx_attempt_qxattemptstrategy,
+							  strategy);
+
+	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
+	CatalogTupleInsert(rel, tup);
+	heap_freetuple(tup);
+
+	return attemptoid;
+}
+
+Oid
+QxCatalogInsertStep(Relation rel, Oid sessionoid, Oid taskoid, int16 seqno,
+					const char *name, const char *detail)
+{
+	Datum		values[Natts_pg_qx_step];
+	bool		nulls[Natts_pg_qx_step];
+	Oid			stepoid;
+	HeapTuple	tup;
+
+	memset(values, 0, sizeof(values));
+	memset(nulls, false, sizeof(nulls));
+
+	stepoid = GetNewOidWithIndex(rel, QxStepOidIndexId,
+								 Anum_pg_qx_step_oid);
+	values[Anum_pg_qx_step_oid - 1] = ObjectIdGetDatum(stepoid);
+	values[Anum_pg_qx_step_qxstepdbid - 1] = ObjectIdGetDatum(MyDatabaseId);
+	values[Anum_pg_qx_step_qxstepsessionid - 1] = ObjectIdGetDatum(sessionoid);
+	values[Anum_pg_qx_step_qxsteptaskid - 1] = ObjectIdGetDatum(taskoid);
+	values[Anum_pg_qx_step_qxstepseqno - 1] = Int16GetDatum(seqno);
+	values[Anum_pg_qx_step_qxstepstate - 1] =
+		CharGetDatum(QX_STEP_STATE_COMPLETED);
+	qx_catalog_set_text_datum(values, nulls, Anum_pg_qx_step_qxstepname, name);
+	qx_catalog_set_text_datum(values, nulls, Anum_pg_qx_step_qxstepdetail, detail);
+
+	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
+	CatalogTupleInsert(rel, tup);
+	heap_freetuple(tup);
+
+	return stepoid;
+}
+
+Oid
+QxCatalogInsertEvent(Relation rel, Oid sessionoid, Oid taskoid, Oid stepoid,
+					 Oid ownerid, const QxSemanticExecutionMetadata *metadata,
+					 const char *kind, const char *payload)
+{
+	Datum		values[Natts_pg_qx_event];
+	bool		nulls[Natts_pg_qx_event];
+	Oid			eventoid;
+	HeapTuple	tup;
+	XLogRecPtr	eventlsn;
+
+	memset(values, 0, sizeof(values));
+	memset(nulls, false, sizeof(nulls));
+
+	eventoid = GetNewOidWithIndex(rel, QxEventOidIndexId,
+								  Anum_pg_qx_event_oid);
+	values[Anum_pg_qx_event_oid - 1] = ObjectIdGetDatum(eventoid);
+	values[Anum_pg_qx_event_qxeventdbid - 1] = ObjectIdGetDatum(MyDatabaseId);
+	values[Anum_pg_qx_event_qxeventsessionid - 1] =
+		ObjectIdGetDatum(sessionoid);
+	values[Anum_pg_qx_event_qxeventtaskid - 1] = ObjectIdGetDatum(taskoid);
+	values[Anum_pg_qx_event_qxeventstepid - 1] = ObjectIdGetDatum(stepoid);
+	values[Anum_pg_qx_event_qxeventowner - 1] = ObjectIdGetDatum(ownerid);
+	if (metadata != NULL)
+		eventlsn = QxEmitSemanticEventRecordV2(eventoid, sessionoid, taskoid,
+											   stepoid, ownerid, metadata,
+											   kind, payload);
+	else
+		eventlsn = QxEmitSemanticEventRecord(eventoid, sessionoid, taskoid,
+											 stepoid, ownerid, kind, payload);
+	values[Anum_pg_qx_event_qxeventlsn - 1] = LSNGetDatum(eventlsn);
+	qx_catalog_set_text_datum(values, nulls, Anum_pg_qx_event_qxeventkind, kind);
+	qx_catalog_set_text_datum(values, nulls, Anum_pg_qx_event_qxeventpayload, payload);
+
+	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
+	CatalogTupleInsert(rel, tup);
+	heap_freetuple(tup);
+
+	return eventoid;
+}
+
+Oid
+QxCatalogInsertTrace(Relation rel, Oid sessionoid, Oid taskoid, Oid stepoid,
+					 Oid ownerid, const QxSemanticExecutionMetadata *metadata,
+					 const char *name, const char *detail)
+{
+	Datum		values[Natts_pg_qx_trace];
+	bool		nulls[Natts_pg_qx_trace];
+	Oid			traceoid;
+	HeapTuple	tup;
+	XLogRecPtr	tracelsn;
+	const char *trace_detail = detail;
+	char	   *stripped_detail = NULL;
+
+	if (detail != NULL &&
+		name != NULL &&
+		(strcmp(name, "runtime.external_submit") == 0 ||
+		 strcmp(name, "runtime.external_resume") == 0))
+	{
+		stripped_detail = QxObserveNormalizeExternalTraceDetail(detail);
+		trace_detail = stripped_detail;
+	}
+
+	memset(values, 0, sizeof(values));
+	memset(nulls, false, sizeof(nulls));
+
+	traceoid = GetNewOidWithIndex(rel, QxTraceOidIndexId,
+								  Anum_pg_qx_trace_oid);
+	values[Anum_pg_qx_trace_oid - 1] = ObjectIdGetDatum(traceoid);
+	values[Anum_pg_qx_trace_qxtracedbid - 1] = ObjectIdGetDatum(MyDatabaseId);
+	values[Anum_pg_qx_trace_qxtracesessionid - 1] =
+		ObjectIdGetDatum(sessionoid);
+	values[Anum_pg_qx_trace_qxtracetaskid - 1] = ObjectIdGetDatum(taskoid);
+	values[Anum_pg_qx_trace_qxtracestepid - 1] = ObjectIdGetDatum(stepoid);
+	values[Anum_pg_qx_trace_qxtraceowner - 1] = ObjectIdGetDatum(ownerid);
+	values[Anum_pg_qx_trace_qxtracestate - 1] =
+		CharGetDatum(QX_TRACE_STATE_CLOSED);
+	if (metadata != NULL)
+		tracelsn = QxEmitSemanticTraceRecordV2(traceoid, sessionoid, taskoid,
+											   stepoid, ownerid, metadata,
+											   QX_TRACE_STATE_CLOSED, name,
+											   trace_detail);
+	else
+		tracelsn = QxEmitSemanticTraceRecord(traceoid, sessionoid, taskoid,
+											 stepoid, ownerid,
+											 QX_TRACE_STATE_CLOSED, name,
+											 trace_detail);
+	values[Anum_pg_qx_trace_qxtracelsn - 1] = LSNGetDatum(tracelsn);
+	qx_catalog_set_text_datum(values, nulls, Anum_pg_qx_trace_qxtracename, name);
+	qx_catalog_set_text_datum(values, nulls, Anum_pg_qx_trace_qxtracedetail, trace_detail);
+
+	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
+	CatalogTupleInsert(rel, tup);
+	heap_freetuple(tup);
+
+	if (qhapaqxian_track_stats)
+		QxStatReportTrace(name, trace_detail);
+
+	if (stripped_detail != NULL)
+		pfree(stripped_detail);
+
+	return traceoid;
+}
+
+Oid
+QxCatalogInsertCheckpoint(Relation rel, Oid sessionoid, Oid taskoid, Oid attemptoid,
+						  Oid stepoid, Oid ownerid,
+						  const QxSemanticExecutionMetadata *metadata,
+						  char taskstate, int16 nextstepseqno,
+						  const char *label, const char *data)
+{
+	Datum		values[Natts_pg_qx_checkpoint];
+	bool		nulls[Natts_pg_qx_checkpoint];
+	Oid			checkpointoid;
+	HeapTuple	tup;
+	XLogRecPtr	checkpointlsn;
+
+	memset(values, 0, sizeof(values));
+	memset(nulls, false, sizeof(nulls));
+
+	checkpointoid = GetNewOidWithIndex(rel, QxCheckpointOidIndexId,
+									   Anum_pg_qx_checkpoint_oid);
+	values[Anum_pg_qx_checkpoint_oid - 1] = ObjectIdGetDatum(checkpointoid);
+	values[Anum_pg_qx_checkpoint_qxcheckpointdbid - 1] =
+		ObjectIdGetDatum(MyDatabaseId);
+	values[Anum_pg_qx_checkpoint_qxcheckpointsessionid - 1] =
+		ObjectIdGetDatum(sessionoid);
+	values[Anum_pg_qx_checkpoint_qxcheckpointtaskid - 1] =
+		ObjectIdGetDatum(taskoid);
+	values[Anum_pg_qx_checkpoint_qxcheckpointattemptid - 1] =
+		ObjectIdGetDatum(attemptoid);
+	values[Anum_pg_qx_checkpoint_qxcheckpointstepid - 1] =
+		ObjectIdGetDatum(stepoid);
+	values[Anum_pg_qx_checkpoint_qxcheckpointowner - 1] =
+		ObjectIdGetDatum(ownerid);
+	values[Anum_pg_qx_checkpoint_qxcheckpointstate - 1] =
+		CharGetDatum(QX_CHECKPOINT_STATE_DURABLE);
+	values[Anum_pg_qx_checkpoint_qxcheckpointtaskstate - 1] =
+		CharGetDatum(taskstate);
+	values[Anum_pg_qx_checkpoint_qxcheckpointnextstepseqno - 1] =
+		Int16GetDatum(nextstepseqno);
+	if (metadata != NULL)
+		checkpointlsn = QxEmitSemanticCheckpointRecordV2(checkpointoid,
+														 sessionoid, taskoid,
+														 attemptoid, stepoid,
+														 ownerid, metadata,
+														 QX_CHECKPOINT_STATE_DURABLE,
+														 taskstate, nextstepseqno,
+														 label, data);
+	else
+		checkpointlsn = QxEmitSemanticCheckpointRecord(checkpointoid,
+													   sessionoid, taskoid,
+													   attemptoid, stepoid,
+													   ownerid,
+													   QX_CHECKPOINT_STATE_DURABLE,
+													   taskstate, nextstepseqno,
+													   label, data);
+	values[Anum_pg_qx_checkpoint_qxcheckpointlsn - 1] =
+		LSNGetDatum(checkpointlsn);
+	qx_catalog_set_text_datum(values, nulls, Anum_pg_qx_checkpoint_qxcheckpointlabel,
+							  label);
+	qx_catalog_set_text_datum(values, nulls, Anum_pg_qx_checkpoint_qxcheckpointdata,
+							  data);
+
+	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
+	CatalogTupleInsert(rel, tup);
+	heap_freetuple(tup);
+
+	return checkpointoid;
+}
+
+Oid
+QxCatalogInsertSchedulerQueue(Relation rel,
+							  const QxSchedulerQueueSnapshot *snapshot)
+{
+	Datum		values[Natts_pg_qx_scheduler_queue];
+	bool		nulls[Natts_pg_qx_scheduler_queue];
+	Oid			queueoid;
+	HeapTuple	tup;
+
+	Assert(snapshot != NULL);
+
+	memset(values, 0, sizeof(values));
+	memset(nulls, false, sizeof(nulls));
+
+	queueoid = GetNewOidWithIndex(rel, QxSchedulerQueueOidIndexId,
+								  Anum_pg_qx_scheduler_queue_oid);
+	values[Anum_pg_qx_scheduler_queue_oid - 1] = ObjectIdGetDatum(queueoid);
+	values[Anum_pg_qx_scheduler_queue_qxqueueledgerdbid - 1] =
+		ObjectIdGetDatum(MyDatabaseId);
+	values[Anum_pg_qx_scheduler_queue_qxqueueledgerowner - 1] =
+		ObjectIdGetDatum(snapshot->ownerid);
+	values[Anum_pg_qx_scheduler_queue_qxqueueledgernamespaceid - 1] =
+		ObjectIdGetDatum(snapshot->namespace_policy_oid);
+	values[Anum_pg_qx_scheduler_queue_qxqueueledgeragentid - 1] =
+		ObjectIdGetDatum(snapshot->agentoid);
+	values[Anum_pg_qx_scheduler_queue_qxqueueledgersessionid - 1] =
+		ObjectIdGetDatum(snapshot->sessionoid);
+	values[Anum_pg_qx_scheduler_queue_qxqueueledgertaskid - 1] =
+		ObjectIdGetDatum(snapshot->taskoid);
+	values[Anum_pg_qx_scheduler_queue_qxqueueledgerattemptid - 1] =
+		ObjectIdGetDatum(snapshot->attemptoid);
+	values[Anum_pg_qx_scheduler_queue_qxqueueledgerkind - 1] =
+		Int16GetDatum((int16) snapshot->queue_kind);
+	values[Anum_pg_qx_scheduler_queue_qxqueueledgerrunnablecount - 1] =
+		Int32GetDatum(snapshot->runnable_count);
+	values[Anum_pg_qx_scheduler_queue_qxqueueledgerleasedcount - 1] =
+		Int32GetDatum(snapshot->leased_count);
+	values[Anum_pg_qx_scheduler_queue_qxqueueledgerblockedcount - 1] =
+		Int32GetDatum(snapshot->blocked_count);
+	values[Anum_pg_qx_scheduler_queue_qxqueueledgerretrycount - 1] =
+		Int32GetDatum(snapshot->retry_count);
+	values[Anum_pg_qx_scheduler_queue_qxqueueledgerenqueuedat - 1] =
+		TimestampTzGetDatum(snapshot->enqueued_at);
+	values[Anum_pg_qx_scheduler_queue_qxqueueledgereligibleat - 1] =
+		TimestampTzGetDatum(snapshot->eligible_at);
+	values[Anum_pg_qx_scheduler_queue_qxqueueledgerupdatedat - 1] =
+		TimestampTzGetDatum(snapshot->updated_at);
+	qx_catalog_set_text_datum(values, nulls,
+							  Anum_pg_qx_scheduler_queue_qxqueueledgername,
+							  snapshot->queue_name);
+	qx_catalog_set_text_datum(values, nulls,
+							  Anum_pg_qx_scheduler_queue_qxqueueledgeragentname,
+							  snapshot->agent_name);
+	qx_catalog_set_text_datum(values, nulls,
+							  Anum_pg_qx_scheduler_queue_qxqueueledgeridentityname,
+							  snapshot->identity_name);
+	qx_catalog_set_text_datum(values, nulls,
+							  Anum_pg_qx_scheduler_queue_qxqueueledgernamespacepolicyname,
+							  snapshot->namespace_policy_name);
+	qx_catalog_set_text_datum(values, nulls,
+							  Anum_pg_qx_scheduler_queue_qxqueueledgerpriority,
+							  snapshot->priority);
+	qx_catalog_set_text_datum(values, nulls,
+							  Anum_pg_qx_scheduler_queue_qxqueueledgerprincipalname,
+							  snapshot->principal_name);
+	qx_catalog_set_text_datum(values, nulls,
+							  Anum_pg_qx_scheduler_queue_qxqueueledgerprovidername,
+							  snapshot->provider_name);
+	qx_catalog_set_text_datum(values, nulls,
+							  Anum_pg_qx_scheduler_queue_qxqueueledgerproviderkind,
+							  snapshot->provider_kind);
+	qx_catalog_set_text_datum(values, nulls,
+							  Anum_pg_qx_scheduler_queue_qxqueueledgerprincipalruntime,
+							  snapshot->principal_runtime);
+
+	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
+	CatalogTupleInsert(rel, tup);
+	heap_freetuple(tup);
+
+	return queueoid;
+}
+
+Oid
+QxCatalogInsertSchedulerLease(Relation rel, Oid queueoid,
+							  const QxSchedulerLeaseSnapshot *snapshot)
+{
+	Datum		values[Natts_pg_qx_scheduler_lease];
+	bool		nulls[Natts_pg_qx_scheduler_lease];
+	Oid			leaseoid;
+	HeapTuple	tup;
+
+	Assert(snapshot != NULL);
+
+	memset(values, 0, sizeof(values));
+	memset(nulls, false, sizeof(nulls));
+
+	leaseoid = GetNewOidWithIndex(rel, QxSchedulerLeaseOidIndexId,
+								  Anum_pg_qx_scheduler_lease_oid);
+	values[Anum_pg_qx_scheduler_lease_oid - 1] = ObjectIdGetDatum(leaseoid);
+	values[Anum_pg_qx_scheduler_lease_qxleaseledgerdbid - 1] =
+		ObjectIdGetDatum(MyDatabaseId);
+	values[Anum_pg_qx_scheduler_lease_qxleaseledgerowner - 1] =
+		ObjectIdGetDatum(snapshot->ownerid);
+	values[Anum_pg_qx_scheduler_lease_qxleaseledgerqueueid - 1] =
+		ObjectIdGetDatum(queueoid);
+	values[Anum_pg_qx_scheduler_lease_qxleaseledgerworkerid - 1] =
+		ObjectIdGetDatum(snapshot->workeroid);
+	values[Anum_pg_qx_scheduler_lease_qxleaseledgersessionid - 1] =
+		ObjectIdGetDatum(snapshot->sessionoid);
+	values[Anum_pg_qx_scheduler_lease_qxleaseledgertaskid - 1] =
+		ObjectIdGetDatum(snapshot->taskoid);
+	values[Anum_pg_qx_scheduler_lease_qxleaseledgerattemptid - 1] =
+		ObjectIdGetDatum(snapshot->attemptoid);
+	values[Anum_pg_qx_scheduler_lease_qxleaseledgerstate - 1] =
+		Int16GetDatum((int16) snapshot->state);
+	values[Anum_pg_qx_scheduler_lease_qxleaseledgeracquiredat - 1] =
+		TimestampTzGetDatum(snapshot->acquired_at);
+	values[Anum_pg_qx_scheduler_lease_qxleaseledgerrenewedat - 1] =
+		TimestampTzGetDatum(snapshot->renewed_at);
+	values[Anum_pg_qx_scheduler_lease_qxleaseledgerexpiresat - 1] =
+		TimestampTzGetDatum(snapshot->expires_at);
+	values[Anum_pg_qx_scheduler_lease_qxleaseledgerlastheartbeatat - 1] =
+		TimestampTzGetDatum(snapshot->last_heartbeat_at);
+	values[Anum_pg_qx_scheduler_lease_qxleaseledgerrenewalcount - 1] =
+		Int32GetDatum(snapshot->renewal_count);
+	values[Anum_pg_qx_scheduler_lease_qxleaseledgerneedsrecovery - 1] =
+		BoolGetDatum(snapshot->needs_recovery);
+	qx_catalog_set_text_datum(values, nulls,
+							  Anum_pg_qx_scheduler_lease_qxleaseledgerqueuename,
+							  snapshot->queue_name);
+	qx_catalog_set_text_datum(values, nulls,
+							  Anum_pg_qx_scheduler_lease_qxleaseledgerworkername,
+							  snapshot->worker_name);
+	qx_catalog_set_text_datum(values, nulls,
+							  Anum_pg_qx_scheduler_lease_qxleaseledgerleasetoken,
+							  snapshot->lease_token);
+	qx_catalog_set_text_datum(values, nulls,
+							  Anum_pg_qx_scheduler_lease_qxleaseledgerprincipalname,
+							  snapshot->principal_name);
+	qx_catalog_set_text_datum(values, nulls,
+							  Anum_pg_qx_scheduler_lease_qxleaseledgerprovidername,
+							  snapshot->provider_name);
+	qx_catalog_set_text_datum(values, nulls,
+							  Anum_pg_qx_scheduler_lease_qxleaseledgerproviderkind,
+							  snapshot->provider_kind);
+	qx_catalog_set_text_datum(values, nulls,
+							  Anum_pg_qx_scheduler_lease_qxleaseledgerprincipalruntime,
+							  snapshot->principal_runtime);
+
+	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
+	CatalogTupleInsert(rel, tup);
+	heap_freetuple(tup);
+
+	return leaseoid;
+}
+
+Oid
+QxCatalogInsertSchedulerHeartbeat(Relation rel, Oid leaseoid,
+								  const QxSchedulerHeartbeatSnapshot *snapshot)
+{
+	Datum		values[Natts_pg_qx_scheduler_heartbeat];
+	bool		nulls[Natts_pg_qx_scheduler_heartbeat];
+	Oid			heartbeatoid;
+	HeapTuple	tup;
+
+	Assert(snapshot != NULL);
+
+	memset(values, 0, sizeof(values));
+	memset(nulls, false, sizeof(nulls));
+
+	heartbeatoid = GetNewOidWithIndex(rel, QxSchedulerHeartbeatOidIndexId,
+									  Anum_pg_qx_scheduler_heartbeat_oid);
+	values[Anum_pg_qx_scheduler_heartbeat_oid - 1] =
+		ObjectIdGetDatum(heartbeatoid);
+	values[Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerdbid - 1] =
+		ObjectIdGetDatum(MyDatabaseId);
+	values[Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerowner - 1] =
+		ObjectIdGetDatum(snapshot->ownerid);
+	values[Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerleaseid - 1] =
+		ObjectIdGetDatum(leaseoid);
+	values[Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerworkerid - 1] =
+		ObjectIdGetDatum(snapshot->workeroid);
+	values[Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgersessionid - 1] =
+		ObjectIdGetDatum(snapshot->sessionoid);
+	values[Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgertaskid - 1] =
+		ObjectIdGetDatum(snapshot->taskoid);
+	values[Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerattemptid - 1] =
+		ObjectIdGetDatum(snapshot->attemptoid);
+	values[Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerstate - 1] =
+		Int16GetDatum((int16) snapshot->state);
+	values[Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerlagms - 1] =
+		Int32GetDatum(snapshot->lag_ms);
+	values[Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerobservedat - 1] =
+		TimestampTzGetDatum(snapshot->observed_at);
+	values[Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerexpectedbefore - 1] =
+		TimestampTzGetDatum(snapshot->expected_before);
+	values[Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerstale - 1] =
+		BoolGetDatum(snapshot->stale);
+	qx_catalog_set_text_datum(values, nulls,
+							  Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerworkername,
+							  snapshot->worker_name);
+	qx_catalog_set_text_datum(values, nulls,
+							  Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerqueuename,
+							  snapshot->queue_name);
+	qx_catalog_set_text_datum(values, nulls,
+							  Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerprincipalruntime,
+							  snapshot->principal_runtime);
+	qx_catalog_set_text_datum(values, nulls,
+							  Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerproviderkind,
+							  snapshot->provider_kind);
+	qx_catalog_set_text_datum(values, nulls,
+							  Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerreceiptmode,
+							  snapshot->receipt_mode);
+
+	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
+	CatalogTupleInsert(rel, tup);
+	heap_freetuple(tup);
+
+	return heartbeatoid;
+}
+
+Oid
+QxCatalogInsertTask(Relation taskrel, const QxCatalogTaskInsertParams *params)
+{
+	Datum		values[Natts_pg_qx_task];
+	bool		nulls[Natts_pg_qx_task];
+	HeapTuple	tup;
+	Oid			taskoid;
+	ObjectAddress myself;
+	ObjectAddress referenced;
+
+	Assert(params != NULL);
+
+	memset(values, 0, sizeof(values));
+	memset(nulls, false, sizeof(nulls));
+
+	taskoid = GetNewOidWithIndex(taskrel, QxTaskOidIndexId,
+								 Anum_pg_qx_task_oid);
+	values[Anum_pg_qx_task_oid - 1] = ObjectIdGetDatum(taskoid);
+	values[Anum_pg_qx_task_qxtaskdbid - 1] = ObjectIdGetDatum(MyDatabaseId);
+	values[Anum_pg_qx_task_qxtasksessionid - 1] =
+		ObjectIdGetDatum(params->sessionoid);
+	values[Anum_pg_qx_task_qxtaskagentid - 1] =
+		ObjectIdGetDatum(params->agentoid);
+	values[Anum_pg_qx_task_qxtasknamespacepolicyid - 1] =
+		ObjectIdGetDatum(params->namespace_policy_oid);
+	values[Anum_pg_qx_task_qxtaskidentityid - 1] =
+		ObjectIdGetDatum(params->identityoid);
+	values[Anum_pg_qx_task_qxtaskowner - 1] =
+		ObjectIdGetDatum(params->ownerid);
+	values[Anum_pg_qx_task_qxtasklastattemptid - 1] =
+		ObjectIdGetDatum(InvalidOid);
+	values[Anum_pg_qx_task_qxtasklastcheckpointid - 1] =
+		ObjectIdGetDatum(InvalidOid);
+	values[Anum_pg_qx_task_qxtaskbudgettokens - 1] =
+		Int32GetDatum(params->budget_tokens);
+	values[Anum_pg_qx_task_qxtaskbudgetcost - 1] =
+		Int32GetDatum(params->budget_cost);
+	values[Anum_pg_qx_task_qxtaskauthorizedtooltokens - 1] =
+		Int32GetDatum(params->authorized_tool_tokens);
+	values[Anum_pg_qx_task_qxtaskauthorizedtoolcost - 1] =
+		Int32GetDatum(params->authorized_tool_cost);
+	values[Anum_pg_qx_task_qxtaskestimatedtokens - 1] =
+		Int32GetDatum(params->estimated_tokens);
+	values[Anum_pg_qx_task_qxtaskestimatedcost - 1] =
+		Int32GetDatum(params->estimated_cost);
+	values[Anum_pg_qx_task_qxtaskstate - 1] =
+		CharGetDatum(QX_TASK_STATE_QUEUED);
+	qx_catalog_set_text_datum(values, nulls, Anum_pg_qx_task_qxtaskname,
+							  params->task_name);
+	qx_catalog_set_text_datum(values, nulls, Anum_pg_qx_task_qxtaskgoal,
+							  params->goal);
+	qx_catalog_set_nodetree_datum(values, nulls, Anum_pg_qx_task_qxtaskinput,
+								  params->input);
+	qx_catalog_set_text_datum(values, nulls, Anum_pg_qx_task_qxtaskpriority,
+							  params->priority);
+	qx_catalog_set_nodetree_datum(values, nulls,
+								  Anum_pg_qx_task_qxtaskauthorizedtools,
+								  params->authorized_tools);
+	qx_catalog_set_text_datum(values, nulls,
+							  Anum_pg_qx_task_qxtasksubmitcontract,
+							  params->submit_contract);
+	qx_catalog_set_text_datum(values, nulls,
+							  Anum_pg_qx_task_qxtaskresumecontract,
+							  params->resume_contract);
+
+	tup = heap_form_tuple(RelationGetDescr(taskrel), values, nulls);
+	CatalogTupleInsert(taskrel, tup);
+	heap_freetuple(tup);
+
+	ObjectAddressSet(myself, QxTaskRelationId, taskoid);
+	recordDependencyOnOwner(QxTaskRelationId, taskoid, params->ownerid);
+	ObjectAddressSet(referenced, QxSessionRelationId, params->sessionoid);
+	recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
+	ObjectAddressSet(referenced, QxAgentRelationId, params->agentoid);
+	recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
+	ObjectAddressSet(referenced, QxNamespaceRelationId, params->namespace_policy_oid);
+	recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
+	ObjectAddressSet(referenced, QxIdentityRelationId, params->identityoid);
+	recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
+	recordDependencyOnCurrentExtension(&myself, false);
+	InvokeObjectPostCreateHook(QxTaskRelationId, taskoid, 0);
+
+	return taskoid;
 }

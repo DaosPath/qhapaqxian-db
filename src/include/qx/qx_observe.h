@@ -133,6 +133,7 @@ extern void QxObserveRecordRuntimeClassExecution(QxObserveRuntimeClassStats *sta
 												 int32 token_charge,
 												 int32 cost_charge);
 
+extern char *QxObserveNormalizeExternalTraceDetail(const char *detail);
 extern char *QxObserveTraceDetailValue(const char *trace_detail,
 									   const char *key);
 extern char *QxObserveSummarizeTraceDetail(const char *trace_name,

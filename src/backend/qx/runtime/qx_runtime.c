@@ -1,4 +1,4 @@
-/*-------------------------------------------------------------------------
+﻿/*-------------------------------------------------------------------------
  *
  * qx_runtime.c
  *	  Stage 7 embedded runtime entry points for QhapaqXian Engine
@@ -371,14 +371,8 @@ static void qx_runtime_remember_recovery_queueoid(
 static Oid qx_runtime_lookup_recovery_queueoid(
 	const QxRuntimeRecoveryHooksContext *context,
 	Oid taskoid);
-static Oid qx_insert_scheduler_queue(Relation rel,
-									 const QxSchedulerQueueSnapshot *snapshot);
-static Oid qx_insert_scheduler_lease(Relation rel,
-									 Oid queueoid,
-									 const QxSchedulerLeaseSnapshot *snapshot);
-static Oid qx_insert_scheduler_heartbeat(Relation rel,
-										 Oid leaseoid,
-										 const QxSchedulerHeartbeatSnapshot *snapshot);
+static void qx_runtime_fill_task_insert_params(QxCatalogTaskInsertParams *params,
+											   const QxRuntimeTaskRequest *request);
 
 static int32 qx_runtime_lease_ttl_ms(
 	const QxSchedulerLeaseSnapshot *snapshot);
@@ -526,35 +520,6 @@ static void qx_validate_microvm_runtime_contract(
 	const char *receipt_nonce,
 	bool require_attestation);
 
-static void
-qx_set_text_datum(Datum *values, bool *nulls, AttrNumber attnum,
-				  const char *value)
-{
-	if (value == NULL)
-	{
-		nulls[attnum - 1] = true;
-		return;
-	}
-
-	values[attnum - 1] = CStringGetTextDatum(value);
-}
-
-static void
-qx_set_nodetree_datum(Datum *values, bool *nulls, AttrNumber attnum,
-					  const void *node)
-{
-	char	   *serialized;
-
-	if (node == NULL)
-	{
-		nulls[attnum - 1] = true;
-		return;
-	}
-
-	serialized = nodeToString(node);
-	values[attnum - 1] = CStringGetTextDatum(serialized);
-	pfree(serialized);
-}
 
 static const char *
 qx_safe_runtime_text(const char *value)
@@ -972,7 +937,7 @@ qx_runtime_recovery_requeue_task(const QxRecoveryTaskSummary *summary,
 	queue_snapshot = QxSchedulerQueueSnapshotFromEnvelope(&scheduler_envelope);
 	queue_snapshot->queue_kind = QX_SCHEDULER_QUEUE_RECOVERY;
 	queue_snapshot->retry_count = retry_count;
-	queueoid = qx_insert_scheduler_queue(context->queueledgerrel, queue_snapshot);
+	queueoid = QxCatalogInsertSchedulerQueue(context->queueledgerrel, queue_snapshot);
 	CommandCounterIncrement();
 	qx_runtime_remember_recovery_queueoid(context, summary->taskoid, queueoid);
 
@@ -1039,7 +1004,7 @@ qx_runtime_recovery_fence_attempt(const QxRecoveryAttemptSummary *summary,
 		queue_snapshot = QxSchedulerQueueSnapshotFromEnvelope(&scheduler_envelope);
 		queue_snapshot->queue_kind = QX_SCHEDULER_QUEUE_RECOVERY;
 		queue_snapshot->retry_count = Max(summary->seqno, 0);
-		queueoid = qx_insert_scheduler_queue(context->queueledgerrel,
+		queueoid = QxCatalogInsertSchedulerQueue(context->queueledgerrel,
 											 queue_snapshot);
 		CommandCounterIncrement();
 		qx_runtime_remember_recovery_queueoid(context, summary->taskoid, queueoid);
@@ -1050,7 +1015,7 @@ qx_runtime_recovery_fence_attempt(const QxRecoveryAttemptSummary *summary,
 														  "embedded-runtime");
 	reclaimed_lease_snapshot =
 		QxSchedulerReleaseLeaseSnapshot(lease_snapshot, true);
-	leaseoid = qx_insert_scheduler_lease(context->leaseledgerrel,
+	leaseoid = QxCatalogInsertSchedulerLease(context->leaseledgerrel,
 										 queueoid,
 										 reclaimed_lease_snapshot);
 	heartbeat_snapshot =
@@ -1059,7 +1024,7 @@ qx_runtime_recovery_fence_attempt(const QxRecoveryAttemptSummary *summary,
 	heartbeat_snapshot->state = QX_SCHEDULER_HEARTBEAT_MISSED;
 	heartbeat_snapshot->lag_ms = scheduler_envelope.heartbeat_interval_ms;
 	heartbeat_snapshot->stale = true;
-	(void) qx_insert_scheduler_heartbeat(context->heartbeatledgerrel,
+	(void) QxCatalogInsertSchedulerHeartbeat(context->heartbeatledgerrel,
 										 leaseoid,
 										 heartbeat_snapshot);
 	CommandCounterIncrement();
@@ -3649,464 +3614,6 @@ qx_runtime_task_phase_contract(const QxCatalogTaskInfo *task, bool prefer_resume
 	return copied_contract;
 }
 
-static Oid
-qx_insert_attempt(Relation rel, Oid sessionoid, Oid taskoid, Oid ownerid,
-				  Oid resumecheckpointid, int16 seqno, char state,
-				  const char *strategy)
-{
-	Datum		values[Natts_pg_qx_attempt];
-	bool		nulls[Natts_pg_qx_attempt];
-	Oid			attemptoid;
-	HeapTuple	tup;
-
-	memset(values, 0, sizeof(values));
-	memset(nulls, false, sizeof(nulls));
-
-	attemptoid = GetNewOidWithIndex(rel, QxAttemptOidIndexId,
-									Anum_pg_qx_attempt_oid);
-	values[Anum_pg_qx_attempt_oid - 1] = ObjectIdGetDatum(attemptoid);
-	values[Anum_pg_qx_attempt_qxattemptdbid - 1] =
-		ObjectIdGetDatum(MyDatabaseId);
-	values[Anum_pg_qx_attempt_qxattemptsessionid - 1] =
-		ObjectIdGetDatum(sessionoid);
-	values[Anum_pg_qx_attempt_qxattempttaskid - 1] = ObjectIdGetDatum(taskoid);
-	values[Anum_pg_qx_attempt_qxattemptowner - 1] = ObjectIdGetDatum(ownerid);
-	values[Anum_pg_qx_attempt_qxattemptresumecheckpointid - 1] =
-		ObjectIdGetDatum(resumecheckpointid);
-	values[Anum_pg_qx_attempt_qxattemptseqno - 1] = Int16GetDatum(seqno);
-	values[Anum_pg_qx_attempt_qxattemptstate - 1] = CharGetDatum(state);
-	qx_set_text_datum(values, nulls, Anum_pg_qx_attempt_qxattemptstrategy,
-					  strategy);
-
-	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
-	CatalogTupleInsert(rel, tup);
-	heap_freetuple(tup);
-
-	return attemptoid;
-}
-
-static Oid
-qx_insert_step(Relation rel, Oid sessionoid, Oid taskoid, int16 seqno,
-			   const char *name, const char *detail)
-{
-	Datum		values[Natts_pg_qx_step];
-	bool		nulls[Natts_pg_qx_step];
-	Oid			stepoid;
-	HeapTuple	tup;
-
-	memset(values, 0, sizeof(values));
-	memset(nulls, false, sizeof(nulls));
-
-	stepoid = GetNewOidWithIndex(rel, QxStepOidIndexId,
-								 Anum_pg_qx_step_oid);
-	values[Anum_pg_qx_step_oid - 1] = ObjectIdGetDatum(stepoid);
-	values[Anum_pg_qx_step_qxstepdbid - 1] = ObjectIdGetDatum(MyDatabaseId);
-	values[Anum_pg_qx_step_qxstepsessionid - 1] = ObjectIdGetDatum(sessionoid);
-	values[Anum_pg_qx_step_qxsteptaskid - 1] = ObjectIdGetDatum(taskoid);
-	values[Anum_pg_qx_step_qxstepseqno - 1] = Int16GetDatum(seqno);
-	values[Anum_pg_qx_step_qxstepstate - 1] =
-		CharGetDatum(QX_STEP_STATE_COMPLETED);
-	qx_set_text_datum(values, nulls, Anum_pg_qx_step_qxstepname, name);
-	qx_set_text_datum(values, nulls, Anum_pg_qx_step_qxstepdetail, detail);
-
-	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
-	CatalogTupleInsert(rel, tup);
-	heap_freetuple(tup);
-
-	return stepoid;
-}
-
-static Oid
-qx_insert_event(Relation rel, Oid sessionoid, Oid taskoid, Oid stepoid,
-				Oid ownerid, const QxSemanticExecutionMetadata *metadata,
-				const char *kind, const char *payload)
-{
-	Datum		values[Natts_pg_qx_event];
-	bool		nulls[Natts_pg_qx_event];
-	Oid			eventoid;
-	HeapTuple	tup;
-	XLogRecPtr	eventlsn;
-
-	memset(values, 0, sizeof(values));
-	memset(nulls, false, sizeof(nulls));
-
-	eventoid = GetNewOidWithIndex(rel, QxEventOidIndexId,
-								  Anum_pg_qx_event_oid);
-	values[Anum_pg_qx_event_oid - 1] = ObjectIdGetDatum(eventoid);
-	values[Anum_pg_qx_event_qxeventdbid - 1] = ObjectIdGetDatum(MyDatabaseId);
-	values[Anum_pg_qx_event_qxeventsessionid - 1] =
-		ObjectIdGetDatum(sessionoid);
-	values[Anum_pg_qx_event_qxeventtaskid - 1] = ObjectIdGetDatum(taskoid);
-	values[Anum_pg_qx_event_qxeventstepid - 1] = ObjectIdGetDatum(stepoid);
-	values[Anum_pg_qx_event_qxeventowner - 1] = ObjectIdGetDatum(ownerid);
-	if (metadata != NULL)
-		eventlsn = QxEmitSemanticEventRecordV2(eventoid, sessionoid, taskoid,
-											   stepoid, ownerid, metadata,
-											   kind, payload);
-	else
-		eventlsn = QxEmitSemanticEventRecord(eventoid, sessionoid, taskoid,
-											 stepoid, ownerid, kind, payload);
-	values[Anum_pg_qx_event_qxeventlsn - 1] = LSNGetDatum(eventlsn);
-	qx_set_text_datum(values, nulls, Anum_pg_qx_event_qxeventkind, kind);
-	qx_set_text_datum(values, nulls, Anum_pg_qx_event_qxeventpayload, payload);
-
-	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
-	CatalogTupleInsert(rel, tup);
-	heap_freetuple(tup);
-
-	return eventoid;
-}
-
-static Oid
-qx_insert_trace(Relation rel, Oid sessionoid, Oid taskoid, Oid stepoid,
-				Oid ownerid, const QxSemanticExecutionMetadata *metadata,
-				const char *name, const char *detail)
-{
-	Datum		values[Natts_pg_qx_trace];
-	bool		nulls[Natts_pg_qx_trace];
-	Oid			traceoid;
-	HeapTuple	tup;
-	XLogRecPtr	tracelsn;
-	const char *trace_detail = detail;
-	char	   *stripped_detail = NULL;
-
-	if (detail != NULL &&
-		name != NULL &&
-		(strcmp(name, "runtime.external_submit") == 0 ||
-		 strcmp(name, "runtime.external_resume") == 0))
-	{
-		stripped_detail = qx_strip_external_trace_payload(detail);
-		trace_detail = stripped_detail;
-	}
-
-	memset(values, 0, sizeof(values));
-	memset(nulls, false, sizeof(nulls));
-
-	traceoid = GetNewOidWithIndex(rel, QxTraceOidIndexId,
-								  Anum_pg_qx_trace_oid);
-	values[Anum_pg_qx_trace_oid - 1] = ObjectIdGetDatum(traceoid);
-	values[Anum_pg_qx_trace_qxtracedbid - 1] = ObjectIdGetDatum(MyDatabaseId);
-	values[Anum_pg_qx_trace_qxtracesessionid - 1] =
-		ObjectIdGetDatum(sessionoid);
-	values[Anum_pg_qx_trace_qxtracetaskid - 1] = ObjectIdGetDatum(taskoid);
-	values[Anum_pg_qx_trace_qxtracestepid - 1] = ObjectIdGetDatum(stepoid);
-	values[Anum_pg_qx_trace_qxtraceowner - 1] = ObjectIdGetDatum(ownerid);
-	values[Anum_pg_qx_trace_qxtracestate - 1] =
-		CharGetDatum(QX_TRACE_STATE_CLOSED);
-	if (metadata != NULL)
-		tracelsn = QxEmitSemanticTraceRecordV2(traceoid, sessionoid, taskoid,
-											   stepoid, ownerid, metadata,
-											   QX_TRACE_STATE_CLOSED, name,
-											   trace_detail);
-	else
-		tracelsn = QxEmitSemanticTraceRecord(traceoid, sessionoid, taskoid,
-											 stepoid, ownerid,
-											 QX_TRACE_STATE_CLOSED, name,
-											 trace_detail);
-	values[Anum_pg_qx_trace_qxtracelsn - 1] = LSNGetDatum(tracelsn);
-	qx_set_text_datum(values, nulls, Anum_pg_qx_trace_qxtracename, name);
-	qx_set_text_datum(values, nulls, Anum_pg_qx_trace_qxtracedetail, trace_detail);
-
-	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
-	CatalogTupleInsert(rel, tup);
-	heap_freetuple(tup);
-
-	if (qhapaqxian_track_stats)
-		QxStatReportTrace(name, trace_detail);
-
-	if (stripped_detail != NULL)
-		pfree(stripped_detail);
-
-	return traceoid;
-}
-
-static Oid
-qx_insert_checkpoint(Relation rel, Oid sessionoid, Oid taskoid, Oid attemptoid,
-					 Oid stepoid, Oid ownerid,
-					 const QxSemanticExecutionMetadata *metadata,
-					 char taskstate, int16 nextstepseqno,
-					 const char *label, const char *data)
-{
-	Datum		values[Natts_pg_qx_checkpoint];
-	bool		nulls[Natts_pg_qx_checkpoint];
-	Oid			checkpointoid;
-	HeapTuple	tup;
-	XLogRecPtr	checkpointlsn;
-
-	memset(values, 0, sizeof(values));
-	memset(nulls, false, sizeof(nulls));
-
-	checkpointoid = GetNewOidWithIndex(rel, QxCheckpointOidIndexId,
-									   Anum_pg_qx_checkpoint_oid);
-	values[Anum_pg_qx_checkpoint_oid - 1] = ObjectIdGetDatum(checkpointoid);
-	values[Anum_pg_qx_checkpoint_qxcheckpointdbid - 1] =
-		ObjectIdGetDatum(MyDatabaseId);
-	values[Anum_pg_qx_checkpoint_qxcheckpointsessionid - 1] =
-		ObjectIdGetDatum(sessionoid);
-	values[Anum_pg_qx_checkpoint_qxcheckpointtaskid - 1] =
-		ObjectIdGetDatum(taskoid);
-	values[Anum_pg_qx_checkpoint_qxcheckpointattemptid - 1] =
-		ObjectIdGetDatum(attemptoid);
-	values[Anum_pg_qx_checkpoint_qxcheckpointstepid - 1] =
-		ObjectIdGetDatum(stepoid);
-	values[Anum_pg_qx_checkpoint_qxcheckpointowner - 1] =
-		ObjectIdGetDatum(ownerid);
-	values[Anum_pg_qx_checkpoint_qxcheckpointstate - 1] =
-		CharGetDatum(QX_CHECKPOINT_STATE_DURABLE);
-	values[Anum_pg_qx_checkpoint_qxcheckpointtaskstate - 1] =
-		CharGetDatum(taskstate);
-	values[Anum_pg_qx_checkpoint_qxcheckpointnextstepseqno - 1] =
-		Int16GetDatum(nextstepseqno);
-	if (metadata != NULL)
-		checkpointlsn = QxEmitSemanticCheckpointRecordV2(checkpointoid,
-														 sessionoid, taskoid,
-														 attemptoid, stepoid,
-														 ownerid, metadata,
-														 QX_CHECKPOINT_STATE_DURABLE,
-														 taskstate, nextstepseqno,
-														 label, data);
-	else
-		checkpointlsn = QxEmitSemanticCheckpointRecord(checkpointoid,
-													   sessionoid, taskoid,
-													   attemptoid, stepoid,
-													   ownerid,
-													   QX_CHECKPOINT_STATE_DURABLE,
-													   taskstate, nextstepseqno,
-													   label, data);
-	values[Anum_pg_qx_checkpoint_qxcheckpointlsn - 1] =
-		LSNGetDatum(checkpointlsn);
-	qx_set_text_datum(values, nulls, Anum_pg_qx_checkpoint_qxcheckpointlabel,
-					  label);
-	qx_set_text_datum(values, nulls, Anum_pg_qx_checkpoint_qxcheckpointdata,
-					  data);
-
-	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
-	CatalogTupleInsert(rel, tup);
-	heap_freetuple(tup);
-
-	return checkpointoid;
-}
-
-static Oid
-qx_insert_scheduler_queue(Relation rel,
-						  const QxSchedulerQueueSnapshot *snapshot)
-{
-	Datum		values[Natts_pg_qx_scheduler_queue];
-	bool		nulls[Natts_pg_qx_scheduler_queue];
-	Oid			queueoid;
-	HeapTuple	tup;
-
-	Assert(snapshot != NULL);
-
-	memset(values, 0, sizeof(values));
-	memset(nulls, false, sizeof(nulls));
-
-	queueoid = GetNewOidWithIndex(rel, QxSchedulerQueueOidIndexId,
-								  Anum_pg_qx_scheduler_queue_oid);
-	values[Anum_pg_qx_scheduler_queue_oid - 1] = ObjectIdGetDatum(queueoid);
-	values[Anum_pg_qx_scheduler_queue_qxqueueledgerdbid - 1] =
-		ObjectIdGetDatum(MyDatabaseId);
-	values[Anum_pg_qx_scheduler_queue_qxqueueledgerowner - 1] =
-		ObjectIdGetDatum(snapshot->ownerid);
-	values[Anum_pg_qx_scheduler_queue_qxqueueledgernamespaceid - 1] =
-		ObjectIdGetDatum(snapshot->namespace_policy_oid);
-	values[Anum_pg_qx_scheduler_queue_qxqueueledgeragentid - 1] =
-		ObjectIdGetDatum(snapshot->agentoid);
-	values[Anum_pg_qx_scheduler_queue_qxqueueledgersessionid - 1] =
-		ObjectIdGetDatum(snapshot->sessionoid);
-	values[Anum_pg_qx_scheduler_queue_qxqueueledgertaskid - 1] =
-		ObjectIdGetDatum(snapshot->taskoid);
-	values[Anum_pg_qx_scheduler_queue_qxqueueledgerattemptid - 1] =
-		ObjectIdGetDatum(snapshot->attemptoid);
-	values[Anum_pg_qx_scheduler_queue_qxqueueledgerkind - 1] =
-		Int16GetDatum((int16) snapshot->queue_kind);
-	values[Anum_pg_qx_scheduler_queue_qxqueueledgerrunnablecount - 1] =
-		Int32GetDatum(snapshot->runnable_count);
-	values[Anum_pg_qx_scheduler_queue_qxqueueledgerleasedcount - 1] =
-		Int32GetDatum(snapshot->leased_count);
-	values[Anum_pg_qx_scheduler_queue_qxqueueledgerblockedcount - 1] =
-		Int32GetDatum(snapshot->blocked_count);
-	values[Anum_pg_qx_scheduler_queue_qxqueueledgerretrycount - 1] =
-		Int32GetDatum(snapshot->retry_count);
-	values[Anum_pg_qx_scheduler_queue_qxqueueledgerenqueuedat - 1] =
-		TimestampTzGetDatum(snapshot->enqueued_at);
-	values[Anum_pg_qx_scheduler_queue_qxqueueledgereligibleat - 1] =
-		TimestampTzGetDatum(snapshot->eligible_at);
-	values[Anum_pg_qx_scheduler_queue_qxqueueledgerupdatedat - 1] =
-		TimestampTzGetDatum(snapshot->updated_at);
-	qx_set_text_datum(values, nulls,
-					  Anum_pg_qx_scheduler_queue_qxqueueledgername,
-					  snapshot->queue_name);
-	qx_set_text_datum(values, nulls,
-					  Anum_pg_qx_scheduler_queue_qxqueueledgeragentname,
-					  snapshot->agent_name);
-	qx_set_text_datum(values, nulls,
-					  Anum_pg_qx_scheduler_queue_qxqueueledgeridentityname,
-					  snapshot->identity_name);
-	qx_set_text_datum(values, nulls,
-					  Anum_pg_qx_scheduler_queue_qxqueueledgernamespacepolicyname,
-					  snapshot->namespace_policy_name);
-	qx_set_text_datum(values, nulls,
-					  Anum_pg_qx_scheduler_queue_qxqueueledgerpriority,
-					  snapshot->priority);
-	qx_set_text_datum(values, nulls,
-					  Anum_pg_qx_scheduler_queue_qxqueueledgerprincipalname,
-					  snapshot->principal_name);
-	qx_set_text_datum(values, nulls,
-					  Anum_pg_qx_scheduler_queue_qxqueueledgerprovidername,
-					  snapshot->provider_name);
-	qx_set_text_datum(values, nulls,
-					  Anum_pg_qx_scheduler_queue_qxqueueledgerproviderkind,
-					  snapshot->provider_kind);
-	qx_set_text_datum(values, nulls,
-					  Anum_pg_qx_scheduler_queue_qxqueueledgerprincipalruntime,
-					  snapshot->principal_runtime);
-
-	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
-	CatalogTupleInsert(rel, tup);
-	heap_freetuple(tup);
-
-	return queueoid;
-}
-
-static Oid
-qx_insert_scheduler_lease(Relation rel, Oid queueoid,
-						  const QxSchedulerLeaseSnapshot *snapshot)
-{
-	Datum		values[Natts_pg_qx_scheduler_lease];
-	bool		nulls[Natts_pg_qx_scheduler_lease];
-	Oid			leaseoid;
-	HeapTuple	tup;
-
-	Assert(snapshot != NULL);
-
-	memset(values, 0, sizeof(values));
-	memset(nulls, false, sizeof(nulls));
-
-	leaseoid = GetNewOidWithIndex(rel, QxSchedulerLeaseOidIndexId,
-								  Anum_pg_qx_scheduler_lease_oid);
-	values[Anum_pg_qx_scheduler_lease_oid - 1] = ObjectIdGetDatum(leaseoid);
-	values[Anum_pg_qx_scheduler_lease_qxleaseledgerdbid - 1] =
-		ObjectIdGetDatum(MyDatabaseId);
-	values[Anum_pg_qx_scheduler_lease_qxleaseledgerowner - 1] =
-		ObjectIdGetDatum(snapshot->ownerid);
-	values[Anum_pg_qx_scheduler_lease_qxleaseledgerqueueid - 1] =
-		ObjectIdGetDatum(queueoid);
-	values[Anum_pg_qx_scheduler_lease_qxleaseledgerworkerid - 1] =
-		ObjectIdGetDatum(snapshot->workeroid);
-	values[Anum_pg_qx_scheduler_lease_qxleaseledgersessionid - 1] =
-		ObjectIdGetDatum(snapshot->sessionoid);
-	values[Anum_pg_qx_scheduler_lease_qxleaseledgertaskid - 1] =
-		ObjectIdGetDatum(snapshot->taskoid);
-	values[Anum_pg_qx_scheduler_lease_qxleaseledgerattemptid - 1] =
-		ObjectIdGetDatum(snapshot->attemptoid);
-	values[Anum_pg_qx_scheduler_lease_qxleaseledgerstate - 1] =
-		Int16GetDatum((int16) snapshot->state);
-	values[Anum_pg_qx_scheduler_lease_qxleaseledgeracquiredat - 1] =
-		TimestampTzGetDatum(snapshot->acquired_at);
-	values[Anum_pg_qx_scheduler_lease_qxleaseledgerrenewedat - 1] =
-		TimestampTzGetDatum(snapshot->renewed_at);
-	values[Anum_pg_qx_scheduler_lease_qxleaseledgerexpiresat - 1] =
-		TimestampTzGetDatum(snapshot->expires_at);
-	values[Anum_pg_qx_scheduler_lease_qxleaseledgerlastheartbeatat - 1] =
-		TimestampTzGetDatum(snapshot->last_heartbeat_at);
-	values[Anum_pg_qx_scheduler_lease_qxleaseledgerrenewalcount - 1] =
-		Int32GetDatum(snapshot->renewal_count);
-	values[Anum_pg_qx_scheduler_lease_qxleaseledgerneedsrecovery - 1] =
-		BoolGetDatum(snapshot->needs_recovery);
-	qx_set_text_datum(values, nulls,
-					  Anum_pg_qx_scheduler_lease_qxleaseledgerqueuename,
-					  snapshot->queue_name);
-	qx_set_text_datum(values, nulls,
-					  Anum_pg_qx_scheduler_lease_qxleaseledgerworkername,
-					  snapshot->worker_name);
-	qx_set_text_datum(values, nulls,
-					  Anum_pg_qx_scheduler_lease_qxleaseledgerleasetoken,
-					  snapshot->lease_token);
-	qx_set_text_datum(values, nulls,
-					  Anum_pg_qx_scheduler_lease_qxleaseledgerprincipalname,
-					  snapshot->principal_name);
-	qx_set_text_datum(values, nulls,
-					  Anum_pg_qx_scheduler_lease_qxleaseledgerprovidername,
-					  snapshot->provider_name);
-	qx_set_text_datum(values, nulls,
-					  Anum_pg_qx_scheduler_lease_qxleaseledgerproviderkind,
-					  snapshot->provider_kind);
-	qx_set_text_datum(values, nulls,
-					  Anum_pg_qx_scheduler_lease_qxleaseledgerprincipalruntime,
-					  snapshot->principal_runtime);
-
-	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
-	CatalogTupleInsert(rel, tup);
-	heap_freetuple(tup);
-
-	return leaseoid;
-}
-
-static Oid
-qx_insert_scheduler_heartbeat(Relation rel, Oid leaseoid,
-							  const QxSchedulerHeartbeatSnapshot *snapshot)
-{
-	Datum		values[Natts_pg_qx_scheduler_heartbeat];
-	bool		nulls[Natts_pg_qx_scheduler_heartbeat];
-	Oid			heartbeatoid;
-	HeapTuple	tup;
-
-	Assert(snapshot != NULL);
-
-	memset(values, 0, sizeof(values));
-	memset(nulls, false, sizeof(nulls));
-
-	heartbeatoid = GetNewOidWithIndex(rel, QxSchedulerHeartbeatOidIndexId,
-									  Anum_pg_qx_scheduler_heartbeat_oid);
-	values[Anum_pg_qx_scheduler_heartbeat_oid - 1] =
-		ObjectIdGetDatum(heartbeatoid);
-	values[Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerdbid - 1] =
-		ObjectIdGetDatum(MyDatabaseId);
-	values[Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerowner - 1] =
-		ObjectIdGetDatum(snapshot->ownerid);
-	values[Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerleaseid - 1] =
-		ObjectIdGetDatum(leaseoid);
-	values[Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerworkerid - 1] =
-		ObjectIdGetDatum(snapshot->workeroid);
-	values[Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgersessionid - 1] =
-		ObjectIdGetDatum(snapshot->sessionoid);
-	values[Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgertaskid - 1] =
-		ObjectIdGetDatum(snapshot->taskoid);
-	values[Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerattemptid - 1] =
-		ObjectIdGetDatum(snapshot->attemptoid);
-	values[Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerstate - 1] =
-		Int16GetDatum((int16) snapshot->state);
-	values[Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerlagms - 1] =
-		Int32GetDatum(snapshot->lag_ms);
-	values[Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerobservedat - 1] =
-		TimestampTzGetDatum(snapshot->observed_at);
-	values[Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerexpectedbefore - 1] =
-		TimestampTzGetDatum(snapshot->expected_before);
-	values[Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerstale - 1] =
-		BoolGetDatum(snapshot->stale);
-	qx_set_text_datum(values, nulls,
-					  Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerworkername,
-					  snapshot->worker_name);
-	qx_set_text_datum(values, nulls,
-					  Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerqueuename,
-					  snapshot->queue_name);
-	qx_set_text_datum(values, nulls,
-					  Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerprincipalruntime,
-					  snapshot->principal_runtime);
-	qx_set_text_datum(values, nulls,
-					  Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerproviderkind,
-					  snapshot->provider_kind);
-	qx_set_text_datum(values, nulls,
-					  Anum_pg_qx_scheduler_heartbeat_qxheartbeatledgerreceiptmode,
-					  snapshot->receipt_mode);
-
-	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
-	CatalogTupleInsert(rel, tup);
-	heap_freetuple(tup);
-
-	return heartbeatoid;
-}
 
 static int32
 qx_runtime_lease_ttl_ms(const QxSchedulerLeaseSnapshot *snapshot)
@@ -4485,7 +3992,7 @@ qx_runtime_reclaim_running_attempt(Relation taskrel,
 		queue_snapshot = QxSchedulerQueueSnapshotFromEnvelope(&scheduler_envelope);
 		queue_snapshot->queue_kind = QX_SCHEDULER_QUEUE_RECOVERY;
 		queue_snapshot->retry_count = Max((int32) attempt->seqno, 0);
-		reclaimed_queueoid = qx_insert_scheduler_queue(queueledgerrel,
+		reclaimed_queueoid = QxCatalogInsertSchedulerQueue(queueledgerrel,
 													   queue_snapshot);
 		CommandCounterIncrement();
 		if (stats != NULL)
@@ -4526,7 +4033,7 @@ qx_runtime_reclaim_running_attempt(Relation taskrel,
 													   task->oid);
 		queue_snapshot->eligible_at = queue_snapshot->enqueued_at +
 			((TimestampTz) retry_backoff_ms * USECS_PER_MSEC);
-		reclaimed_queueoid = qx_insert_scheduler_queue(queueledgerrel,
+		reclaimed_queueoid = QxCatalogInsertSchedulerQueue(queueledgerrel,
 													   queue_snapshot);
 		CommandCounterIncrement();
 		if (stats != NULL)
@@ -4553,7 +4060,7 @@ qx_runtime_reclaim_running_attempt(Relation taskrel,
 			pfree(reclaimed_lease_snapshot->worker_name);
 		reclaimed_lease_snapshot->worker_name = pstrdup(worker_name);
 	}
-	leaseoid = qx_insert_scheduler_lease(leaseledgerrel,
+	leaseoid = QxCatalogInsertSchedulerLease(leaseledgerrel,
 										 reclaimed_queueoid,
 										 reclaimed_lease_snapshot);
 	heartbeat_snapshot =
@@ -4563,7 +4070,7 @@ qx_runtime_reclaim_running_attempt(Relation taskrel,
 	heartbeat_snapshot->state = QX_SCHEDULER_HEARTBEAT_MISSED;
 	heartbeat_snapshot->lag_ms = heartbeat_lag_ms;
 	heartbeat_snapshot->stale = true;
-	(void) qx_insert_scheduler_heartbeat(heartbeatledgerrel,
+	(void) QxCatalogInsertSchedulerHeartbeat(heartbeatledgerrel,
 										 leaseoid,
 										 heartbeat_snapshot);
 	CommandCounterIncrement();
@@ -4671,14 +4178,14 @@ qx_runtime_run_scheduler_cycle(QxRuntimeSchedulerCycleStats *stats,
 			lease_ttl_ms = qx_runtime_lease_ttl_ms(&lease_snapshot);
 			renewed_lease_snapshot =
 				QxSchedulerRenewLeaseSnapshot(&lease_snapshot, lease_ttl_ms);
-			leaseoid = qx_insert_scheduler_lease(leaseledgerrel,
+			leaseoid = QxCatalogInsertSchedulerLease(leaseledgerrel,
 												 queueoid,
 												 renewed_lease_snapshot);
 			heartbeat_snapshot =
 				QxSchedulerHeartbeatSnapshotFromLease(renewed_lease_snapshot);
 			qx_runtime_set_heartbeat_receipt(heartbeat_snapshot,
 											 "scheduler-renew");
-			(void) qx_insert_scheduler_heartbeat(heartbeatledgerrel,
+			(void) QxCatalogInsertSchedulerHeartbeat(heartbeatledgerrel,
 												 leaseoid,
 												 heartbeat_snapshot);
 			CommandCounterIncrement();
@@ -4943,7 +4450,7 @@ qx_runtime_dead_letter_retry_task(Relation taskrel,
 	dead_queue.blocked_count = 1;
 	dead_queue.eligible_at = now;
 	dead_queue.updated_at = now;
-	queueoid = qx_insert_scheduler_queue(queueledgerrel, &dead_queue);
+	queueoid = QxCatalogInsertSchedulerQueue(queueledgerrel, &dead_queue);
 	CommandCounterIncrement();
 
 	QxCatalogUpdateAttemptState(attemptrel, failed_attempt->oid,
@@ -4963,9 +4470,9 @@ qx_runtime_dead_letter_retry_task(Relation taskrel,
 					   QX_TASK_STATE_FAILED,
 					   (int) QX_SCHEDULER_QUEUE_MAINTENANCE);
 	payload = qx_runtime_append_recovery_payload(payload);
-	(void) qx_insert_event(eventrel, task->sessionoid, task->oid, InvalidOid,
+	(void) QxCatalogInsertEvent(eventrel, task->sessionoid, task->oid, InvalidOid,
 						   task->ownerid, NULL, "TASK_DEAD_LETTERED", payload);
-	(void) qx_insert_trace(tracerel, task->sessionoid, task->oid, InvalidOid,
+	(void) QxCatalogInsertTrace(tracerel, task->sessionoid, task->oid, InvalidOid,
 						   task->ownerid, NULL, "runtime.dead_letter", payload);
 	pfree(payload);
 
@@ -5030,7 +4537,7 @@ qx_runtime_dispatch_retry_task(Relation taskrel,
 	stepseqbase = QxCatalogMaxStepSeqnoForTask(MyDatabaseId, task->oid);
 	memset(&tool_result, 0, sizeof(tool_result));
 
-	attemptoid = qx_insert_attempt(attemptrel,
+	attemptoid = QxCatalogInsertAttempt(attemptrel,
 								   task->sessionoid,
 								   task->oid,
 								   task->ownerid,
@@ -5071,7 +4578,7 @@ qx_runtime_dispatch_retry_task(Relation taskrel,
 		QxSchedulerQueueSnapshotFromEnvelope(&scheduler_envelope);
 	dispatch_queue_snapshot->queue_kind = QX_SCHEDULER_QUEUE_RETRY;
 	dispatch_queue_snapshot->retry_count = nextattemptseqno - 1;
-	queueoid = qx_insert_scheduler_queue(queueledgerrel, dispatch_queue_snapshot);
+	queueoid = QxCatalogInsertSchedulerQueue(queueledgerrel, dispatch_queue_snapshot);
 	CommandCounterIncrement();
 
 	payload = psprintf("retry_from_attempt=%d;retry_delay_ms=" INT64_FORMAT,
@@ -5082,13 +4589,13 @@ qx_runtime_dispatch_retry_task(Relation taskrel,
 	payload = qx_scheduler_append_runtime_payload(payload,
 												  &scheduler_envelope,
 												  false);
-	(void) qx_insert_event(eventrel, task->sessionoid, task->oid, InvalidOid,
+	(void) QxCatalogInsertEvent(eventrel, task->sessionoid, task->oid, InvalidOid,
 						   task->ownerid, NULL, "TASK_RETRIED", payload);
-	(void) qx_insert_trace(tracerel, task->sessionoid, task->oid, InvalidOid,
+	(void) QxCatalogInsertTrace(tracerel, task->sessionoid, task->oid, InvalidOid,
 						   task->ownerid, NULL, "runtime.retry", payload);
 	pfree(payload);
 
-	stepoid = qx_insert_step(steprel, task->sessionoid, task->oid, stepseqbase,
+	stepoid = QxCatalogInsertStep(steprel, task->sessionoid, task->oid, stepseqbase,
 							 "stage8.retry_dispatch",
 							 "Attempt retried execution after stale no-checkpoint reclaim");
 	QxCatalogChargeTaskBudget(taskrel, task->oid, 8, 14, "retry_dispatch");
@@ -5109,19 +4616,19 @@ qx_runtime_dispatch_retry_task(Relation taskrel,
 														 worker_name != NULL ?
 														 worker_name :
 														 "embedded-runtime");
-	leaseoid = qx_insert_scheduler_lease(leaseledgerrel, queueoid,
+	leaseoid = QxCatalogInsertSchedulerLease(leaseledgerrel, queueoid,
 										 lease_snapshot);
 	heartbeat_snapshot = QxSchedulerHeartbeatSnapshotFromLease(lease_snapshot);
-	(void) qx_insert_scheduler_heartbeat(heartbeatledgerrel, leaseoid,
+	(void) QxCatalogInsertSchedulerHeartbeat(heartbeatledgerrel, leaseoid,
 										 heartbeat_snapshot);
 	CommandCounterIncrement();
-	(void) qx_insert_event(eventrel, task->sessionoid, task->oid, stepoid,
+	(void) QxCatalogInsertEvent(eventrel, task->sessionoid, task->oid, stepoid,
 						   task->ownerid, NULL, "TASK_RETRY_DISPATCHED", payload);
-	(void) qx_insert_trace(tracerel, task->sessionoid, task->oid, stepoid,
+	(void) QxCatalogInsertTrace(tracerel, task->sessionoid, task->oid, stepoid,
 						   task->ownerid, NULL, "runtime.retry_dispatch", payload);
 	pfree(payload);
 
-	stepoid = qx_insert_step(steprel, task->sessionoid, task->oid,
+	stepoid = QxCatalogInsertStep(steprel, task->sessionoid, task->oid,
 							 stepseqbase + 1,
 							 "stage15.authorize_tools",
 							 "Retry dispatch reused the stored runtime tool allowlist");
@@ -5131,13 +4638,13 @@ qx_runtime_dispatch_retry_task(Relation taskrel,
 					   task->authorized_tool_tokens,
 					   task->authorized_tool_cost,
 					   failed_attempt->seqno);
-	(void) qx_insert_event(eventrel, task->sessionoid, task->oid, stepoid,
+	(void) QxCatalogInsertEvent(eventrel, task->sessionoid, task->oid, stepoid,
 						   task->ownerid, NULL, "TASK_TOOLS_AUTHORIZED", payload);
-	(void) qx_insert_trace(tracerel, task->sessionoid, task->oid, stepoid,
+	(void) QxCatalogInsertTrace(tracerel, task->sessionoid, task->oid, stepoid,
 						   task->ownerid, NULL, "runtime.authorize_tools", payload);
 	pfree(payload);
 
-	stepoid = qx_insert_step(steprel, task->sessionoid, task->oid,
+	stepoid = QxCatalogInsertStep(steprel, task->sessionoid, task->oid,
 							 stepseqbase + 2,
 							 "stage16.external_submit",
 							 "Retry attempt executed the selected tool through its principal program");
@@ -5151,15 +4658,15 @@ qx_runtime_dispatch_retry_task(Relation taskrel,
 						  tool_result.cost_charge,
 						  "external_submit");
 	payload = qx_format_external_execution_payload("submit", &tool_result);
-	(void) qx_insert_event(eventrel, task->sessionoid, task->oid, stepoid,
+	(void) QxCatalogInsertEvent(eventrel, task->sessionoid, task->oid, stepoid,
 						   task->ownerid, &semantic_meta,
 						   "TASK_TOOL_EXECUTED", payload);
-	(void) qx_insert_trace(tracerel, task->sessionoid, task->oid, stepoid,
+	(void) QxCatalogInsertTrace(tracerel, task->sessionoid, task->oid, stepoid,
 						   task->ownerid, &semantic_meta,
 						   "runtime.external_submit", payload);
 	pfree(payload);
 
-	stepoid = qx_insert_step(steprel, task->sessionoid, task->oid,
+	stepoid = QxCatalogInsertStep(steprel, task->sessionoid, task->oid,
 							 stepseqbase + 3,
 							 "stage8.capture_input",
 							 "Retry attempt captured task goal and raw input");
@@ -5170,23 +4677,23 @@ qx_runtime_dispatch_retry_task(Relation taskrel,
 	payload = psprintf("input_present=%s;task_name=%s",
 					   task->input != NULL ? "true" : "false",
 					   task->name != NULL ? task->name : "<anonymous>");
-	(void) qx_insert_event(eventrel, task->sessionoid, task->oid, stepoid,
+	(void) QxCatalogInsertEvent(eventrel, task->sessionoid, task->oid, stepoid,
 						   task->ownerid, NULL, "TASK_INPUT_CAPTURED", payload);
-	(void) qx_insert_trace(tracerel, task->sessionoid, task->oid, stepoid,
+	(void) QxCatalogInsertTrace(tracerel, task->sessionoid, task->oid, stepoid,
 						   task->ownerid, NULL, "runtime.capture_input", payload);
 	pfree(payload);
 
-	stepoid = qx_insert_step(steprel, task->sessionoid, task->oid,
+	stepoid = QxCatalogInsertStep(steprel, task->sessionoid, task->oid,
 							 stepseqbase + 4,
 							 "stage8.checkpoint_barrier",
 							 "Retry attempt reached a resumable checkpoint barrier");
 	QxCatalogChargeTaskBudget(taskrel, task->oid, 4, 14, "checkpoint_barrier");
 	payload = psprintf("checkpoint=stage8.after_capture;task_state=%c",
 					   QX_TASK_STATE_CHECKPOINTED);
-	(void) qx_insert_event(eventrel, task->sessionoid, task->oid, stepoid,
+	(void) QxCatalogInsertEvent(eventrel, task->sessionoid, task->oid, stepoid,
 						   task->ownerid, &semantic_meta,
 						   "TASK_CHECKPOINTED", payload);
-	(void) qx_insert_trace(tracerel, task->sessionoid, task->oid, stepoid,
+	(void) QxCatalogInsertTrace(tracerel, task->sessionoid, task->oid, stepoid,
 						   task->ownerid, &semantic_meta,
 						   "runtime.checkpoint", payload);
 
@@ -5195,7 +4702,7 @@ qx_runtime_dispatch_retry_task(Relation taskrel,
 							   attemptoid,
 							   task->sessionoid,
 							   stepseqbase + 5);
-	checkpointoid = qx_insert_checkpoint(checkpointrel,
+	checkpointoid = QxCatalogInsertCheckpoint(checkpointrel,
 										 task->sessionoid,
 										 task->oid,
 										 attemptoid,
@@ -5213,19 +4720,19 @@ qx_runtime_dispatch_retry_task(Relation taskrel,
 						   attemptoid, true, checkpointoid, true);
 	released_lease_snapshot = QxSchedulerReleaseLeaseSnapshot(lease_snapshot,
 															 false);
-	leaseoid = qx_insert_scheduler_lease(leaseledgerrel, queueoid,
+	leaseoid = QxCatalogInsertSchedulerLease(leaseledgerrel, queueoid,
 										 released_lease_snapshot);
 	final_heartbeat_snapshot =
 		QxSchedulerFinalizeHeartbeatSnapshot(released_lease_snapshot,
 											 "scheduler-release");
-	(void) qx_insert_scheduler_heartbeat(heartbeatledgerrel, leaseoid,
+	(void) QxCatalogInsertSchedulerHeartbeat(heartbeatledgerrel, leaseoid,
 										 final_heartbeat_snapshot);
 	CommandCounterIncrement();
 
-	(void) qx_insert_event(eventrel, task->sessionoid, task->oid, InvalidOid,
+	(void) QxCatalogInsertEvent(eventrel, task->sessionoid, task->oid, InvalidOid,
 						   task->ownerid, NULL,
 						   "TASK_READY_FOR_RESUME", payload);
-	(void) qx_insert_trace(tracerel, task->sessionoid, task->oid, InvalidOid,
+	(void) QxCatalogInsertTrace(tracerel, task->sessionoid, task->oid, InvalidOid,
 						   task->ownerid, NULL, "runtime.pause",
 						   "Task paused at durable checkpoint and awaits RESUME TASK");
 	pfree(payload);
@@ -5282,91 +4789,32 @@ qx_runtime_log_scheduler_cycle(const char *worker_name,
 		 stats->heartbeats_written);
 }
 
-static Oid
-qx_runtime_insert_task(Relation taskrel, const QxRuntimeTaskRequest *request)
+static void
+qx_runtime_fill_task_insert_params(QxCatalogTaskInsertParams *params,
+								   const QxRuntimeTaskRequest *request)
 {
-	Datum		values[Natts_pg_qx_task];
-	bool		nulls[Natts_pg_qx_task];
-	HeapTuple	tup;
-	Oid			taskoid;
-	ObjectAddress myself;
-	ObjectAddress referenced;
-	const char *submit_contract;
-	const char *resume_contract;
+	Assert(params != NULL);
+	Assert(request != NULL);
 
-	memset(values, 0, sizeof(values));
-	memset(nulls, false, sizeof(nulls));
-	submit_contract = qx_runtime_request_phase_contract(request, false);
-	resume_contract = qx_runtime_request_phase_contract(request, true);
-
-	taskoid = GetNewOidWithIndex(taskrel, QxTaskOidIndexId,
-								 Anum_pg_qx_task_oid);
-	values[Anum_pg_qx_task_oid - 1] = ObjectIdGetDatum(taskoid);
-	values[Anum_pg_qx_task_qxtaskdbid - 1] = ObjectIdGetDatum(MyDatabaseId);
-	values[Anum_pg_qx_task_qxtasksessionid - 1] =
-		ObjectIdGetDatum(request->sessionoid);
-	values[Anum_pg_qx_task_qxtaskagentid - 1] =
-		ObjectIdGetDatum(request->agentoid);
-	values[Anum_pg_qx_task_qxtasknamespacepolicyid - 1] =
-		ObjectIdGetDatum(request->namespace_policy_oid);
-	values[Anum_pg_qx_task_qxtaskidentityid - 1] =
-		ObjectIdGetDatum(request->identityoid);
-	values[Anum_pg_qx_task_qxtaskowner - 1] =
-		ObjectIdGetDatum(request->ownerid);
-	values[Anum_pg_qx_task_qxtasklastattemptid - 1] =
-		ObjectIdGetDatum(InvalidOid);
-	values[Anum_pg_qx_task_qxtasklastcheckpointid - 1] =
-		ObjectIdGetDatum(InvalidOid);
-	values[Anum_pg_qx_task_qxtaskbudgettokens - 1] =
-		Int32GetDatum(request->budget_tokens);
-	values[Anum_pg_qx_task_qxtaskbudgetcost - 1] =
-		Int32GetDatum(request->budget_cost);
-	values[Anum_pg_qx_task_qxtaskauthorizedtooltokens - 1] =
-		Int32GetDatum(request->authorized_tool_tokens);
-	values[Anum_pg_qx_task_qxtaskauthorizedtoolcost - 1] =
-		Int32GetDatum(request->authorized_tool_cost);
-	values[Anum_pg_qx_task_qxtaskestimatedtokens - 1] =
-		Int32GetDatum(request->estimated_tokens);
-	values[Anum_pg_qx_task_qxtaskestimatedcost - 1] =
-		Int32GetDatum(request->estimated_cost);
-	values[Anum_pg_qx_task_qxtaskstate - 1] =
-		CharGetDatum(QX_TASK_STATE_QUEUED);
-	qx_set_text_datum(values, nulls, Anum_pg_qx_task_qxtaskname,
-					  request->task_name);
-	qx_set_text_datum(values, nulls, Anum_pg_qx_task_qxtaskgoal,
-					  request->goal);
-	qx_set_nodetree_datum(values, nulls, Anum_pg_qx_task_qxtaskinput,
-						  request->input);
-	qx_set_text_datum(values, nulls, Anum_pg_qx_task_qxtaskpriority,
-					  request->priority);
-	qx_set_nodetree_datum(values, nulls,
-						  Anum_pg_qx_task_qxtaskauthorizedtools,
-						  request->authorized_tools);
-	qx_set_text_datum(values, nulls,
-					  Anum_pg_qx_task_qxtasksubmitcontract,
-					  submit_contract);
-	qx_set_text_datum(values, nulls,
-					  Anum_pg_qx_task_qxtaskresumecontract,
-					  resume_contract);
-
-	tup = heap_form_tuple(RelationGetDescr(taskrel), values, nulls);
-	CatalogTupleInsert(taskrel, tup);
-	heap_freetuple(tup);
-
-	ObjectAddressSet(myself, QxTaskRelationId, taskoid);
-	recordDependencyOnOwner(QxTaskRelationId, taskoid, request->ownerid);
-	ObjectAddressSet(referenced, QxSessionRelationId, request->sessionoid);
-	recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
-	ObjectAddressSet(referenced, QxAgentRelationId, request->agentoid);
-	recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
-	ObjectAddressSet(referenced, QxNamespaceRelationId, request->namespace_policy_oid);
-	recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
-	ObjectAddressSet(referenced, QxIdentityRelationId, request->identityoid);
-	recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
-	recordDependencyOnCurrentExtension(&myself, false);
-	InvokeObjectPostCreateHook(QxTaskRelationId, taskoid, 0);
-
-	return taskoid;
+	MemSet(params, 0, sizeof(*params));
+	params->sessionoid = request->sessionoid;
+	params->agentoid = request->agentoid;
+	params->identityoid = request->identityoid;
+	params->namespace_policy_oid = request->namespace_policy_oid;
+	params->ownerid = request->ownerid;
+	params->task_name = request->task_name;
+	params->goal = request->goal;
+	params->input = request->input;
+	params->priority = request->priority;
+	params->authorized_tools = request->authorized_tools;
+	params->submit_contract = qx_runtime_request_phase_contract(request, false);
+	params->resume_contract = qx_runtime_request_phase_contract(request, true);
+	params->budget_tokens = request->budget_tokens;
+	params->budget_cost = request->budget_cost;
+	params->authorized_tool_tokens = request->authorized_tool_tokens;
+	params->authorized_tool_cost = request->authorized_tool_cost;
+	params->estimated_tokens = request->estimated_tokens;
+	params->estimated_cost = request->estimated_cost;
 }
 
 static int16
@@ -5471,7 +4919,7 @@ pg_qx_test_start_recovery_attempt(PG_FUNCTION_ARGS)
 	heartbeatledgerrel = table_open(QxSchedulerHeartbeatRelationId,
 									RowExclusiveLock);
 
-	attemptoid = qx_insert_attempt(attemptrel,
+	attemptoid = QxCatalogInsertAttempt(attemptrel,
 								   task.sessionoid,
 								   taskoid,
 								   task.ownerid,
@@ -5495,16 +4943,16 @@ pg_qx_test_start_recovery_attempt(PG_FUNCTION_ARGS)
 												true,
 												selected_contract);
 	queue_snapshot = QxSchedulerQueueSnapshotFromEnvelope(&scheduler_envelope);
-	queueoid = qx_insert_scheduler_queue(queueledgerrel, queue_snapshot);
+	queueoid = QxCatalogInsertSchedulerQueue(queueledgerrel, queue_snapshot);
 	CommandCounterIncrement();
 
 	lease_snapshot = QxSchedulerLeaseSnapshotFromEnvelope(&scheduler_envelope,
 														  InvalidOid,
 														  "embedded-runtime");
-	leaseoid = qx_insert_scheduler_lease(leaseledgerrel, queueoid,
+	leaseoid = QxCatalogInsertSchedulerLease(leaseledgerrel, queueoid,
 										 lease_snapshot);
 	heartbeat_snapshot = QxSchedulerHeartbeatSnapshotFromLease(lease_snapshot);
-	(void) qx_insert_scheduler_heartbeat(heartbeatledgerrel, leaseoid,
+	(void) QxCatalogInsertSchedulerHeartbeat(heartbeatledgerrel, leaseoid,
 										 heartbeat_snapshot);
 	CommandCounterIncrement();
 
@@ -5649,10 +5097,15 @@ qx_runtime_test_start_uncheckpointed_task(Oid sessionoid,
 	heartbeatledgerrel = table_open(QxSchedulerHeartbeatRelationId,
 									RowExclusiveLock);
 
-	taskoid = qx_runtime_insert_task(taskrel, &request);
+	{
+		QxCatalogTaskInsertParams task_params;
+
+		qx_runtime_fill_task_insert_params(&task_params, &request);
+		taskoid = QxCatalogInsertTask(taskrel, &task_params);
+	}
 	CommandCounterIncrement();
 
-	attemptoid = qx_insert_attempt(attemptrel,
+	attemptoid = QxCatalogInsertAttempt(attemptrel,
 								   request.sessionoid,
 								   taskoid,
 								   request.ownerid,
@@ -5690,7 +5143,7 @@ qx_runtime_test_start_uncheckpointed_task(Oid sessionoid,
 	pfree(agent_name);
 
 	queue_snapshot = QxSchedulerQueueSnapshotFromEnvelope(&scheduler_envelope);
-	queueoid = qx_insert_scheduler_queue(queueledgerrel, queue_snapshot);
+	queueoid = QxCatalogInsertSchedulerQueue(queueledgerrel, queue_snapshot);
 	CommandCounterIncrement();
 
 	payload = psprintf("goal=%s;priority=%s",
@@ -5700,16 +5153,16 @@ qx_runtime_test_start_uncheckpointed_task(Oid sessionoid,
 	payload = qx_scheduler_append_runtime_payload(payload,
 												  &scheduler_envelope,
 												  false);
-	(void) qx_insert_event(eventrel, request.sessionoid, taskoid, InvalidOid,
+	(void) QxCatalogInsertEvent(eventrel, request.sessionoid, taskoid, InvalidOid,
 						   request.ownerid, NULL, "TASK_QUEUED", payload);
-	(void) qx_insert_trace(tracerel, request.sessionoid, taskoid, InvalidOid,
+	(void) QxCatalogInsertTrace(tracerel, request.sessionoid, taskoid, InvalidOid,
 						   request.ownerid, NULL, "runtime.queue", payload);
 	pfree(payload);
 
 	QxCatalogUpdateTaskRuntime(taskrel, taskoid, QX_TASK_STATE_RUNNING,
 						   attemptoid, true, InvalidOid, false);
 
-	stepoid = qx_insert_step(steprel, request.sessionoid, taskoid, 1,
+	stepoid = QxCatalogInsertStep(steprel, request.sessionoid, taskoid, 1,
 							 "stage8.scheduler_admit",
 							 "Scheduler regression hook admitted an initial attempt without writing a durable checkpoint");
 	payload = psprintf("attempt_opened;state=%c;identity=%s;namespace_policy=%s;tools=%d;budget_cost=%d;budget_tokens=%d",
@@ -5726,15 +5179,15 @@ qx_runtime_test_start_uncheckpointed_task(Oid sessionoid,
 	lease_snapshot = QxSchedulerLeaseSnapshotFromEnvelope(&scheduler_envelope,
 														 InvalidOid,
 														 "embedded-runtime");
-	leaseoid = qx_insert_scheduler_lease(leaseledgerrel, queueoid,
+	leaseoid = QxCatalogInsertSchedulerLease(leaseledgerrel, queueoid,
 										 lease_snapshot);
 	heartbeat_snapshot = QxSchedulerHeartbeatSnapshotFromLease(lease_snapshot);
-	(void) qx_insert_scheduler_heartbeat(heartbeatledgerrel, leaseoid,
+	(void) QxCatalogInsertSchedulerHeartbeat(heartbeatledgerrel, leaseoid,
 										 heartbeat_snapshot);
 	CommandCounterIncrement();
-	(void) qx_insert_event(eventrel, request.sessionoid, taskoid, stepoid,
+	(void) QxCatalogInsertEvent(eventrel, request.sessionoid, taskoid, stepoid,
 						   request.ownerid, NULL, "TASK_DISPATCHED", payload);
-	(void) qx_insert_trace(tracerel, request.sessionoid, taskoid, stepoid,
+	(void) QxCatalogInsertTrace(tracerel, request.sessionoid, taskoid, stepoid,
 						   request.ownerid, NULL, "runtime.dispatch", payload);
 	pfree(payload);
 
@@ -5821,7 +5274,7 @@ qx_runtime_test_start_exhausted_retry_task(Oid sessionoid)
 	QxCatalogUpdateAttemptState(attemptrel, attempt.oid, QX_ATTEMPT_STATE_FAILED);
 	QxCatalogUpdateTaskRuntime(taskrel, taskoid, QX_TASK_STATE_QUEUED,
 						   attempt.oid, true, InvalidOid, true);
-	queueoid = qx_insert_scheduler_queue(queueledgerrel, retry_queue);
+	queueoid = QxCatalogInsertSchedulerQueue(queueledgerrel, retry_queue);
 	CommandCounterIncrement();
 
 	payload = psprintf("test=exhausted_retry;retry_count=%d;max_retries=%d;queueoid=%u",
@@ -5832,10 +5285,10 @@ qx_runtime_test_start_exhausted_retry_task(Oid sessionoid)
 	payload = qx_scheduler_append_runtime_payload(payload,
 												  &scheduler_envelope,
 												  false);
-	(void) qx_insert_event(eventrel, task.sessionoid, taskoid, InvalidOid,
+	(void) QxCatalogInsertEvent(eventrel, task.sessionoid, taskoid, InvalidOid,
 						   task.ownerid, NULL,
 						   "TASK_RETRY_EXHAUSTED_FIXTURE", payload);
-	(void) qx_insert_trace(tracerel, task.sessionoid, taskoid, InvalidOid,
+	(void) QxCatalogInsertTrace(tracerel, task.sessionoid, taskoid, InvalidOid,
 						   task.ownerid, NULL,
 						   "runtime.retry_exhausted_fixture", payload);
 	pfree(payload);
@@ -6221,14 +5674,14 @@ pg_qx_test_run_scheduler_worker_tick(PG_FUNCTION_ARGS)
 		lease_ttl_ms = qx_runtime_lease_ttl_ms(&lease_snapshot);
 		renewed_lease_snapshot =
 			QxSchedulerRenewLeaseSnapshot(&lease_snapshot, lease_ttl_ms);
-		leaseoid = qx_insert_scheduler_lease(leaseledgerrel,
+		leaseoid = QxCatalogInsertSchedulerLease(leaseledgerrel,
 											 queueoid,
 											 renewed_lease_snapshot);
 		heartbeat_snapshot =
 			QxSchedulerHeartbeatSnapshotFromLease(renewed_lease_snapshot);
 		qx_runtime_set_heartbeat_receipt(heartbeat_snapshot,
 										 "scheduler-renew");
-		(void) qx_insert_scheduler_heartbeat(heartbeatledgerrel,
+		(void) QxCatalogInsertSchedulerHeartbeat(heartbeatledgerrel,
 											 leaseoid,
 											 heartbeat_snapshot);
 		CommandCounterIncrement();
@@ -6343,10 +5796,15 @@ QxRuntimeSubmitTask(const QxRuntimeTaskRequest *request)
 	leaseledgerrel = table_open(QxSchedulerLeaseRelationId, RowExclusiveLock);
 	heartbeatledgerrel = table_open(QxSchedulerHeartbeatRelationId, RowExclusiveLock);
 
-	taskoid = qx_runtime_insert_task(taskrel, request);
+	{
+		QxCatalogTaskInsertParams task_params;
+
+		qx_runtime_fill_task_insert_params(&task_params, request);
+		taskoid = QxCatalogInsertTask(taskrel, &task_params);
+	}
 	CommandCounterIncrement();
 
-	attemptoid = qx_insert_attempt(attemptrel,
+	attemptoid = QxCatalogInsertAttempt(attemptrel,
 								   request->sessionoid,
 								   taskoid,
 								   request->ownerid,
@@ -6384,7 +5842,7 @@ QxRuntimeSubmitTask(const QxRuntimeTaskRequest *request)
 							   selected_contract);
 	pfree(agent_name);
 	queue_snapshot = QxSchedulerQueueSnapshotFromEnvelope(&scheduler_envelope);
-	queueoid = qx_insert_scheduler_queue(queueledgerrel, queue_snapshot);
+	queueoid = QxCatalogInsertSchedulerQueue(queueledgerrel, queue_snapshot);
 	CommandCounterIncrement();
 
 	payload = psprintf("goal=%s;priority=%s",
@@ -6394,16 +5852,16 @@ QxRuntimeSubmitTask(const QxRuntimeTaskRequest *request)
 	payload = qx_scheduler_append_runtime_payload(payload,
 												  &scheduler_envelope,
 												  false);
-	(void) qx_insert_event(eventrel, request->sessionoid, taskoid, InvalidOid,
+	(void) QxCatalogInsertEvent(eventrel, request->sessionoid, taskoid, InvalidOid,
 						   request->ownerid, NULL, "TASK_QUEUED", payload);
-	(void) qx_insert_trace(tracerel, request->sessionoid, taskoid, InvalidOid,
+	(void) QxCatalogInsertTrace(tracerel, request->sessionoid, taskoid, InvalidOid,
 						   request->ownerid, NULL, "runtime.queue", payload);
 	pfree(payload);
 
 	QxCatalogUpdateTaskRuntime(taskrel, taskoid, QX_TASK_STATE_RUNNING,
 						   attemptoid, true, InvalidOid, false);
 
-	stepoid = qx_insert_step(steprel, request->sessionoid, taskoid, 1,
+	stepoid = QxCatalogInsertStep(steprel, request->sessionoid, taskoid, 1,
 							 "stage8.scheduler_admit",
 							 "Stage 26 scheduler contract admitted attempt 1 into the embedded runtime");
 	QxCatalogChargeTaskBudget(taskrel, taskoid, 16, 17, "scheduler_admit");
@@ -6421,19 +5879,19 @@ QxRuntimeSubmitTask(const QxRuntimeTaskRequest *request)
 	lease_snapshot = QxSchedulerLeaseSnapshotFromEnvelope(&scheduler_envelope,
 														 InvalidOid,
 														 "embedded-runtime");
-	leaseoid = qx_insert_scheduler_lease(leaseledgerrel, queueoid,
+	leaseoid = QxCatalogInsertSchedulerLease(leaseledgerrel, queueoid,
 										 lease_snapshot);
 	heartbeat_snapshot = QxSchedulerHeartbeatSnapshotFromLease(lease_snapshot);
-	(void) qx_insert_scheduler_heartbeat(heartbeatledgerrel, leaseoid,
+	(void) QxCatalogInsertSchedulerHeartbeat(heartbeatledgerrel, leaseoid,
 										 heartbeat_snapshot);
 	CommandCounterIncrement();
-	(void) qx_insert_event(eventrel, request->sessionoid, taskoid, stepoid,
+	(void) QxCatalogInsertEvent(eventrel, request->sessionoid, taskoid, stepoid,
 						   request->ownerid, NULL, "TASK_DISPATCHED", payload);
-	(void) qx_insert_trace(tracerel, request->sessionoid, taskoid, stepoid,
+	(void) QxCatalogInsertTrace(tracerel, request->sessionoid, taskoid, stepoid,
 						   request->ownerid, NULL, "runtime.dispatch", payload);
 	pfree(payload);
 
-	stepoid = qx_insert_step(steprel, request->sessionoid, taskoid, 2,
+	stepoid = QxCatalogInsertStep(steprel, request->sessionoid, taskoid, 2,
 							 "stage15.authorize_tools",
 							 "Attempt 1 validated the runtime tool allowlist against namespace policy");
 	payload = psprintf("namespace_policy=%s;authorized_tools=%d;tool_tokens=%d;tool_cost=%d",
@@ -6441,15 +5899,15 @@ QxRuntimeSubmitTask(const QxRuntimeTaskRequest *request)
 					   list_length(request->authorized_tools),
 					   request->authorized_tool_tokens,
 					   request->authorized_tool_cost);
-	(void) qx_insert_event(eventrel, request->sessionoid, taskoid, stepoid,
+	(void) QxCatalogInsertEvent(eventrel, request->sessionoid, taskoid, stepoid,
 						   request->ownerid, NULL, "TASK_TOOLS_AUTHORIZED",
 						   payload);
-	(void) qx_insert_trace(tracerel, request->sessionoid, taskoid, stepoid,
+	(void) QxCatalogInsertTrace(tracerel, request->sessionoid, taskoid, stepoid,
 						   request->ownerid, NULL, "runtime.authorize_tools",
 						   payload);
 	pfree(payload);
 
-	stepoid = qx_insert_step(steprel, request->sessionoid, taskoid, 3,
+	stepoid = QxCatalogInsertStep(steprel, request->sessionoid, taskoid, 3,
 							 "stage16.external_submit",
 							 "Attempt 1 executed the selected tool through its principal program");
 	qx_execute_tool_contract(selected_contract, "submit", taskoid,
@@ -6461,15 +5919,15 @@ QxRuntimeSubmitTask(const QxRuntimeTaskRequest *request)
 						  tool_result.cost_charge,
 						  "external_submit");
 	payload = qx_format_external_execution_payload("submit", &tool_result);
-	(void) qx_insert_event(eventrel, request->sessionoid, taskoid, stepoid,
+	(void) QxCatalogInsertEvent(eventrel, request->sessionoid, taskoid, stepoid,
 						   request->ownerid, &semantic_meta,
 						   "TASK_TOOL_EXECUTED", payload);
-	(void) qx_insert_trace(tracerel, request->sessionoid, taskoid, stepoid,
+	(void) QxCatalogInsertTrace(tracerel, request->sessionoid, taskoid, stepoid,
 						   request->ownerid, &semantic_meta,
 						   "runtime.external_submit", payload);
 	pfree(payload);
 
-	stepoid = qx_insert_step(steprel, request->sessionoid, taskoid, 4,
+	stepoid = QxCatalogInsertStep(steprel, request->sessionoid, taskoid, 4,
 							 "stage8.capture_input",
 							 "Attempt 1 captured task goal and raw input");
 	QxCatalogChargeTaskBudget(taskrel, taskoid,
@@ -6479,30 +5937,30 @@ QxRuntimeSubmitTask(const QxRuntimeTaskRequest *request)
 	payload = psprintf("input_present=%s;task_name=%s",
 					   request->input != NULL ? "true" : "false",
 					   request->task_name != NULL ? request->task_name : "<anonymous>");
-	(void) qx_insert_event(eventrel, request->sessionoid, taskoid, stepoid,
+	(void) QxCatalogInsertEvent(eventrel, request->sessionoid, taskoid, stepoid,
 						   request->ownerid, NULL, "TASK_INPUT_CAPTURED",
 						   payload);
-	(void) qx_insert_trace(tracerel, request->sessionoid, taskoid, stepoid,
+	(void) QxCatalogInsertTrace(tracerel, request->sessionoid, taskoid, stepoid,
 						   request->ownerid, NULL, "runtime.capture_input",
 						   payload);
 	pfree(payload);
 
-	stepoid = qx_insert_step(steprel, request->sessionoid, taskoid, 5,
+	stepoid = QxCatalogInsertStep(steprel, request->sessionoid, taskoid, 5,
 							 "stage8.checkpoint_barrier",
 							 "Attempt 1 reached a resumable checkpoint barrier");
 	QxCatalogChargeTaskBudget(taskrel, taskoid, 4, 14, "checkpoint_barrier");
 	payload = psprintf("checkpoint=stage8.after_capture;task_state=%c",
 					   QX_TASK_STATE_CHECKPOINTED);
-	(void) qx_insert_event(eventrel, request->sessionoid, taskoid, stepoid,
+	(void) QxCatalogInsertEvent(eventrel, request->sessionoid, taskoid, stepoid,
 						   request->ownerid, &semantic_meta,
 						   "TASK_CHECKPOINTED", payload);
-	(void) qx_insert_trace(tracerel, request->sessionoid, taskoid, stepoid,
+	(void) QxCatalogInsertTrace(tracerel, request->sessionoid, taskoid, stepoid,
 						   request->ownerid, &semantic_meta,
 						   "runtime.checkpoint", payload);
 
 	checkpoint_data = psprintf("task=%u;attempt=%u;session=%u;next_step=%d",
 							   taskoid, attemptoid, request->sessionoid, 6);
-	checkpointoid = qx_insert_checkpoint(checkpointrel,
+	checkpointoid = QxCatalogInsertCheckpoint(checkpointrel,
 										 request->sessionoid,
 										 taskoid,
 										 attemptoid,
@@ -6520,19 +5978,19 @@ QxRuntimeSubmitTask(const QxRuntimeTaskRequest *request)
 						   attemptoid, true, checkpointoid, true);
 	released_lease_snapshot = QxSchedulerReleaseLeaseSnapshot(lease_snapshot,
 															 false);
-	leaseoid = qx_insert_scheduler_lease(leaseledgerrel, queueoid,
+	leaseoid = QxCatalogInsertSchedulerLease(leaseledgerrel, queueoid,
 										 released_lease_snapshot);
 	final_heartbeat_snapshot =
 		QxSchedulerFinalizeHeartbeatSnapshot(released_lease_snapshot,
 											 "scheduler-release");
-	(void) qx_insert_scheduler_heartbeat(heartbeatledgerrel, leaseoid,
+	(void) QxCatalogInsertSchedulerHeartbeat(heartbeatledgerrel, leaseoid,
 										 final_heartbeat_snapshot);
 	CommandCounterIncrement();
 
-	(void) qx_insert_event(eventrel, request->sessionoid, taskoid, InvalidOid,
+	(void) QxCatalogInsertEvent(eventrel, request->sessionoid, taskoid, InvalidOid,
 						   request->ownerid, NULL,
 						   "TASK_READY_FOR_RESUME", payload);
-	(void) qx_insert_trace(tracerel, request->sessionoid, taskoid, InvalidOid,
+	(void) QxCatalogInsertTrace(tracerel, request->sessionoid, taskoid, InvalidOid,
 						   request->ownerid, NULL, "runtime.pause",
 						   "Task paused at durable checkpoint and awaits RESUME TASK");
 	pfree(payload);
@@ -6664,7 +6122,7 @@ QxRuntimeResumeTask(Oid taskoid, const char *checkpoint_label, Oid ownerid)
 	leaseledgerrel = table_open(QxSchedulerLeaseRelationId, RowExclusiveLock);
 	heartbeatledgerrel = table_open(QxSchedulerHeartbeatRelationId, RowExclusiveLock);
 
-	attemptoid = qx_insert_attempt(attemptrel,
+	attemptoid = QxCatalogInsertAttempt(attemptrel,
 								   task.sessionoid,
 								   taskoid,
 								   ownerid,
@@ -6707,7 +6165,7 @@ QxRuntimeResumeTask(Oid taskoid, const char *checkpoint_label, Oid ownerid)
 							   selected_contract);
 	memset(&tool_result, 0, sizeof(tool_result));
 	queue_snapshot = QxSchedulerQueueSnapshotFromEnvelope(&scheduler_envelope);
-	queueoid = qx_insert_scheduler_queue(queueledgerrel, queue_snapshot);
+	queueoid = QxCatalogInsertSchedulerQueue(queueledgerrel, queue_snapshot);
 	CommandCounterIncrement();
 
 	payload = psprintf("checkpoint=%s;resume_requested;next_step=%d",
@@ -6717,13 +6175,13 @@ QxRuntimeResumeTask(Oid taskoid, const char *checkpoint_label, Oid ownerid)
 	payload = qx_scheduler_append_runtime_payload(payload,
 												  &scheduler_envelope,
 												  false);
-	(void) qx_insert_event(eventrel, task.sessionoid, taskoid,
+	(void) QxCatalogInsertEvent(eventrel, task.sessionoid, taskoid,
 						   InvalidOid, ownerid, NULL, "TASK_RESUMED", payload);
-	(void) qx_insert_trace(tracerel, task.sessionoid, taskoid,
+	(void) QxCatalogInsertTrace(tracerel, task.sessionoid, taskoid,
 						   InvalidOid, ownerid, NULL, "runtime.resume", payload);
 	pfree(payload);
 
-	stepoid = qx_insert_step(steprel, task.sessionoid, taskoid,
+	stepoid = QxCatalogInsertStep(steprel, task.sessionoid, taskoid,
 							 resume_stepseqno,
 							 "stage8.resume_dispatch",
 							 "Attempt 2 resumed execution from the last durable checkpoint");
@@ -6738,21 +6196,21 @@ QxRuntimeResumeTask(Oid taskoid, const char *checkpoint_label, Oid ownerid)
 	lease_snapshot = QxSchedulerLeaseSnapshotFromEnvelope(&scheduler_envelope,
 														 InvalidOid,
 														 "embedded-runtime");
-	leaseoid = qx_insert_scheduler_lease(leaseledgerrel, queueoid,
+	leaseoid = QxCatalogInsertSchedulerLease(leaseledgerrel, queueoid,
 										 lease_snapshot);
 	heartbeat_snapshot = QxSchedulerHeartbeatSnapshotFromLease(lease_snapshot);
-	(void) qx_insert_scheduler_heartbeat(heartbeatledgerrel, leaseoid,
+	(void) QxCatalogInsertSchedulerHeartbeat(heartbeatledgerrel, leaseoid,
 										 heartbeat_snapshot);
 	CommandCounterIncrement();
-	(void) qx_insert_event(eventrel, task.sessionoid, taskoid,
+	(void) QxCatalogInsertEvent(eventrel, task.sessionoid, taskoid,
 						   stepoid, ownerid, NULL, "TASK_RESUME_DISPATCHED",
 						   payload);
-	(void) qx_insert_trace(tracerel, task.sessionoid, taskoid,
+	(void) QxCatalogInsertTrace(tracerel, task.sessionoid, taskoid,
 						   stepoid, ownerid, NULL, "runtime.resume_dispatch",
 						   payload);
 	pfree(payload);
 
-	stepoid = qx_insert_step(steprel, task.sessionoid, taskoid,
+	stepoid = QxCatalogInsertStep(steprel, task.sessionoid, taskoid,
 							 resume_stepseqno + 1,
 							 "stage16.external_resume",
 							 "Attempt 2 executed the selected tool through its principal program");
@@ -6764,31 +6222,31 @@ QxRuntimeResumeTask(Oid taskoid, const char *checkpoint_label, Oid ownerid)
 						  tool_result.cost_charge,
 						  "external_resume");
 	payload = qx_format_external_execution_payload("resume", &tool_result);
-	(void) qx_insert_event(eventrel, task.sessionoid, taskoid,
+	(void) QxCatalogInsertEvent(eventrel, task.sessionoid, taskoid,
 						   stepoid, ownerid, &semantic_meta,
 						   "TASK_TOOL_EXECUTED", payload);
-	(void) qx_insert_trace(tracerel, task.sessionoid, taskoid,
+	(void) QxCatalogInsertTrace(tracerel, task.sessionoid, taskoid,
 						   stepoid, ownerid, &semantic_meta,
 						   "runtime.external_resume", payload);
 	pfree(payload);
 
-	stepoid = qx_insert_step(steprel, task.sessionoid, taskoid,
+	stepoid = QxCatalogInsertStep(steprel, task.sessionoid, taskoid,
 							 resume_stepseqno + 2,
 							 "stage8.complete",
 							 "Attempt 2 completed the task after resuming");
 	QxCatalogChargeTaskBudget(taskrel, taskoid, 4, 11, "final_checkpoint");
 	payload = psprintf("checkpoint=stage8.final;task_state=%c",
 					   QX_TASK_STATE_COMPLETED);
-	(void) qx_insert_event(eventrel, task.sessionoid, taskoid,
+	(void) QxCatalogInsertEvent(eventrel, task.sessionoid, taskoid,
 						   stepoid, ownerid, &semantic_meta,
 						   "TASK_CHECKPOINTED", payload);
-	(void) qx_insert_trace(tracerel, task.sessionoid, taskoid,
+	(void) QxCatalogInsertTrace(tracerel, task.sessionoid, taskoid,
 						   stepoid, ownerid, &semantic_meta,
 						   "runtime.final_checkpoint", payload);
 
 	checkpoint_data = psprintf("task=%u;attempt=%u;session=%u;next_step=%d",
 							   taskoid, attemptoid, task.sessionoid, 0);
-	finalcheckpointoid = qx_insert_checkpoint(checkpointrel,
+	finalcheckpointoid = QxCatalogInsertCheckpoint(checkpointrel,
 											  task.sessionoid,
 											  taskoid,
 											  attemptoid,
@@ -6806,19 +6264,19 @@ QxRuntimeResumeTask(Oid taskoid, const char *checkpoint_label, Oid ownerid)
 						   attemptoid, true, finalcheckpointoid, true);
 	released_lease_snapshot = QxSchedulerReleaseLeaseSnapshot(lease_snapshot,
 															 false);
-	leaseoid = qx_insert_scheduler_lease(leaseledgerrel, queueoid,
+	leaseoid = QxCatalogInsertSchedulerLease(leaseledgerrel, queueoid,
 										 released_lease_snapshot);
 	final_heartbeat_snapshot =
 		QxSchedulerFinalizeHeartbeatSnapshot(released_lease_snapshot,
 											 "scheduler-release");
-	(void) qx_insert_scheduler_heartbeat(heartbeatledgerrel, leaseoid,
+	(void) QxCatalogInsertSchedulerHeartbeat(heartbeatledgerrel, leaseoid,
 										 final_heartbeat_snapshot);
 	CommandCounterIncrement();
 
-	(void) qx_insert_event(eventrel, task.sessionoid, taskoid,
+	(void) QxCatalogInsertEvent(eventrel, task.sessionoid, taskoid,
 						   InvalidOid, ownerid, &semantic_meta,
 						   "TASK_COMPLETED", payload);
-	(void) qx_insert_trace(tracerel, task.sessionoid, taskoid,
+	(void) QxCatalogInsertTrace(tracerel, task.sessionoid, taskoid,
 						   InvalidOid, ownerid, &semantic_meta,
 						   "runtime.complete",
 						   "Task completed after resumable attempt handoff");

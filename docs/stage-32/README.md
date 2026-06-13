@@ -36,6 +36,13 @@ It is a consolidation step, not a new runtime feature by itself.
 - runtime receipt-key lookup, submit-time agent name lookup, attempt sequence
   lookup, budget validation, and RESUME TASK task/checkpoint reads now consume
   `qx_catalog` snapshots;
+- runtime insert paths for tasks, attempts, steps, events, traces, and
+  checkpoints, plus scheduler queue/lease/heartbeat ledger writes, now route
+  through `QxCatalogInsert*` helpers instead of open-coded tuple insertion in
+  `qx_runtime.c`;
+- provider, principal, and distinct runtime-class list snapshot builders now
+  back `pg_qx_stat_get_provider_stats`, `pg_qx_stat_get_principal_stats`, and
+  `pg_qx_stat_get_runtime_class_stats` instead of open-coded catalog scans;
 - recovery task/attempt summaries now also consult the durable scheduler
   queue/lease ledgers before requesting runtime requeue/fence hooks, so
   startup/failover scans stay idempotent once the autonomous supervisor has
@@ -70,8 +77,7 @@ It is a consolidation step, not a new runtime feature by itself.
   checkpoint snapshots;
 - planner flow now depends on this helper layer for session, agent, identity,
   task, and checkpoint snapshots used by `EXPLAIN AGENT`;
-- runtime write/update paths, scheduler, broader observability consumers, and
-  remaining security DDL/write paths still have direct catalog access to
+- remaining security DDL/write paths still have direct catalog access to
   migrate where practical;
 - no dedicated regression schedule was added yet for the helper API itself.
 
@@ -99,8 +105,7 @@ It is a consolidation step, not a new runtime feature by itself.
 - this stage is mainly an internal maintainability improvement;
 - recovery, planner, security authorization/validation, and selected runtime
   read paths are now migrated consumers;
-- runtime write/update paths, scheduler, broader observability consumers, and
-  security write/validation paths still use direct catalog access in places
+- security write/validation paths still use direct catalog access in places
   and need migration in later cleanup phases.
 
 ## Validation
@@ -125,8 +130,8 @@ It is a consolidation step, not a new runtime feature by itself.
   catalog access is now limited to write-time tuple insertion for identity
   creation.
 - `runtime` now uses `qx_catalog` for pure resume/read metadata, budget
-  validation, and provider receipt-key reads. Remaining direct syscache access
-  in runtime is limited to tuple update helpers for task/attempt mutation.
+  validation, provider receipt-key reads, and all durable insert paths for
+  tasks, attempts, steps, events, traces, checkpoints, and scheduler ledgers.
 - `tracecmds` and `memorycmds` no longer open-code syscache task, session, or
   agent authorization reads; `SHOW TRACE` still scans `pg_qx_trace` rows to
   return trace output, but now also renders `trace_summary` through

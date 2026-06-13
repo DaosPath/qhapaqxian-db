@@ -558,24 +558,7 @@ pg_qx_stat_get_provider_stats(PG_FUNCTION_ARGS)
 		state->index = 0;
 		state->providers = NIL;
 
-		{
-			Relation	rel;
-			TableScanDesc scan;
-			HeapTuple	tup;
-
-			rel = table_open(QxProviderRelationId, AccessShareLock);
-			scan = table_beginscan_catalog(rel, 0, NULL);
-			while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
-			{
-				Form_pg_qx_provider form = (Form_pg_qx_provider) GETSTRUCT(tup);
-				QxCatalogProviderInfo *info = palloc(sizeof(QxCatalogProviderInfo));
-
-				if (QxCatalogLookupProviderByOid(form->oid, info))
-					state->providers = lappend(state->providers, info);
-			}
-			table_endscan(scan);
-			table_close(rel, AccessShareLock);
-		}
+		state->providers = QxCatalogBuildProviderInfoList(InvalidOid, InvalidOid);
 
 		if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 			ereport(ERROR,
@@ -651,24 +634,7 @@ pg_qx_stat_get_principal_stats(PG_FUNCTION_ARGS)
 		state->index = 0;
 		state->principals = NIL;
 
-		{
-			Relation	rel;
-			TableScanDesc scan;
-			HeapTuple	tup;
-
-			rel = table_open(QxPrincipalRelationId, AccessShareLock);
-			scan = table_beginscan_catalog(rel, 0, NULL);
-			while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
-			{
-				Form_pg_qx_principal form = (Form_pg_qx_principal) GETSTRUCT(tup);
-				QxCatalogPrincipalInfo *info = palloc(sizeof(QxCatalogPrincipalInfo));
-
-				if (QxCatalogLookupPrincipalByOid(form->oid, info))
-					state->principals = lappend(state->principals, info);
-			}
-			table_endscan(scan);
-			table_close(rel, AccessShareLock);
-		}
+		state->principals = QxCatalogBuildPrincipalInfoList(InvalidOid, InvalidOid);
 
 		if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 			ereport(ERROR,
@@ -725,25 +691,6 @@ pg_qx_stat_get_principal_stats(PG_FUNCTION_ARGS)
 	SRF_RETURN_DONE(funcctx);
 }
 
-static bool
-qx_stat_runtime_class_seen(List *runtime_classes, const char *runtime_class)
-{
-	ListCell   *lc;
-
-	if (runtime_class == NULL || runtime_class[0] == '\0')
-		return true;
-
-	foreach(lc, runtime_classes)
-	{
-		const char *existing = (const char *) lfirst(lc);
-
-		if (strcmp(existing, runtime_class) == 0)
-			return true;
-	}
-
-	return false;
-}
-
 typedef struct QxStatRuntimeClassSrfState
 {
 	int			index;
@@ -768,35 +715,7 @@ pg_qx_stat_get_runtime_class_stats(PG_FUNCTION_ARGS)
 		state->index = 0;
 		state->runtime_classes = NIL;
 
-		{
-			Relation	rel;
-			TableScanDesc scan;
-			HeapTuple	tup;
-
-			rel = table_open(QxPrincipalRelationId, AccessShareLock);
-			scan = table_beginscan_catalog(rel, 0, NULL);
-			while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
-			{
-				Form_pg_qx_principal form = (Form_pg_qx_principal) GETSTRUCT(tup);
-				QxCatalogPrincipalInfo info;
-
-				if (QxCatalogLookupPrincipalByOid(form->oid, &info))
-				{
-					if (info.runtime_class != NULL &&
-						info.runtime_class[0] != '\0' &&
-						!qx_stat_runtime_class_seen(state->runtime_classes,
-													info.runtime_class))
-					{
-						state->runtime_classes =
-							lappend(state->runtime_classes,
-									pstrdup(info.runtime_class));
-					}
-					QxCatalogFreePrincipalInfo(&info);
-				}
-			}
-			table_endscan(scan);
-			table_close(rel, AccessShareLock);
-		}
+		state->runtime_classes = QxCatalogBuildDistinctRuntimeClassList();
 
 		if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 			ereport(ERROR,

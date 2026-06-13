@@ -629,6 +629,135 @@ QxObserveRenderTraceSummary(StringInfo buf, const QxObserveTraceSummary *summary
 	qx_observe_append_int(buf, "checkpoint_count", summary->checkpoint_count);
 }
 
+static char *
+qx_observe_strip_duplicate_receipt_tail_once(const char *source)
+{
+	const char *cursor;
+	const char *duplicate;
+
+	if (source == NULL)
+		return NULL;
+
+	cursor = strstr(source, ";detail=");
+	if (cursor != NULL)
+	{
+		duplicate = strstr(cursor + strlen(";detail="), ";detail=");
+		if (duplicate != NULL)
+			return pnstrdup(source, duplicate - source);
+	}
+
+	cursor = strstr(source, ";tokens=");
+	if (cursor != NULL)
+	{
+		duplicate = strstr(cursor + strlen(";tokens="), ";tokens=");
+		if (duplicate != NULL)
+			return pnstrdup(source, duplicate - source);
+	}
+
+	cursor = strstr(source, ";launch_mode=");
+	if (cursor != NULL)
+	{
+		duplicate = strstr(cursor + strlen(";launch_mode="), ";launch_mode=");
+		if (duplicate != NULL)
+			return pnstrdup(source, duplicate - source);
+	}
+
+	return NULL;
+}
+
+static char *
+qx_observe_strip_duplicate_receipt_tail(const char *source)
+{
+	char	   *stripped;
+	char	   *next;
+
+	if (source == NULL)
+		return NULL;
+
+	stripped = pstrdup(source);
+	for (;;)
+	{
+		next = qx_observe_strip_duplicate_receipt_tail_once(stripped);
+		if (next == NULL)
+			break;
+		pfree(stripped);
+		stripped = next;
+	}
+
+	return stripped;
+}
+
+static char *
+qx_observe_truncate_detail_after_wall_ms(const char *source)
+{
+	const char *wall_ms;
+	const char *cursor;
+
+	if (source == NULL)
+		return NULL;
+
+	wall_ms = strstr(source, ";wall_ms=");
+	if (wall_ms == NULL)
+		return pstrdup(source);
+
+	cursor = wall_ms + strlen(";wall_ms=");
+	while (*cursor >= '0' && *cursor <= '9')
+		cursor++;
+
+	return pnstrdup(source, cursor - source);
+}
+
+char *
+QxObserveNormalizeExternalTraceDetail(const char *source)
+{
+	char	   *stripped;
+	const char *detail_marker;
+
+	if (source == NULL)
+		return NULL;
+
+	stripped = qx_observe_strip_duplicate_receipt_tail(source);
+	detail_marker = strstr(stripped, ";detail=");
+	if (detail_marker != NULL)
+	{
+		const char *inner_detail = detail_marker + strlen(";detail=");
+		const char *tokens_in_inner = strstr(inner_detail, ";tokens=");
+		const char *detail_dup = strstr(inner_detail, ";detail=");
+		const char *truncate_at = NULL;
+		char	   *clean_inner;
+		char	   *rewritten;
+
+		if (tokens_in_inner != NULL &&
+			(detail_dup == NULL || tokens_in_inner < detail_dup))
+			truncate_at = tokens_in_inner;
+		else if (detail_dup != NULL)
+			truncate_at = detail_dup;
+
+		if (truncate_at != NULL)
+		{
+			rewritten = pnstrdup(stripped, truncate_at - stripped);
+			pfree(stripped);
+			stripped = rewritten;
+		}
+		else
+		{
+			clean_inner = qx_observe_truncate_detail_after_wall_ms(inner_detail);
+			if (strcmp(clean_inner, inner_detail) != 0)
+			{
+				rewritten = psprintf("%.*s%s",
+									 (int) (inner_detail - stripped),
+									 stripped,
+									 clean_inner);
+				pfree(stripped);
+				stripped = rewritten;
+			}
+			pfree(clean_inner);
+		}
+	}
+
+	return stripped;
+}
+
 Datum
 pg_qx_trace_detail_value(PG_FUNCTION_ARGS)
 {
