@@ -119,6 +119,8 @@ typedef struct QxExternalToolResult
 	char	   *receipt_nonce;
 	char	   *receipt_signature;
 	char	   *attestation_mode;
+	char	   *container_id;
+	char	   *vm_id;
 } QxExternalToolResult;
 
 typedef struct QxSandboxProfile
@@ -2510,6 +2512,10 @@ qx_read_external_result(const char *path, QxExternalToolResult *result)
 			result->process_limit = pg_strtoint32(value);
 		else if (strcmp(key, "PATH_PRESENT") == 0)
 			result->path_present = (strcmp(value, "true") == 0);
+		else if (strcmp(key, "CONTAINER_ID") == 0)
+			result->container_id = pstrdup(value);
+		else if (strcmp(key, "VM_ID") == 0)
+			result->vm_id = pstrdup(value);
 		else if (strcmp(key, "STATUS") == 0 && strcmp(value, "ok") != 0)
 		{
 			FreeFile(file);
@@ -2523,6 +2529,35 @@ qx_read_external_result(const char *path, QxExternalToolResult *result)
 
 	if (result->detail == NULL)
 		result->detail = pstrdup("external tool execution completed");
+}
+
+static char *
+qx_format_external_execution_payload(const char *phase,
+									 const QxExternalToolResult *result)
+{
+	return psprintf("phase=%s;tool=%s;principal=%s;principal_runtime=%s;provider=%s;provider_kind=%s;effective_sandbox=%s;profile=%s;env=%s;cwd=%s;process_limit=%d;timeout_ms=%d;receipt_schema=%s;receipt_alg=%s;receipt_nonce=%s;receipt_sig=%s;attestation=%s;container_id=%s;vm_id=%s;tokens=%d;cost=%d;detail=%s",
+					phase != NULL ? phase : "submit",
+					result->tool_name != NULL ? result->tool_name : "<unknown>",
+					result->principal_name != NULL ? result->principal_name : "<unknown>",
+					result->principal_runtime != NULL ? result->principal_runtime : "<unknown>",
+					result->provider_name != NULL ? result->provider_name : "<unknown>",
+					result->provider_kind != NULL ? result->provider_kind : "<unknown>",
+					result->sandbox_name != NULL ? result->sandbox_name : "<unknown>",
+					result->profile_name != NULL ? result->profile_name : "<unknown>",
+					result->environment_mode != NULL ? result->environment_mode : "<unknown>",
+					result->workdir_name != NULL ? result->workdir_name : "<unknown>",
+					result->process_limit,
+					result->timeout_ms,
+					result->receipt_schema != NULL ? result->receipt_schema : "<unknown>",
+					result->receipt_alg != NULL ? result->receipt_alg : "<unknown>",
+					result->receipt_nonce != NULL ? result->receipt_nonce : "<unknown>",
+					result->receipt_signature != NULL ? "verified" : "missing",
+					result->attestation_mode != NULL ? result->attestation_mode : "<unknown>",
+					result->container_id != NULL ? result->container_id : "",
+					result->vm_id != NULL ? result->vm_id : "",
+					result->token_charge,
+					result->cost_charge,
+					result->detail != NULL ? result->detail : "<none>");
 }
 
 static void
@@ -3177,18 +3212,30 @@ qx_execute_tool_contract(const char *contract, const char *phase, Oid taskoid,
 	if (use_container_backend && result->detail != NULL &&
 		strstr(result->detail, "backend_launch=docker") != NULL)
 	{
-		char		instance_id[64];
+		const char *instance_id = result->container_id;
 
-		snprintf(instance_id, sizeof(instance_id), "qx-container-%u", taskoid);
+		if (instance_id == NULL || instance_id[0] == '\0')
+		{
+			char		fallback_id[64];
+
+			snprintf(fallback_id, sizeof(fallback_id), "qx-container-%u", taskoid);
+			instance_id = fallback_id;
+		}
 		qx_backend_supervisor_register(taskoid, instance_id,
 									   QX_BACKEND_LEASE_CONTAINER);
 	}
 	else if (use_microvm_backend && result->detail != NULL &&
 			 strstr(result->detail, "backend_launch=qemu") != NULL)
 	{
-		char		instance_id[64];
+		const char *instance_id = result->vm_id;
 
-		snprintf(instance_id, sizeof(instance_id), "qx-microvm-%u", taskoid);
+		if (instance_id == NULL || instance_id[0] == '\0')
+		{
+			char		fallback_id[64];
+
+			snprintf(fallback_id, sizeof(fallback_id), "qx-microvm-%u", taskoid);
+			instance_id = fallback_id;
+		}
 		qx_backend_supervisor_register(taskoid, instance_id,
 									   QX_BACKEND_LEASE_MICROVM);
 	}
@@ -3281,6 +3328,13 @@ qx_execute_tool_contract(const char *contract, const char *phase, Oid taskoid,
 		pfree(result->detail);
 		result->detail = augmented_detail;
 	}
+
+	if (result->container_id != NULL && result->container_id[0] != '\0')
+		qx_backend_supervisor_release(taskoid, result->container_id);
+	else if (result->vm_id != NULL && result->vm_id[0] != '\0')
+		qx_backend_supervisor_release(taskoid, result->vm_id);
+	else if (use_container_backend || use_microvm_backend)
+		qx_backend_supervisor_fence_stale(taskoid);
 
 	if (receipt_signer != NULL)
 		pfree(receipt_signer);
@@ -5019,26 +5073,7 @@ qx_runtime_dispatch_retry_task(Relation taskrel,
 						  tool_result.token_charge,
 						  tool_result.cost_charge,
 						  "external_submit");
-	payload = psprintf("phase=submit;tool=%s;principal=%s;principal_runtime=%s;provider=%s;provider_kind=%s;effective_sandbox=%s;profile=%s;env=%s;cwd=%s;process_limit=%d;timeout_ms=%d;receipt_schema=%s;receipt_alg=%s;receipt_nonce=%s;receipt_sig=%s;attestation=%s;tokens=%d;cost=%d;detail=%s",
-					   tool_result.tool_name != NULL ? tool_result.tool_name : "<unknown>",
-					   tool_result.principal_name != NULL ? tool_result.principal_name : "<unknown>",
-					   tool_result.principal_runtime != NULL ? tool_result.principal_runtime : "<unknown>",
-					   tool_result.provider_name != NULL ? tool_result.provider_name : "<unknown>",
-					   tool_result.provider_kind != NULL ? tool_result.provider_kind : "<unknown>",
-					   tool_result.sandbox_name != NULL ? tool_result.sandbox_name : "<unknown>",
-					   tool_result.profile_name != NULL ? tool_result.profile_name : "<unknown>",
-					   tool_result.environment_mode != NULL ? tool_result.environment_mode : "<unknown>",
-					   tool_result.workdir_name != NULL ? tool_result.workdir_name : "<unknown>",
-					   tool_result.process_limit,
-					   tool_result.timeout_ms,
-					   tool_result.receipt_schema != NULL ? tool_result.receipt_schema : "<unknown>",
-					   tool_result.receipt_alg != NULL ? tool_result.receipt_alg : "<unknown>",
-					   tool_result.receipt_nonce != NULL ? tool_result.receipt_nonce : "<unknown>",
-					   tool_result.receipt_signature != NULL ? "verified" : "missing",
-					   tool_result.attestation_mode != NULL ? tool_result.attestation_mode : "<unknown>",
-					   tool_result.token_charge,
-					   tool_result.cost_charge,
-					   tool_result.detail != NULL ? tool_result.detail : "<none>");
+	payload = qx_format_external_execution_payload("submit", &tool_result);
 	(void) qx_insert_event(eventrel, task->sessionoid, task->oid, stepoid,
 						   task->ownerid, &semantic_meta,
 						   "TASK_TOOL_EXECUTED", payload);
@@ -6348,26 +6383,7 @@ QxRuntimeSubmitTask(const QxRuntimeTaskRequest *request)
 						  tool_result.token_charge,
 						  tool_result.cost_charge,
 						  "external_submit");
-	payload = psprintf("phase=submit;tool=%s;principal=%s;principal_runtime=%s;provider=%s;provider_kind=%s;effective_sandbox=%s;profile=%s;env=%s;cwd=%s;process_limit=%d;timeout_ms=%d;receipt_schema=%s;receipt_alg=%s;receipt_nonce=%s;receipt_sig=%s;attestation=%s;tokens=%d;cost=%d;detail=%s",
-					   tool_result.tool_name != NULL ? tool_result.tool_name : "<unknown>",
-					   tool_result.principal_name != NULL ? tool_result.principal_name : "<unknown>",
-					   tool_result.principal_runtime != NULL ? tool_result.principal_runtime : "<unknown>",
-					   tool_result.provider_name != NULL ? tool_result.provider_name : "<unknown>",
-					   tool_result.provider_kind != NULL ? tool_result.provider_kind : "<unknown>",
-					   tool_result.sandbox_name != NULL ? tool_result.sandbox_name : "<unknown>",
-					   tool_result.profile_name != NULL ? tool_result.profile_name : "<unknown>",
-					   tool_result.environment_mode != NULL ? tool_result.environment_mode : "<unknown>",
-					   tool_result.workdir_name != NULL ? tool_result.workdir_name : "<unknown>",
-					   tool_result.process_limit,
-					   tool_result.timeout_ms,
-					   tool_result.receipt_schema != NULL ? tool_result.receipt_schema : "<unknown>",
-					   tool_result.receipt_alg != NULL ? tool_result.receipt_alg : "<unknown>",
-					   tool_result.receipt_nonce != NULL ? tool_result.receipt_nonce : "<unknown>",
-					   tool_result.receipt_signature != NULL ? "verified" : "missing",
-					   tool_result.attestation_mode != NULL ? tool_result.attestation_mode : "<unknown>",
-					   tool_result.token_charge,
-					   tool_result.cost_charge,
-					   tool_result.detail != NULL ? tool_result.detail : "<none>");
+	payload = qx_format_external_execution_payload("submit", &tool_result);
 	(void) qx_insert_event(eventrel, request->sessionoid, taskoid, stepoid,
 						   request->ownerid, &semantic_meta,
 						   "TASK_TOOL_EXECUTED", payload);
@@ -6670,26 +6686,7 @@ QxRuntimeResumeTask(Oid taskoid, const char *checkpoint_label, Oid ownerid)
 						  tool_result.token_charge,
 						  tool_result.cost_charge,
 						  "external_resume");
-	payload = psprintf("phase=resume;tool=%s;principal=%s;principal_runtime=%s;provider=%s;provider_kind=%s;effective_sandbox=%s;profile=%s;env=%s;cwd=%s;process_limit=%d;timeout_ms=%d;receipt_schema=%s;receipt_alg=%s;receipt_nonce=%s;receipt_sig=%s;attestation=%s;tokens=%d;cost=%d;detail=%s",
-					   tool_result.tool_name != NULL ? tool_result.tool_name : "<unknown>",
-					   tool_result.principal_name != NULL ? tool_result.principal_name : "<unknown>",
-					   tool_result.principal_runtime != NULL ? tool_result.principal_runtime : "<unknown>",
-					   tool_result.provider_name != NULL ? tool_result.provider_name : "<unknown>",
-					   tool_result.provider_kind != NULL ? tool_result.provider_kind : "<unknown>",
-					   tool_result.sandbox_name != NULL ? tool_result.sandbox_name : "<unknown>",
-					   tool_result.profile_name != NULL ? tool_result.profile_name : "<unknown>",
-					   tool_result.environment_mode != NULL ? tool_result.environment_mode : "<unknown>",
-					   tool_result.workdir_name != NULL ? tool_result.workdir_name : "<unknown>",
-					   tool_result.process_limit,
-					   tool_result.timeout_ms,
-					   tool_result.receipt_schema != NULL ? tool_result.receipt_schema : "<unknown>",
-					   tool_result.receipt_alg != NULL ? tool_result.receipt_alg : "<unknown>",
-					   tool_result.receipt_nonce != NULL ? tool_result.receipt_nonce : "<unknown>",
-					   tool_result.receipt_signature != NULL ? "verified" : "missing",
-					   tool_result.attestation_mode != NULL ? tool_result.attestation_mode : "<unknown>",
-					   tool_result.token_charge,
-					   tool_result.cost_charge,
-					   tool_result.detail != NULL ? tool_result.detail : "<none>");
+	payload = qx_format_external_execution_payload("resume", &tool_result);
 	(void) qx_insert_event(eventrel, task.sessionoid, taskoid,
 						   stepoid, ownerid, &semantic_meta,
 						   "TASK_TOOL_EXECUTED", payload);

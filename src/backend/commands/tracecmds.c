@@ -216,6 +216,65 @@ qx_replace_trace_delimited_value(const char *source, const char *key,
 }
 
 static char *
+qx_replace_trace_delimited_value_all(const char *source, const char *key,
+									 const char *replacement)
+{
+	const char *cursor;
+	StringInfoData rewritten;
+	bool		changed = false;
+	size_t		key_len;
+
+	if (source == NULL || key == NULL || replacement == NULL)
+		return NULL;
+
+	key_len = strlen(key);
+	cursor = source;
+	initStringInfo(&rewritten);
+
+	while (*cursor != '\0')
+	{
+		const char *match = strstr(cursor, key);
+		const char *value_start;
+		const char *value_end;
+		size_t		value_len;
+
+		if (match == NULL)
+		{
+			appendStringInfoString(&rewritten, cursor);
+			break;
+		}
+
+		appendBinaryStringInfo(&rewritten, cursor, match - cursor);
+		appendStringInfoString(&rewritten, key);
+		value_start = match + key_len;
+		value_end = value_start;
+		while (*value_end != '\0' && *value_end != ';')
+			value_end++;
+
+		value_len = value_end - value_start;
+		if (value_len == 0 ||
+			(value_len == strlen(replacement) &&
+			 strncmp(value_start, replacement, value_len) == 0))
+		{
+			appendBinaryStringInfo(&rewritten, value_start, value_len);
+		}
+		else
+		{
+			appendStringInfoString(&rewritten, replacement);
+			changed = true;
+		}
+
+		appendStringInfoString(&rewritten, value_end);
+		cursor = value_end;
+	}
+
+	if (!changed)
+		return pstrdup(source);
+
+	return rewritten.data;
+}
+
+static char *
 qx_normalize_trace_detail(const char *detail, Oid taskoid)
 {
 	char	   *task_fragment;
@@ -224,6 +283,8 @@ qx_normalize_trace_detail(const char *detail, Oid taskoid)
 	char	   *rewritten;
 	char	   *microvm_accel;
 	char	   *microvm_kernel;
+	char	   *container_id;
+	char	   *vm_id;
 	char	   *restricted_identity;
 	char	   *final_detail;
 
@@ -241,7 +302,13 @@ qx_normalize_trace_detail(const char *detail, Oid taskoid)
 	microvm_kernel = qx_replace_trace_delimited_value(microvm_accel,
 													  "microvm_kernel=",
 													  "<kernel>");
-	restricted_identity = qx_replace_trace_delimited_value(microvm_kernel,
+	container_id = qx_replace_trace_delimited_value_all(microvm_kernel,
+													  "container_id=",
+													  "<container_id>");
+	vm_id = qx_replace_trace_delimited_value_all(container_id,
+												 "vm_id=",
+												 "<vm_id>");
+	restricted_identity = qx_replace_trace_delimited_value(vm_id,
 														   "restricted_identity=",
 														   "<identity>");
 	final_detail = qx_replace_trace_numeric_value(restricted_identity, "wall_ms=", "<ms>");
@@ -251,6 +318,8 @@ qx_normalize_trace_detail(const char *detail, Oid taskoid)
 	pfree(rewritten);
 	pfree(microvm_accel);
 	pfree(microvm_kernel);
+	pfree(container_id);
+	pfree(vm_id);
 	pfree(restricted_identity);
 
 	return final_detail;

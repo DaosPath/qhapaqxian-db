@@ -27,6 +27,12 @@ tests += {
     'regress_args': [
       '--temp-config', files('logical.conf'),
     ],
+    'env': {
+      'QX_CONTAINER_IMAGE': 'alpine:3.20',
+      'QX_MICROVM_ACCEL': 'tcg',
+      'QX_MICROVM_KERNEL': meson.build_root() / 'microvm-assets' / 'vmlinuz-virt',
+      'QX_MICROVM_INITRD': meson.build_root() / 'microvm-assets' / 'initramfs-qx-microvm.cpio.gz',
+    },
     'runningcheck': false,
   },
 }

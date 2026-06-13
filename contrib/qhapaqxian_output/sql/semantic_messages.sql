@@ -107,8 +107,8 @@ ORDER BY oid DESC
 LIMIT 1
 \gset
 
-RUN TASK summarize_docs IN SESSION :qx_session_oid
-  GOAL 'summarize docs'
+RUN TASK search_docs IN SESSION :qx_session_oid
+  GOAL 'search docs'
   INPUT jsonb_build_object('topic', 'parser')
   PRIORITY high;
 

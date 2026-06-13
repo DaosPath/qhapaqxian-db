@@ -3546,6 +3546,9 @@ foreach test_dir : tests
 
       env = test_env
       env.prepend('PATH', temp_install_bindir, test_dir['bd'])
+      foreach name, value : t.get('env', {})
+        env.set(name, value)
+      endforeach
 
       test_kwargs = {
         'protocol': 'tap',

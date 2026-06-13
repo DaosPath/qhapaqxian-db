@@ -553,7 +553,9 @@ SELECT qxtracename::text AS trace_name,
        qxtracedetail LIKE '%provider_kind=container%' AS expected_provider_kind,
        qxtracedetail LIKE '%receipt_alg=ed25519%' AS expected_receipt_alg,
        qxtracedetail LIKE '%receipt_sig=verified%' AS has_receipt_sig,
-       qxtracedetail LIKE '%attestation=container_receipt_verified%' AS expected_attestation
+       qxtracedetail LIKE '%attestation=container_receipt_verified%' AS expected_attestation,
+       qxtracedetail LIKE '%container_id=%' AS has_container_id,
+       qxtracedetail NOT LIKE '%container_id=;%' AS container_id_populated
 FROM pg_qx_trace
 WHERE qxtracetaskid = :qx_container_task_oid
   AND qxtracename = 'runtime.external_submit';
