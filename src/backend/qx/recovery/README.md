@@ -23,6 +23,7 @@ Current state:
 
 Integration debt:
 - recovery still emits scheduler snapshots through the runtime-owned autonomous
-  daemon rather than owning supervision itself, and broader retry/backoff
-  policy plus semantic replay for repeated no-checkpoint failures remain
-  future work.
+  daemon rather than owning supervision itself;
+- semantic checkpoint replay is now wired through failover rebuild and a focused
+  regression hook, but decoder-fed orchestration and repeated no-checkpoint
+  semantic replay remain future work.

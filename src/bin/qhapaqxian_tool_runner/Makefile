@@ -19,14 +19,12 @@ qhapaqxian-tool-runner: $(OBJS) | submake-libpgport
 
 install: all installdirs
 	$(INSTALL_PROGRAM) qhapaqxian-tool-runner$(X) '$(DESTDIR)$(bindir)/qhapaqxian-tool-runner$(X)'
-	$(INSTALL_DATA) qx_remote_ed25519_private.pem '$(DESTDIR)$(bindir)/qx_remote_ed25519_private.pem'
 
 installdirs:
 	$(MKDIR_P) '$(DESTDIR)$(bindir)'
 
 uninstall:
 	rm -f '$(DESTDIR)$(bindir)/qhapaqxian-tool-runner$(X)'
-	rm -f '$(DESTDIR)$(bindir)/qx_remote_ed25519_private.pem'
 
 clean distclean:
 	rm -f qhapaqxian-tool-runner$(X) $(OBJS)

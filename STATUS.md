@@ -17,9 +17,19 @@ Documentation hierarchy:
 - `docs/stage-*/README.md` = stage-local landed contracts and notes
 
 Snapshot date:
-- `2026-06-13` (Stage 34 historical/SLO follow-up)
+- `2026-06-18` (Stage 35 shared supervisor close-out)
 
 Last validated test sweep:
+- Windows sweep on 2026-06-18: clean compile and setup, focused
+  `qx_stage35_supervisor` cross-session regression, `qhapaqxian_output`, and
+  full `regress/regress` passed **232/232** with Docker Desktop real plus
+  QEMU/TCG microVM assets. The regression-only Ed25519 private key is now
+  excluded from production Meson and Make installs.
+- WSL Ubuntu 24.04 revalidation on 2026-06-18 confirmed `/dev/kvm`, then
+  exposed CRLF-sensitive generator failures in the Windows checkout. The
+  repository now enforces LF through `.gitattributes`; the current host WSL
+  service hung before a clean-clone rerun, so the last green KVM sweep below
+  remains the canonical Linux result.
 - Windows: `meson compile -C build-stage4-codex -j 2`
 - Windows: `meson test -C build-stage4-codex --suite postgresql:setup --print-errorlogs`
 - Windows: `meson test -C build-stage4-codex --suite postgresql:qhapaqxian_output --print-errorlogs`
@@ -101,13 +111,13 @@ Status legend:
 | 18 restricted-identity launch | yes | yes | yes | yes | restricted-identity evidence is strongest on Windows; cross-platform parity is weaker |
 | 19 provider receipts | yes | yes | yes | yes | provider receipts exist, but provider trust is still local/brokered rather than independently attested |
 | 20 brokered remote/HMAC | yes | yes | yes | yes | shared-key receipt model remains weaker than asymmetric or hardware-rooted attestation |
-| 21 asymmetric receipts | yes | yes | yes | yes | signer material is still repo/bindir local; no certificate chain or hardware root |
+| 21 asymmetric receipts | yes | yes | yes | yes | deterministic signer material remains a regression-only fixture; production certificate-chain or hardware-root provisioning remains external |
 | 22 container/microVM runtime classes | yes | yes | yes | yes | runtime classes now have real Docker and QEMU launch paths; deeper OCI policy and VM lifecycle ownership remain future work |
 | 23 attestation contracts | yes | yes | yes | partial | attestation bundles are consumed by real backend paths and regression now covers partial/missing/mismatched/inherited contract permutations; stronger provenance roots remain future work |
 | 24 container backend scaffold | yes | yes | yes | yes | OCI policy compilation from capability tags (`readonly_rootfs`, `seccomp_mode`, `oci_profile`), image allowlist enforcement, runner `docker run` honors compiled policy, and `qx_stage24_container_policy` regress; full rootless OCI and cgroup namespace ownership remain intentional deferrals |
 | 25 microVM backend scaffold | yes | yes | yes | yes | MicroVM asset policy resolves kernel/initrd/snapshot refs with allowlist validation, launch payloads emit `kernel_ref`/`initrd_ref`, `qx_stage25_microvm_policy` regress, and self-hosted KVM CI; hypervisor process ownership and snapshot lifecycle remain intentional deferrals |
 | 26 scheduler scaffold | yes | yes | yes | yes | durable queue/lease/heartbeat catalogs, autonomous launcher/database bgworkers, configurable bounded per-database slot ownership with default 2, lease renewal/reclaim/retry/dead-letter supervision, ledger-backed queue/worker/activity/backoff/balance views, dedicated collector-backed scheduler stats via `pg_qx_stat_get_scheduler_activity_stats()` and `pg_stat_qx_scheduler_collected`, and `qx_stage26_scheduler` regress; load-adaptive slot scaling remains an intentional deferral |
-| 27 recovery scanner scaffold | yes | yes | yes | yes | startup recovery, failover rebuild, and autonomous scheduler supervision drive real scheduler requeue/reclaim writes with ledger-local dedupe, read-only `pg_qx_recovery_scan()` exposes suppressed requeue/fence counts, collector-backed recovery stats via `pg_qx_stat_get_recovery_stats()` and `pg_stat_qx_recovery`, and `qx_stage27_recovery` regress; deeper semantic replay and replication-fed supervision remain intentional deferrals |
+| 27 recovery scanner scaffold | yes | yes | yes | yes | startup recovery, failover rebuild, and autonomous scheduler supervision drive real scheduler requeue/reclaim writes with ledger-local dedupe; failover rebuild and `pg_qx_test_run_semantic_replay()` now re-emit durable checkpoint logical messages with trace-backed replay dedupe; read-only `pg_qx_recovery_scan()` / `pg_qx_recovery_failover_scan()` expose suppressed requeue/fence/replay counts; collector-backed recovery stats via `pg_qx_stat_get_recovery_stats()` and `pg_stat_qx_recovery`; `qx_stage27_recovery` regress; decoder-fed replay orchestration and replication supervision remain intentional deferrals |
 | 28 observability scaffold | yes | yes | partial | partial | `qx_observe` backs `SHOW TRACE` summaries; Stages 26–27 add collector-backed scheduler/recovery stats; Stages 33–34 add shared-memory `qx_stat`, provider/principal/runtime-class SRFs, durable `pg_qx_stat_history`, SLO/dashboard SQL views, and `qx_stage3_observability`; long-horizon retention and external operator UI remain open |
 | 29 capability-aware planner/executor | yes | yes | yes | yes | planner/executor now materialize explicit submit/resume capability routes, persist them in `pg_qx_task`, and runtime/retry/recovery consume those routes instead of first/last contract heuristics |
 | 30 security/tool capability contract | yes | yes | yes | yes | namespace policy `USING` contracts now enforce required/denied capability tags during tool authorization and `CREATE AGENT`; OS-level OCI/VM policy compilation and stronger provenance remain future hardening |
@@ -115,9 +125,9 @@ Status legend:
 | 32 catalog snapshot helper layer | yes | yes | yes | partial | recovery, planner, security, commands, runtime scheduler reads/writes, DDL tuple inserts for identity/agent/session/memory/policy objects, provider/principal/runtime-class stats SRFs, and `qx_stage32_catalog` regression now use `qx_catalog` helpers; ALTER-command catalog updates remain in command layers |
 | 33 stats collector and runtime hardening | yes | yes | partial | partial | `qx_stat` shared-memory collector, `qhapaqxian.track_stats`, catalog scheduler helpers, runtime policy/supervisor, typed launch requests, KVM CI workflow, `qx_stage3_observability`, and Stage 26–27 scheduler/recovery collector SRFs landed; historical stats and full OCI/VM policy compilation remain open |
 | 34 observability collector v2 | yes | yes | yes | partial | `pg_qx_stat_get_principal_stats`, `pg_qx_stat_get_runtime_class_stats`, collector-backed `pg_stat_qx_principals`/`pg_stat_qx_runtime_classes`, Stage 26–27 scheduler/recovery collector views, durable `pg_qx_stat_history` with `pg_qx_stat_snapshot()`/`pg_qx_stat_get_history()`, `pg_stat_qx_slo_providers`, `pg_stat_qx_operator_dashboard`, extended `qx_stage3_observability`, and `docs/stage-34/README.md` landed; long-horizon retention scheduling and external dashboard export remain open |
-| 35 CI loopback path, backend IDs, catalog runtime writes | yes | yes | yes | partial | `qhapaqxian_output` loopback resume path, real `container_id`/`vm_id` trace evidence (runner top-level IDs + trace assertions), meson microVM/container env wiring, `qx_catalog` runtime update/insert helpers (Stage 32 follow-up), duplicate receipt-tail stripping in runtime/`SHOW TRACE`, and post-Stage-32 validation sweep landed; full OCI cgroup/seccomp and cross-process VM lifecycle ownership remain future work |
+| 35 CI loopback path, backend IDs, catalog runtime writes | yes | yes | yes | partial | `qhapaqxian_output` loopback resume path, real `container_id`/`vm_id` trace evidence, meson microVM/container env wiring, `qx_catalog` runtime update/insert helpers, duplicate receipt-tail stripping, cgroup-aware OCI profile compilation with runner `--cgroupns` wiring, shared-memory `pg_stat_qx_backend_supervisor` plus `pg_qx_backend_supervisor_list()`, and cross-session `qx_stage35_supervisor` regress; full cgroup namespace ownership and external process termination remain future work |
 
 Canonical next-gap summary:
-- strongest remaining platform gap: deepen OCI cgroup/seccomp policy compilation and cross-process VM lifecycle ownership beyond the new supervisor registry;
+- strongest remaining platform gap: deepen OCI cgroup/seccomp policy compilation and external VM lifecycle ownership beyond the shared supervisor registry;
 - strongest observability gap: add long-horizon retention scheduling and external operator UI/export on top of the Stage 34 durable snapshot and SQL dashboard surfaces;
 - strongest documentation gap: older stage docs still vary in depth and shape; use `docs/stage-template.md` and `docs/README.md` as the cleanup baseline.

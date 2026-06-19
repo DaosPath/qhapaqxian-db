@@ -54,19 +54,23 @@ Crash/failover assumptions:
 - startup/failover recovery can also encounter no-checkpoint work that was
   already repaired into queued retry state or failed closed into dead-letter
   by the scheduler;
-- recovery still does not replay semantic logs by itself.
+- failover rebuild and the `pg_qx_test_run_semantic_replay()` regression hook can now
+  re-emit durable checkpoint logical messages from catalog evidence;
+- semantic replay dedupe is trace-backed via durable `recovery.semantic_replay`
+  rows keyed by `checkpoint_oid`.
 
 Integration points to come:
 - extend startup/failover recovery from the current checkpoint/retry/dead-letter
-  transitions into externally failed work and richer semantic replay;
+  transitions into externally failed work and decoder-fed replay orchestration;
 - semantic replication should eventually feed a richer replay path into the
   failover rebuild hook set;
 - observability should later expose the recovery report so operators can see
   how many tasks were scanned, fenced, or requeued.
 
-- `pg_qx_recovery_scan()` now exposes a read-only startup recovery report with
-  dedupe visibility (`tasks_requeue_suppressed`,
-  `attempts_fence_suppressed`) without writing scheduler ledger rows;
+- `pg_qx_recovery_scan()` and `pg_qx_recovery_failover_scan()` now expose read-only
+  recovery reports with dedupe visibility (`tasks_requeue_suppressed`,
+  `attempts_fence_suppressed`, `checkpoints_replay_suppressed`) without writing
+  scheduler ledger rows;
 - `pg_qx_stat_get_recovery_stats()` and `pg_stat_qx_recovery` now surface
   startup/failover recovery counters from the shared-memory collector;
 - startup/failover recovery hooks report into `qx_stat` when durable ledger
@@ -76,11 +80,11 @@ Integration points to come:
 
 Known gaps:
 - hooks are intentionally narrow and do not yet integrate with replication
-  entrypoints;
-- the scanner is catalog-driven only and still assumes the catalogs are the
-  authoritative reconstruction source;
-- recovery dedupe is ledger-local today and should grow richer semantic
-  idempotence once replay enters the path.
+  decoding entrypoints for ordered downstream replay;
+- semantic replay still rebuilds checkpoint logical messages from catalog rows
+  rather than consuming a dedicated WAL family or subscriber cursor;
+- recovery dedupe is ledger-local for scheduler evidence and trace-local for
+  semantic replay; richer cross-subsystem idempotence remains future work.
 
 Validation plan:
 - keep `qx_stage3_agentic` as the real-backend recovery regression for

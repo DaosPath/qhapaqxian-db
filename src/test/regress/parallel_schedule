@@ -149,3 +149,4 @@ test: qx_stage24_container_policy
 test: qx_stage25_microvm_policy
 test: qx_stage26_scheduler
 test: qx_stage27_recovery
+test: qx_stage35_supervisor

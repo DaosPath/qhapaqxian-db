@@ -3205,6 +3205,7 @@ backend_code = declare_dependency(
 # install these files only during test, not main install
 test_install_data = []
 test_install_libs = []
+test_install_bins = []
 
 # src/backend/meson.build defines backend_mod_code used for extension
 # libraries.
@@ -3344,6 +3345,7 @@ install_test_files_args = [
   '--prefix', dir_prefix,
   '--install', contrib_data_dir, test_install_data,
   '--install', dir_lib_pkg, test_install_libs,
+  '--install', dir_bin, test_install_bins,
 ]
 run_target('install-test-files',
   command: [python] + install_test_files_args,

@@ -384,6 +384,8 @@ extern bool QxCatalogLookupAttemptByOid(Oid attemptoid,
 										QxCatalogAttemptInfo *info);
 extern bool QxCatalogLookupCheckpointByOid(Oid checkpointoid,
 										   QxCatalogCheckpointInfo *info);
+extern bool QxCatalogCheckpointHasSemanticReplay(Oid databaseoid, Oid taskoid,
+											   Oid checkpointoid);
 extern List *QxCatalogBuildTaskInfoList(Oid databaseoid, Oid ownerid);
 extern List *QxCatalogBuildAttemptInfoList(Oid databaseoid, Oid ownerid);
 extern List *QxCatalogBuildCheckpointInfoList(Oid databaseoid, Oid ownerid);

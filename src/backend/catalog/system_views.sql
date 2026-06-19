@@ -2352,6 +2352,18 @@ CREATE VIEW pg_stat_qx_scheduler_collected WITH (security_barrier) AS
          ) ledger;
 
 
+CREATE VIEW pg_stat_qx_backend_supervisor WITH (security_barrier) AS
+    SELECT
+        stats.register_count,
+        stats.release_count,
+        stats.fence_count,
+        stats.active_lease_count
+    FROM pg_qx_stat_get_backend_supervisor_stats() AS stats(register_count bigint,
+                                                             release_count bigint,
+                                                             fence_count bigint,
+                                                             active_lease_count int);
+
+
 CREATE VIEW pg_stat_qx_recovery WITH (security_barrier) AS
     SELECT
         stats.startup_scan_count,
@@ -2568,6 +2580,7 @@ GRANT SELECT ON pg_stat_qx_scheduler_queues TO PUBLIC;
 GRANT SELECT ON pg_stat_qx_scheduler_workers TO PUBLIC;
 GRANT SELECT ON pg_stat_qx_scheduler_activity TO PUBLIC;
 GRANT SELECT ON pg_stat_qx_scheduler_collected TO PUBLIC;
+GRANT SELECT ON pg_stat_qx_backend_supervisor TO PUBLIC;
 GRANT SELECT ON pg_stat_qx_recovery TO PUBLIC;
 GRANT SELECT ON pg_stat_qx_scheduler_retry_backoff TO PUBLIC;
 GRANT SELECT ON pg_stat_qx_scheduler_worker_balance TO PUBLIC;
@@ -2596,8 +2609,13 @@ REVOKE ALL ON pg_qx_stat_history FROM PUBLIC;
 REVOKE ALL ON pg_qx_memory FROM PUBLIC;
 REVOKE ALL ON FUNCTION pg_qx_test_start_recovery_attempt(oid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION pg_qx_recovery_scan() FROM PUBLIC;
+REVOKE ALL ON FUNCTION pg_qx_recovery_failover_scan() FROM PUBLIC;
 REVOKE ALL ON FUNCTION pg_qx_test_run_startup_recovery() FROM PUBLIC;
 REVOKE ALL ON FUNCTION pg_qx_test_run_failover_rebuild() FROM PUBLIC;
+REVOKE ALL ON FUNCTION pg_qx_test_run_semantic_replay() FROM PUBLIC;
+REVOKE ALL ON FUNCTION pg_qx_test_register_backend_lease(oid, text, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION pg_qx_test_release_backend_lease(oid, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION pg_qx_test_fence_backend_leases(oid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION pg_qx_test_run_scheduler_worker_tick() FROM PUBLIC;
 REVOKE ALL ON FUNCTION pg_qx_policy_compile_container(text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION pg_qx_policy_validate_image(text) FROM PUBLIC;

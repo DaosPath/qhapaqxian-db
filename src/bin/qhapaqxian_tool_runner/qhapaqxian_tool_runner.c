@@ -71,6 +71,7 @@ typedef struct Request
 	int		allow_privilege_escalation;
 	int		readonly_rootfs;
 	char	seccomp_mode[64];
+	char	cgroup_mode[64];
 	char	launch_request_file[260];
 	char	container_id[128];
 	char	vm_id[128];
@@ -208,6 +209,10 @@ parse_launch_request_file(const char *path, Request *request)
 				else if (strcmp(key, "seccomp_mode") == 0 &&
 						 request->seccomp_mode[0] == '\0')
 					snprintf(request->seccomp_mode, sizeof(request->seccomp_mode),
+							 "%s", value);
+				else if (strcmp(key, "cgroup_mode") == 0 &&
+						 request->cgroup_mode[0] == '\0')
+					snprintf(request->cgroup_mode, sizeof(request->cgroup_mode),
 							 "%s", value);
 				else if (strcmp(key, "image_ref") == 0 &&
 						 request->container_image[0] == '\0')
@@ -497,6 +502,7 @@ run_real_container_backend(const Request *request, char *detail, size_t detail_l
 	{
 		const char *seccomp_opt;
 		const char *readonly_flag;
+		const char *cgroup_opt;
 
 		if (request->seccomp_mode[0] != '\0')
 		{
@@ -510,14 +516,20 @@ run_real_container_backend(const Request *request, char *detail, size_t detail_l
 				"seccomp=unconfined" : "no-new-privileges";
 
 		readonly_flag = request->readonly_rootfs ? "--read-only " : "";
+		if (request->cgroup_mode[0] != '\0' &&
+			strcmp(request->cgroup_mode, "host") == 0)
+			cgroup_opt = "--cgroupns host ";
+		else
+			cgroup_opt = "--cgroupns private ";
 
 		snprintf(command, sizeof(command),
-				 "\"%s\" run --rm --name %s --network %s %s--cap-drop ALL --security-opt %s --pids-limit %s --memory %s %s true",
+				 "\"%s\" run --rm --name %s --network %s %s--cap-drop ALL --security-opt %s %s--pids-limit %s --memory %s %s true",
 				 docker_cli,
 				 request->container_id,
 				 request->allow_network ? "bridge" : "none",
 				 readonly_flag,
 				 seccomp_opt,
+				 cgroup_opt,
 				 pids_limit,
 				 memory_limit,
 				 image);

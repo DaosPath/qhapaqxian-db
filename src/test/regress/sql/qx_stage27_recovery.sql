@@ -75,8 +75,38 @@ FROM pg_qx_recovery_scan() AS s(startup_scan boolean,
                                  checkpoints_replayed int,
                                  orphan_attempts int,
                                  semantic_replay_candidates int,
+                                 checkpoints_replay_suppressed int,
                                  tasks_requeue_suppressed int,
                                  attempts_fence_suppressed int);
+
+SELECT failover_rebuild
+   AND checkpoints_replayed >= 1 AS pre_write_failover_replay_actionable
+FROM pg_qx_recovery_failover_scan() AS s(startup_scan boolean,
+                                           failover_rebuild boolean,
+                                           tasks_scanned int,
+                                           attempts_scanned int,
+                                           checkpoints_scanned int,
+                                           tasks_requeued int,
+                                           attempts_fenced int,
+                                           checkpoints_replayed int,
+                                           orphan_attempts int,
+                                           semantic_replay_candidates int,
+                                           checkpoints_replay_suppressed int,
+                                           tasks_requeue_suppressed int,
+                                           attempts_fence_suppressed int);
+
+SELECT pg_qx_test_run_semantic_replay() AS qx_first_semantic_replay \gset
+
+SELECT :'qx_first_semantic_replay' LIKE '%test=semantic_replay%'
+   AND :'qx_first_semantic_replay' ~ 'recovery_checkpoints_replayed=[1-9]' AS semantic_replay_ran;
+
+SELECT count(*) >= 1 AS semantic_replay_traces
+FROM pg_qx_trace
+WHERE qxtracename = 'recovery.semantic_replay';
+
+SELECT pg_qx_test_run_semantic_replay() AS qx_second_semantic_replay \gset
+
+SELECT :'qx_second_semantic_replay' ~ 'recovery_checkpoints_replay_suppressed=[1-9]' AS semantic_replay_idempotent;
 
 SELECT pg_qx_test_run_startup_recovery() LIKE '%recovery_tasks_requeued=%' AS startup_recovery_ran;
 

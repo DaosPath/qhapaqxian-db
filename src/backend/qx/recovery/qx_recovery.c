@@ -191,6 +191,7 @@ qx_recovery_checkpoint_summary_from_catalog(const QxCatalogCheckpointInfo *info)
 	summary->task_state = info->task_state;
 	summary->nextstepseqno = info->next_step_seqno;
 	summary->has_semantic_lsn = (info->lsn != InvalidXLogRecPtr);
+	summary->semantic_replayed = false;
 	summary->semantic_lsn = info->lsn;
 	summary->label = qx_recovery_copy_string(info->label);
 	summary->data = qx_recovery_copy_string(info->data);
@@ -346,9 +347,14 @@ QxRecoveryBuildCheckpointSummaries(const QxRecoveryStartupRequest *request)
 	foreach(lc, checkpoints)
 	{
 		QxCatalogCheckpointInfo *checkpoint = lfirst(lc);
+		QxRecoveryCheckpointSummary *summary;
 
-		summaries = lappend(summaries,
-							qx_recovery_checkpoint_summary_from_catalog(checkpoint));
+		summary = qx_recovery_checkpoint_summary_from_catalog(checkpoint);
+		summary->semantic_replayed =
+			QxCatalogCheckpointHasSemanticReplay(databaseoid,
+												 summary->taskoid,
+												 summary->checkpointoid);
+		summaries = lappend(summaries, summary);
 	}
 
 	QxCatalogFreeCheckpointInfoList(checkpoints);
@@ -462,10 +468,15 @@ QxRecoveryPopulateReport(QxRecoveryReport *report,
 		QxRecoveryCheckpointSummary *checkpoint = lfirst(lc);
 
 		report->checkpoints_scanned++;
-		if (QxRecoveryCheckpointNeedsReplay(checkpoint))
-			report->checkpoints_replayed++;
 		if (checkpoint->state == QX_CHECKPOINT_STATE_DURABLE)
 			report->semantic_replay_candidates++;
+		if (QxRecoveryCheckpointNeedsReplay(checkpoint))
+		{
+			if (checkpoint->semantic_replayed)
+				report->checkpoints_replay_suppressed++;
+			else
+				report->checkpoints_replayed++;
+		}
 	}
 }
 
@@ -522,6 +533,11 @@ QxRecoveryRunStartupScan(const QxRecoveryStartupRequest *request,
 
 		if (hooks != NULL && hooks->checkpoint != NULL)
 			hooks->checkpoint(checkpoint, hooks->userdata);
+		if (request->rebuild_from_semantic_log &&
+			QxRecoveryCheckpointNeedsReplay(checkpoint) &&
+			!checkpoint->semantic_replayed &&
+			hooks != NULL && hooks->replay_checkpoint != NULL)
+			hooks->replay_checkpoint(checkpoint, hooks->userdata);
 	}
 
 	if (hooks != NULL && hooks->finish != NULL)
@@ -596,6 +612,11 @@ QxRecoveryRunFailoverRebuild(const QxRecoveryFailoverRequest *request,
 
 		if (hooks != NULL && hooks->checkpoint != NULL)
 			hooks->checkpoint(checkpoint, hooks->userdata);
+		if (request->replay_semantic_log &&
+			QxRecoveryCheckpointNeedsReplay(checkpoint) &&
+			!checkpoint->semantic_replayed &&
+			hooks != NULL && hooks->replay_checkpoint != NULL)
+			hooks->replay_checkpoint(checkpoint, hooks->userdata);
 	}
 
 	if (hooks != NULL && hooks->finish != NULL)

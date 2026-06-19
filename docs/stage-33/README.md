@@ -23,7 +23,7 @@ Stage 33 lands five coordinated slices:
 - `qx_runtime_policy` maps capability tags to `allow_network`,
   `allow_privilege_escalation`, and `image_ref`, with
   `QX_CONTAINER_IMAGE_ALLOWLIST` enforcement.
-- `qx_backend_supervisor` tracks container/microVM leases in-memory.
+- `qx_backend_supervisor` tracks container/microVM leases in shared memory.
 - Typed launch requests are written to `LAUNCH_REQUEST_FILE` for the tool
   runner, which returns `CONTAINER_ID` / `VM_ID` and uses supervised waits on
   Unix.

@@ -17,6 +17,7 @@
 
 #include "catalog/catalog.h"
 #include "catalog/indexing.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_qx_principal.h"
 #include "catalog/pg_qx_provider.h"
 #include "catalog/pg_qx_stat_history.h"
@@ -26,6 +27,7 @@
 #include "qx/qx_observe.h"
 #include "qx/qx_recovery.h"
 #include "qx/qx_stat.h"
+
 #include "storage/ipc.h"
 #include "storage/shmem.h"
 #include "storage/spin.h"
@@ -48,6 +50,7 @@ typedef struct QxStatSharedState
 {
 	slock_t		mutex;
 	QxStatSlot	slots[QX_STAT_SLOT_COUNT];
+	QxStatBackendLeaseSnapshot backend_leases[QX_STAT_BACKEND_LEASE_SLOT_COUNT];
 } QxStatSharedState;
 
 bool		qhapaqxian_track_stats = true;
@@ -398,6 +401,186 @@ QxStatReportRecoveryScan(Oid dboid, const QxRecoveryReport *report,
 }
 
 static void
+qx_stat_mutate_backend_supervisor(QxStatCounters *counters, void *ctx)
+{
+	const char *event_name = (const char *) ctx;
+
+	if (strcmp(event_name, "register") == 0)
+		counters->backend_supervisor_register_count++;
+	else if (strcmp(event_name, "release") == 0)
+		counters->backend_supervisor_release_count++;
+	else if (strcmp(event_name, "fence") == 0)
+		counters->backend_supervisor_fence_count++;
+}
+
+void
+QxStatReportBackendSupervisorEvent(Oid dboid, const char *event_name)
+{
+	if (!qhapaqxian_track_stats)
+		return;
+	if (event_name == NULL || event_name[0] == '\0')
+		return;
+
+	qx_stat_with_entry(dboid, QX_STAT_BACKEND_SUPERVISOR, InvalidOid, NULL, true,
+					   qx_stat_mutate_backend_supervisor,
+					   (void *) event_name);
+}
+
+bool
+QxStatBackendLeaseRegister(Oid dboid, Oid taskoid, const char *instance_id,
+						   int kind)
+{
+	QxStatBackendLeaseSnapshot *free_slot = NULL;
+	int			i;
+	bool		inserted = false;
+
+	if (!OidIsValid(dboid) || !OidIsValid(taskoid) || instance_id == NULL ||
+		instance_id[0] == '\0')
+		return false;
+	if (strlen(instance_id) >= QX_STAT_BACKEND_INSTANCE_ID_LEN)
+		ereport(ERROR,
+				(errcode(ERRCODE_NAME_TOO_LONG),
+				 errmsg("backend instance identifier is too long"),
+				 errdetail("Backend instance identifiers must be shorter than %d bytes.",
+						   QX_STAT_BACKEND_INSTANCE_ID_LEN)));
+
+	qx_stat_ensure_attached();
+	SpinLockAcquire(&QxStat->mutex);
+	for (i = 0; i < QX_STAT_BACKEND_LEASE_SLOT_COUNT; i++)
+	{
+		QxStatBackendLeaseSnapshot *slot = &QxStat->backend_leases[i];
+
+		if (!OidIsValid(slot->dboid))
+		{
+			if (free_slot == NULL)
+				free_slot = slot;
+			continue;
+		}
+		if (slot->dboid == dboid && slot->taskoid == taskoid &&
+			strcmp(slot->instance_id, instance_id) == 0)
+		{
+			slot->kind = kind;
+			SpinLockRelease(&QxStat->mutex);
+			return false;
+		}
+	}
+
+	if (free_slot != NULL)
+	{
+		MemSet(free_slot, 0, sizeof(*free_slot));
+		free_slot->dboid = dboid;
+		free_slot->taskoid = taskoid;
+		free_slot->kind = kind;
+		strlcpy(free_slot->instance_id, instance_id,
+				sizeof(free_slot->instance_id));
+		inserted = true;
+	}
+	SpinLockRelease(&QxStat->mutex);
+
+	if (!inserted)
+		ereport(WARNING,
+				(errmsg("QX backend supervisor lease table is full")));
+	return inserted;
+}
+
+bool
+QxStatBackendLeaseRelease(Oid dboid, Oid taskoid, const char *instance_id)
+{
+	int			i;
+
+	if (!OidIsValid(dboid) || !OidIsValid(taskoid))
+		return false;
+
+	qx_stat_ensure_attached();
+	SpinLockAcquire(&QxStat->mutex);
+	for (i = 0; i < QX_STAT_BACKEND_LEASE_SLOT_COUNT; i++)
+	{
+		QxStatBackendLeaseSnapshot *slot = &QxStat->backend_leases[i];
+
+		if (slot->dboid != dboid || slot->taskoid != taskoid)
+			continue;
+		if (instance_id != NULL && instance_id[0] != '\0' &&
+			strcmp(slot->instance_id, instance_id) != 0)
+			continue;
+		MemSet(slot, 0, sizeof(*slot));
+		SpinLockRelease(&QxStat->mutex);
+		return true;
+	}
+	SpinLockRelease(&QxStat->mutex);
+	return false;
+}
+
+int
+QxStatBackendLeaseFence(Oid dboid, Oid taskoid)
+{
+	int			i;
+	int			removed = 0;
+
+	if (!OidIsValid(dboid) || !OidIsValid(taskoid))
+		return 0;
+
+	qx_stat_ensure_attached();
+	SpinLockAcquire(&QxStat->mutex);
+	for (i = 0; i < QX_STAT_BACKEND_LEASE_SLOT_COUNT; i++)
+	{
+		QxStatBackendLeaseSnapshot *slot = &QxStat->backend_leases[i];
+
+		if (slot->dboid == dboid && slot->taskoid == taskoid)
+		{
+			MemSet(slot, 0, sizeof(*slot));
+			removed++;
+		}
+	}
+	SpinLockRelease(&QxStat->mutex);
+	return removed;
+}
+
+int
+QxStatBackendLeaseCount(Oid dboid, Oid taskoid)
+{
+	int			i;
+	int			count = 0;
+
+	qx_stat_ensure_attached();
+	SpinLockAcquire(&QxStat->mutex);
+	for (i = 0; i < QX_STAT_BACKEND_LEASE_SLOT_COUNT; i++)
+	{
+		QxStatBackendLeaseSnapshot *slot = &QxStat->backend_leases[i];
+
+		if (slot->dboid == dboid &&
+			(!OidIsValid(taskoid) || slot->taskoid == taskoid))
+			count++;
+	}
+	SpinLockRelease(&QxStat->mutex);
+	return count;
+}
+
+int
+QxStatBackendLeaseGetSnapshots(Oid dboid,
+							   QxStatBackendLeaseSnapshot *snapshots,
+							   int max_snapshots)
+{
+	int			i;
+	int			count = 0;
+
+	if (snapshots == NULL || max_snapshots <= 0)
+		return 0;
+
+	qx_stat_ensure_attached();
+	SpinLockAcquire(&QxStat->mutex);
+	for (i = 0; i < QX_STAT_BACKEND_LEASE_SLOT_COUNT && count < max_snapshots; i++)
+	{
+		QxStatBackendLeaseSnapshot *slot = &QxStat->backend_leases[i];
+
+		if (slot->dboid != dboid)
+			continue;
+		snapshots[count++] = *slot;
+	}
+	SpinLockRelease(&QxStat->mutex);
+	return count;
+}
+
+static void
 qx_stat_aggregate_scheduler_locked(Oid dboid, QxStatCounters *totals)
 {
 	int			i;
@@ -438,6 +621,7 @@ qx_stat_reset_kind_locked(QxStatKind kind)
 			continue;
 		MemSet(&slot->counters, 0, sizeof(slot->counters));
 	}
+
 }
 
 void
@@ -605,6 +789,9 @@ pg_qx_stat_reset(PG_FUNCTION_ARGS)
 		QxStatReset(QX_STAT_SCHEDULER_ACTIVITY);
 	else if (pg_strcasecmp(scope, "recovery") == 0)
 		QxStatReset(QX_STAT_RECOVERY);
+	else if (pg_strcasecmp(scope, "backend_supervisor") == 0 ||
+			 pg_strcasecmp(scope, "supervisor") == 0)
+		QxStatReset(QX_STAT_BACKEND_SUPERVISOR);
 	else
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -901,6 +1088,39 @@ pg_qx_stat_get_recovery_stats(PG_FUNCTION_ARGS)
 							  counters->recovery_tasks_requeue_suppressed : 0);
 	values[5] = Int64GetDatum(counters != NULL ?
 							  counters->recovery_attempts_fence_suppressed : 0);
+
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+}
+
+Datum
+pg_qx_stat_get_backend_supervisor_stats(PG_FUNCTION_ARGS)
+{
+	TupleDesc	tupdesc;
+	Datum		values[4];
+	bool		nulls[4];
+	QxStatCounters *counters;
+	HeapTuple	tuple;
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("function returning record called in context "
+						"that cannot accept type record")));
+
+	counters = qx_stat_lookup_entry(MyDatabaseId, QX_STAT_BACKEND_SUPERVISOR,
+									InvalidOid, NULL, false);
+
+	MemSet(values, 0, sizeof(values));
+	MemSet(nulls, false, sizeof(nulls));
+
+	values[0] = Int64GetDatum(counters != NULL ?
+							  counters->backend_supervisor_register_count : 0);
+	values[1] = Int64GetDatum(counters != NULL ?
+							  counters->backend_supervisor_release_count : 0);
+	values[2] = Int64GetDatum(counters != NULL ?
+							  counters->backend_supervisor_fence_count : 0);
+	values[3] = Int32GetDatum(QxStatBackendLeaseCount(MyDatabaseId, InvalidOid));
 
 	tuple = heap_form_tuple(tupdesc, values, nulls);
 	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));

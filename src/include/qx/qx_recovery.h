@@ -90,6 +90,7 @@ typedef struct QxRecoveryCheckpointSummary
 	char		task_state;
 	int16		nextstepseqno;
 	bool		has_semantic_lsn;
+	bool		semantic_replayed;
 	XLogRecPtr	semantic_lsn;
 	char	   *label;
 	char	   *data;
@@ -108,6 +109,7 @@ typedef struct QxRecoveryReport
 	int32		checkpoints_replayed;
 	int32		orphan_attempts;
 	int32		semantic_replay_candidates;
+	int32		checkpoints_replay_suppressed;
 	int32		tasks_requeue_suppressed;
 	int32		attempts_fence_suppressed;
 } QxRecoveryReport;
@@ -120,6 +122,8 @@ typedef struct QxRecoveryHooks
 	void		(*checkpoint)(const QxRecoveryCheckpointSummary *summary, void *userdata);
 	void		(*fence_attempt)(const QxRecoveryAttemptSummary *summary, void *userdata);
 	void		(*requeue_task)(const QxRecoveryTaskSummary *summary, void *userdata);
+	void		(*replay_checkpoint)(const QxRecoveryCheckpointSummary *summary,
+									 void *userdata);
 	void		(*finish)(const QxRecoveryReport *report, void *userdata);
 	void	   *userdata;
 } QxRecoveryHooks;

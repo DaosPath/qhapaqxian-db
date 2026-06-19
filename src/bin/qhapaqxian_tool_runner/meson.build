@@ -36,5 +36,5 @@ if host_machine.system() == 'windows' and ssl.found()
   endif
 endif
 
-install_data('qx_remote_ed25519_private.pem', install_dir: dir_bin)
+test_install_bins += files('qx_remote_ed25519_private.pem')
 bin_targets += qhapaqxian_tool_runner

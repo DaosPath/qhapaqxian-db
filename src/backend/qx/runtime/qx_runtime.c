@@ -161,8 +161,11 @@ typedef struct QxRuntimeRecoveryHooksContext
 	Relation	queueledgerrel;
 	Relation	leaseledgerrel;
 	Relation	heartbeatledgerrel;
+	Relation	tracerel;
 	List	   *queue_entries;
 } QxRuntimeRecoveryHooksContext;
+
+#define QX_RECOVERY_SEMANTIC_REPLAY_TRACE "recovery.semantic_replay"
 
 typedef struct QxRuntimeSchedulerCycleStats
 {
@@ -475,8 +478,13 @@ static void qx_runtime_recovery_requeue_task(
 static void qx_runtime_recovery_fence_attempt(
 	const QxRecoveryAttemptSummary *summary,
 	void *userdata);
+static void qx_runtime_recovery_replay_checkpoint(
+	const QxRecoveryCheckpointSummary *summary,
+	void *userdata);
 static void qx_runtime_recovery_finish(const QxRecoveryReport *report,
 									   void *userdata);
+static Datum qx_runtime_recovery_scan_tuple(FunctionCallInfo fcinfo,
+											QxRecoveryReport *report);
 static void qx_runtime_ensure_startup_recovery_scan(Oid ownerid);
 static char *qx_runtime_failover_recovery_payload(
 	char *base_payload,
@@ -888,6 +896,7 @@ qx_runtime_recovery_begin(const QxRecoveryReport *report, void *userdata)
 										 RowExclusiveLock);
 	context->heartbeatledgerrel = table_open(QxSchedulerHeartbeatRelationId,
 											 RowExclusiveLock);
+	context->tracerel = table_open(QxTraceRelationId, RowExclusiveLock);
 }
 
 static void
@@ -1040,6 +1049,52 @@ qx_runtime_recovery_fence_attempt(const QxRecoveryAttemptSummary *summary,
 }
 
 static void
+qx_runtime_recovery_replay_checkpoint(const QxRecoveryCheckpointSummary *summary,
+									  void *userdata)
+{
+	QxRuntimeRecoveryHooksContext *context = userdata;
+	QxCatalogCheckpointInfo checkpoint;
+	XLogRecPtr	replay_lsn;
+	char	   *detail;
+
+	if (context == NULL || summary == NULL || context->tracerel == NULL ||
+		!OidIsValid(summary->checkpointoid))
+		return;
+
+	if (!QxCatalogLookupCheckpointByOid(summary->checkpointoid, &checkpoint))
+		elog(ERROR, "cache lookup failed for QhapaqXian checkpoint %u",
+			 summary->checkpointoid);
+
+	replay_lsn = QxEmitSemanticCheckpointRecord(summary->checkpointoid,
+												checkpoint.sessionoid,
+												checkpoint.taskoid,
+												checkpoint.attemptoid,
+												checkpoint.stepoid,
+												checkpoint.ownerid,
+												checkpoint.state,
+												checkpoint.task_state,
+												checkpoint.next_step_seqno,
+												checkpoint.label,
+												checkpoint.data);
+	detail = psprintf("checkpoint_oid=%u;source_lsn=%X/%X;replay_lsn=%X/%X",
+					  summary->checkpointoid,
+					  LSN_FORMAT_ARGS(summary->semantic_lsn),
+					  LSN_FORMAT_ARGS(replay_lsn));
+	(void) QxCatalogInsertTrace(context->tracerel,
+								checkpoint.sessionoid,
+								checkpoint.taskoid,
+								checkpoint.stepoid,
+								checkpoint.ownerid,
+								NULL,
+								QX_TRACE_STATE_CLOSED,
+								QX_RECOVERY_SEMANTIC_REPLAY_TRACE,
+								detail);
+	CommandCounterIncrement();
+	pfree(detail);
+	QxCatalogFreeCheckpointInfo(&checkpoint);
+}
+
+static void
 qx_runtime_recovery_finish(const QxRecoveryReport *report, void *userdata)
 {
 	QxRuntimeRecoveryHooksContext *context = userdata;
@@ -1054,6 +1109,8 @@ qx_runtime_recovery_finish(const QxRecoveryReport *report, void *userdata)
 		list_free_deep(context->queue_entries);
 	context->queue_entries = NIL;
 
+	if (context->tracerel != NULL)
+		table_close(context->tracerel, RowExclusiveLock);
 	if (context->heartbeatledgerrel != NULL)
 		table_close(context->heartbeatledgerrel, RowExclusiveLock);
 	if (context->leaseledgerrel != NULL)
@@ -1061,6 +1118,7 @@ qx_runtime_recovery_finish(const QxRecoveryReport *report, void *userdata)
 	if (context->queueledgerrel != NULL)
 		table_close(context->queueledgerrel, RowExclusiveLock);
 
+	context->tracerel = NULL;
 	context->heartbeatledgerrel = NULL;
 	context->leaseledgerrel = NULL;
 	context->queueledgerrel = NULL;
@@ -1125,7 +1183,7 @@ qx_runtime_failover_recovery_payload(char *base_payload,
 	initStringInfo(&buf);
 	appendStringInfoString(&buf, base_payload != NULL ? base_payload : "");
 	appendStringInfo(&buf,
-					 ";recovery_startup_scan=%s;recovery_failover_rebuild=%s;recovery_tasks_scanned=%d;recovery_attempts_scanned=%d;recovery_checkpoints_scanned=%d;recovery_tasks_requeued=%d;recovery_attempts_fenced=%d;recovery_checkpoints_replayed=%d;recovery_orphan_attempts=%d;recovery_semantic_candidates=%d;recovery_tasks_requeue_suppressed=%d;recovery_attempts_fence_suppressed=%d",
+					 ";recovery_startup_scan=%s;recovery_failover_rebuild=%s;recovery_tasks_scanned=%d;recovery_attempts_scanned=%d;recovery_checkpoints_scanned=%d;recovery_tasks_requeued=%d;recovery_attempts_fenced=%d;recovery_checkpoints_replayed=%d;recovery_orphan_attempts=%d;recovery_semantic_candidates=%d;recovery_checkpoints_replay_suppressed=%d;recovery_tasks_requeue_suppressed=%d;recovery_attempts_fence_suppressed=%d",
 					 qx_bool_literal(report->startup_scan),
 					 qx_bool_literal(report->failover_rebuild),
 					 report->tasks_scanned,
@@ -1136,6 +1194,7 @@ qx_runtime_failover_recovery_payload(char *base_payload,
 					 report->checkpoints_replayed,
 					 report->orphan_attempts,
 					 report->semantic_replay_candidates,
+					 report->checkpoints_replay_suppressed,
 					 report->tasks_requeue_suppressed,
 					 report->attempts_fence_suppressed);
 
@@ -1155,7 +1214,7 @@ qx_runtime_append_recovery_payload(char *base_payload)
 	initStringInfo(&buf);
 	appendStringInfoString(&buf, base_payload != NULL ? base_payload : "");
 	appendStringInfo(&buf,
-					 ";recovery_startup_scan=%s;recovery_tasks_scanned=%d;recovery_attempts_scanned=%d;recovery_checkpoints_scanned=%d;recovery_tasks_requeued=%d;recovery_attempts_fenced=%d;recovery_orphan_attempts=%d;recovery_semantic_candidates=%d;recovery_tasks_requeue_suppressed=%d;recovery_attempts_fence_suppressed=%d",
+					 ";recovery_startup_scan=%s;recovery_tasks_scanned=%d;recovery_attempts_scanned=%d;recovery_checkpoints_scanned=%d;recovery_tasks_requeued=%d;recovery_attempts_fenced=%d;recovery_orphan_attempts=%d;recovery_semantic_candidates=%d;recovery_checkpoints_replay_suppressed=%d;recovery_tasks_requeue_suppressed=%d;recovery_attempts_fence_suppressed=%d",
 					 qx_bool_literal(report->startup_scan),
 					 report->tasks_scanned,
 					 report->attempts_scanned,
@@ -1164,6 +1223,7 @@ qx_runtime_append_recovery_payload(char *base_payload)
 					 report->attempts_fenced,
 					 report->orphan_attempts,
 					 report->semantic_replay_candidates,
+					 report->checkpoints_replay_suppressed,
 					 report->tasks_requeue_suppressed,
 					 report->attempts_fence_suppressed);
 
@@ -3252,6 +3312,9 @@ qx_execute_tool_contract(const char *contract, const char *phase, Oid taskoid,
 		backend_request.seccomp_mode =
 			pstrdup(runtime_policy.seccomp_mode != NULL ?
 					runtime_policy.seccomp_mode : "no-new-privileges");
+		backend_request.cgroup_mode =
+			pstrdup(runtime_policy.cgroup_mode != NULL ?
+					runtime_policy.cgroup_mode : "private");
 		backend_request.oci_profile =
 			pstrdup(runtime_policy.oci_profile != NULL ?
 					runtime_policy.oci_profile : "");
@@ -5732,26 +5795,15 @@ pg_qx_test_run_scheduler_worker_tick(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(cstring_to_text(payload));
 }
 
-Datum
-pg_qx_recovery_scan(PG_FUNCTION_ARGS)
+static Datum
+qx_runtime_recovery_scan_tuple(FunctionCallInfo fcinfo,
+							   QxRecoveryReport *report)
 {
-	QxRecoveryStartupRequest request;
-	QxRecoveryReport *report;
 	TupleDesc	tupdesc;
-	Datum		values[12];
-	bool		nulls[12];
+	Datum		values[13];
+	bool		nulls[13];
 	HeapTuple	tuple;
 
-	memset(&request, 0, sizeof(request));
-	request.databaseoid = MyDatabaseId;
-	request.ownerid = GetUserId();
-	request.include_attempts = true;
-	request.include_checkpoints = true;
-	request.fence_stale_attempts = true;
-	request.requeue_checkpointed_tasks = true;
-	request.rebuild_from_semantic_log = false;
-
-	report = QxRecoveryRunStartupScan(&request, NULL);
 	if (report == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
@@ -5776,12 +5828,52 @@ pg_qx_recovery_scan(PG_FUNCTION_ARGS)
 	values[7] = Int32GetDatum(report->checkpoints_replayed);
 	values[8] = Int32GetDatum(report->orphan_attempts);
 	values[9] = Int32GetDatum(report->semantic_replay_candidates);
-	values[10] = Int32GetDatum(report->tasks_requeue_suppressed);
-	values[11] = Int32GetDatum(report->attempts_fence_suppressed);
+	values[10] = Int32GetDatum(report->checkpoints_replay_suppressed);
+	values[11] = Int32GetDatum(report->tasks_requeue_suppressed);
+	values[12] = Int32GetDatum(report->attempts_fence_suppressed);
 
 	tuple = heap_form_tuple(tupdesc, values, nulls);
 	QxRecoveryFreeReport(report);
-	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+	return HeapTupleGetDatum(tuple);
+}
+
+Datum
+pg_qx_recovery_scan(PG_FUNCTION_ARGS)
+{
+	QxRecoveryStartupRequest request;
+	QxRecoveryReport *report;
+
+	memset(&request, 0, sizeof(request));
+	request.databaseoid = MyDatabaseId;
+	request.ownerid = GetUserId();
+	request.include_attempts = true;
+	request.include_checkpoints = true;
+	request.fence_stale_attempts = true;
+	request.requeue_checkpointed_tasks = true;
+	request.rebuild_from_semantic_log = false;
+
+	report = QxRecoveryRunStartupScan(&request, NULL);
+	PG_RETURN_DATUM(qx_runtime_recovery_scan_tuple(fcinfo, report));
+}
+
+Datum
+pg_qx_recovery_failover_scan(PG_FUNCTION_ARGS)
+{
+	QxRecoveryFailoverRequest request;
+	QxRecoveryReport *report;
+
+	memset(&request, 0, sizeof(request));
+	request.databaseoid = MyDatabaseId;
+	request.ownerid = GetUserId();
+	request.rebuild_task_graph = true;
+	request.rebuild_attempt_graph = true;
+	request.rebuild_checkpoint_graph = true;
+	request.replay_semantic_log = true;
+	request.fence_orphaned_attempts = true;
+	request.requeue_checkpointed_tasks = true;
+
+	report = QxRecoveryRunFailoverRebuild(&request, NULL);
+	PG_RETURN_DATUM(qx_runtime_recovery_scan_tuple(fcinfo, report));
 }
 
 Datum
@@ -5825,12 +5917,48 @@ pg_qx_test_run_failover_rebuild(PG_FUNCTION_ARGS)
 	hooks.begin = qx_runtime_recovery_begin;
 	hooks.requeue_task = qx_runtime_recovery_requeue_task;
 	hooks.fence_attempt = qx_runtime_recovery_fence_attempt;
+	hooks.replay_checkpoint = qx_runtime_recovery_replay_checkpoint;
 	hooks.finish = qx_runtime_recovery_finish;
 	hooks.userdata = &hook_context;
 
 	report = QxRecoveryRunFailoverRebuild(&request, &hooks);
 	payload = qx_runtime_failover_recovery_payload(
 		pstrdup("test=failover_rebuild"), report);
+	QxRecoveryFreeReport(report);
+
+	PG_RETURN_TEXT_P(cstring_to_text(payload));
+}
+
+Datum
+pg_qx_test_run_semantic_replay(PG_FUNCTION_ARGS)
+{
+	QxRecoveryFailoverRequest request;
+	QxRecoveryHooks hooks;
+	QxRecoveryReport *report;
+	QxRuntimeRecoveryHooksContext hook_context;
+	char	   *payload;
+
+	memset(&request, 0, sizeof(request));
+	request.databaseoid = MyDatabaseId;
+	request.ownerid = GetUserId();
+	request.rebuild_task_graph = false;
+	request.rebuild_attempt_graph = false;
+	request.rebuild_checkpoint_graph = true;
+	request.replay_semantic_log = true;
+	request.fence_orphaned_attempts = false;
+	request.requeue_checkpointed_tasks = false;
+
+	memset(&hooks, 0, sizeof(hooks));
+	memset(&hook_context, 0, sizeof(hook_context));
+	hook_context.ownerid = request.ownerid;
+	hooks.begin = qx_runtime_recovery_begin;
+	hooks.replay_checkpoint = qx_runtime_recovery_replay_checkpoint;
+	hooks.finish = qx_runtime_recovery_finish;
+	hooks.userdata = &hook_context;
+
+	report = QxRecoveryRunFailoverRebuild(&request, &hooks);
+	payload = qx_runtime_failover_recovery_payload(
+		pstrdup("test=semantic_replay"), report);
 	QxRecoveryFreeReport(report);
 
 	PG_RETURN_TEXT_P(cstring_to_text(payload));
@@ -6427,5 +6555,39 @@ pg_qx_policy_validate_microvm_assets(PG_FUNCTION_ARGS)
 	qx_runtime_policy_validate_microvm_assets(kernel, initrd, NULL);
 	pfree(kernel);
 	pfree(initrd);
+	PG_RETURN_VOID();
+}
+
+Datum
+pg_qx_test_register_backend_lease(PG_FUNCTION_ARGS)
+{
+	Oid			taskoid = PG_GETARG_OID(0);
+	char	   *instance_id = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	char	   *kind_name = text_to_cstring(PG_GETARG_TEXT_PP(2));
+
+	qx_backend_supervisor_register(taskoid, instance_id,
+								   QxBackendSupervisorLeaseKindFromName(kind_name));
+	pfree(instance_id);
+	pfree(kind_name);
+	PG_RETURN_VOID();
+}
+
+Datum
+pg_qx_test_release_backend_lease(PG_FUNCTION_ARGS)
+{
+	Oid			taskoid = PG_GETARG_OID(0);
+	char	   *instance_id = text_to_cstring(PG_GETARG_TEXT_PP(1));
+
+	qx_backend_supervisor_release(taskoid, instance_id);
+	pfree(instance_id);
+	PG_RETURN_VOID();
+}
+
+Datum
+pg_qx_test_fence_backend_leases(PG_FUNCTION_ARGS)
+{
+	Oid			taskoid = PG_GETARG_OID(0);
+
+	qx_backend_supervisor_fence_stale(taskoid);
 	PG_RETURN_VOID();
 }

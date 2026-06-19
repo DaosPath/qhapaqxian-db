@@ -2088,6 +2088,11 @@ pg_stat_qx_agents| SELECT a.oid AS agent_oid,
      LEFT JOIN pg_namespace n ON ((n.oid = a.qxagentnamespace)))
      LEFT JOIN pg_qx_namespace qxn ON ((qxn.oid = a.qxnamespacepolicyid)))
   WHERE (pg_has_role(SESSION_USER, a.qxagentowner, 'USAGE'::text) OR pg_has_role(SESSION_USER, 'pg_read_all_stats'::name, 'MEMBER'::text));
+pg_stat_qx_backend_supervisor| SELECT register_count,
+    release_count,
+    fence_count,
+    active_lease_count
+   FROM pg_qx_stat_get_backend_supervisor_stats() stats(register_count bigint, release_count bigint, fence_count bigint, active_lease_count integer);
 pg_stat_qx_operator_dashboard| SELECT 'providers'::text AS surface,
     count(*) AS entity_count,
     COALESCE(sum(s.execution_count), ((0)::bigint)::numeric) AS execution_count,

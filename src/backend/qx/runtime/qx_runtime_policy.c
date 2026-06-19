@@ -43,6 +43,11 @@ qx_runtime_policy_free(QxRuntimePolicy *policy)
 		pfree(policy->seccomp_mode);
 		policy->seccomp_mode = NULL;
 	}
+	if (policy->cgroup_mode != NULL)
+	{
+		pfree(policy->cgroup_mode);
+		policy->cgroup_mode = NULL;
+	}
 	if (policy->oci_profile != NULL)
 	{
 		pfree(policy->oci_profile);
@@ -133,6 +138,7 @@ qx_runtime_policy_from_authz(const QxToolAuthorization *authz,
 	char		image_value[256];
 	char		readonly_value[64];
 	char		seccomp_value[64];
+	char		cgroup_value[64];
 	char		kernel_value[256];
 	char		initrd_value[256];
 	char		snapshot_value[256];
@@ -177,6 +183,15 @@ qx_runtime_policy_from_authz(const QxToolAuthorization *authz,
 										 sizeof(seccomp_value)) &&
 			 seccomp_value[0] != '\0')
 		policy->seccomp_mode = pstrdup(seccomp_value);
+
+	if (qx_runtime_policy_tag_value(tags, "cgroup_mode:", cgroup_value,
+									sizeof(cgroup_value)) &&
+		cgroup_value[0] != '\0')
+		policy->cgroup_mode = pstrdup(cgroup_value);
+	else if (qx_runtime_policy_tag_value(tags, "cgroup:", cgroup_value,
+										 sizeof(cgroup_value)) &&
+			 cgroup_value[0] != '\0')
+		policy->cgroup_mode = pstrdup(cgroup_value);
 
 	if (qx_runtime_policy_tag_value(tags, "image:", image_value,
 									sizeof(image_value)) &&
@@ -307,6 +322,15 @@ qx_runtime_policy_compile_container(QxRuntimePolicy *policy)
 				 errmsg("unsupported container seccomp mode \"%s\"",
 						policy->seccomp_mode)));
 
+	if (policy->cgroup_mode == NULL || policy->cgroup_mode[0] == '\0')
+		policy->cgroup_mode = pstrdup("private");
+	else if (pg_strcasecmp(policy->cgroup_mode, "host") != 0 &&
+			 pg_strcasecmp(policy->cgroup_mode, "private") != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("unsupported container cgroup mode \"%s\"",
+						policy->cgroup_mode)));
+
 	if (policy->oci_profile != NULL)
 	{
 		pfree(policy->oci_profile);
@@ -315,11 +339,12 @@ qx_runtime_policy_compile_container(QxRuntimePolicy *policy)
 
 	initStringInfo(&profile);
 	appendStringInfo(&profile,
-					 "network=%s;privilege_escalation=%s;readonly_rootfs=%s;seccomp=%s;image=%s",
+					 "network=%s;privilege_escalation=%s;readonly_rootfs=%s;seccomp=%s;cgroup=%s;image=%s",
 					 policy->allow_network ? "allow" : "deny",
 					 policy->allow_privilege_escalation ? "allow" : "deny",
 					 policy->readonly_rootfs ? "true" : "false",
 					 policy->seccomp_mode,
+					 policy->cgroup_mode,
 					 policy->image_ref != NULL ? policy->image_ref : "");
 	policy->oci_profile = profile.data;
 }

@@ -12,4 +12,8 @@ SELECT pg_qx_policy_compile_container(
   'network:deny|privilege_escalation:deny|seccomp_mode:no-new-privileges'
 ) LIKE '%seccomp=no-new-privileges%' AS seccomp_tag_honored;
 
+SELECT pg_qx_policy_compile_container(
+  'network:deny|privilege_escalation:deny|cgroup_mode:host|image:alpine:3.20'
+) LIKE '%cgroup=host%' AS cgroup_tag_honored;
+
 SELECT pg_qx_policy_validate_image('alpine:3.20');

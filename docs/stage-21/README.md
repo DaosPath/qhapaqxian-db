@@ -24,6 +24,9 @@ What landed:
 - on Windows, the Meson packaging for `qhapaqxian-tool-runner` now stages the
   required OpenSSL runtime DLLs into `bindir` so minimal-environment execution
   still works after `PATH` is stripped by the sandbox launcher.
+- `qx_remote_ed25519_private.pem` is a deterministic regression-only fixture;
+  the test setup copies it into the temporary test `bindir`, while production
+  `meson install` and `make install` exclude it.
 
 Why this stage matters:
 - Stage 20 proved the provider boundary with HMAC, but that still assumed a
@@ -34,8 +37,8 @@ Why this stage matters:
   runtime, not yet a container or microVM executor.
 
 What this stage still does not pretend to solve:
-- signer material is still bindir-local bootstrap material, not a hardware root
-  of trust or external certificate chain;
+- production signer provisioning remains external to this bootstrap; the
+  regression fixture is not a hardware root of trust or deployable credential;
 - the backend still brokers remote-provider execution through the shipped tool
   runner, not through a direct remote transport;
 - containerized principals and microVM-backed providers remain the next deeper

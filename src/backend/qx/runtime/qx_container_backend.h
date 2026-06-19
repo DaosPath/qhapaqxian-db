@@ -39,6 +39,7 @@ typedef struct QxContainerBackendRequest
 	char	   *command_line;
 	char	   *image_ref;
 	char	   *seccomp_mode;
+	char	   *cgroup_mode;
 	char	   *oci_profile;
 	char	   *receipt_schema;
 	char	   *receipt_alg;

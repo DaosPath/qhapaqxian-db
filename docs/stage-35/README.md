@@ -31,11 +31,22 @@ write paths behind `qx_catalog` helpers.
   on the real Docker submit trace and `has_vm_id` / `vm_id_populated` on the
   real QEMU microVM resume trace.
 
+## Stage 35 follow-up (supervisor + cgroup)
+
+- container policy compilation now emits `cgroup=host|private` in the OCI
+  profile and forwards `cgroup_mode` through launch requests to the runner;
+- the tool runner applies `--cgroupns host|private` on real Docker launches;
+- `pg_qx_backend_supervisor_list()`, `pg_qx_stat_get_backend_supervisor_stats()`,
+  and `pg_stat_qx_backend_supervisor` expose shared-memory active backend leases and
+  register/release/fence counters across database processes;
+- `qx_stage35_supervisor` uses a second `dblink` session to validate cross-process
+  visibility plus list/stats/idempotence without Docker.
+
 ## What is intentionally deferred
 
-- Full OCI cgroup/seccomp policy compilation.
-- Deeper cross-process microVM lifecycle ownership beyond supervisor
-  register/release.
+- Full cgroup namespace ownership beyond Docker CLI flags.
+- External container/microVM termination and orphan-process reaping beyond
+  shared lease register/release/fence.
 - Historical/SLO accounting and operator dashboards (Stage 34 follow-up).
 
 ## Why this stage matters
@@ -66,6 +77,6 @@ catalog writes now follow the same consolidation direction as Stage 32 reads.
 
 ## Next stage handoff
 
-- Deepen OCI cgroup/seccomp policy compilation and cross-process VM lifecycle
-  ownership beyond the in-memory supervisor registry.
+- Deepen OCI cgroup/seccomp policy compilation and external VM lifecycle
+  ownership beyond the shared-memory supervisor registry.
 - Add historical stats persistence on top of the Stage 34 collector surfaces.

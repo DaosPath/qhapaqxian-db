@@ -85,6 +85,8 @@ static void qx_catalog_set_nodetree_datum(Datum *values, bool *nulls,
 										  AttrNumber attnum, const void *node);
 static char *qx_catalog_merge_optional_pair(const char *left,
 											const char *right);
+static char *qx_catalog_heap_text_attr(Relation rel, HeapTuple tup,
+									   AttrNumber attnum);
 
 char *
 QxCatalogTextAttr(HeapTuple tup, AttrNumber attnum, int cacheid)
@@ -1210,6 +1212,65 @@ QxCatalogLookupAttemptByOid(Oid attemptoid, QxCatalogAttemptInfo *info)
 	qx_catalog_fill_attempt_info(tup, info);
 	ReleaseSysCache(tup);
 	return true;
+}
+
+#define QX_RECOVERY_SEMANTIC_REPLAY_TRACE "recovery.semantic_replay"
+
+bool
+QxCatalogCheckpointHasSemanticReplay(Oid databaseoid, Oid taskoid,
+									 Oid checkpointoid)
+{
+	Relation	rel;
+	TableScanDesc scan;
+	HeapTuple	tup;
+	bool		found = false;
+	char		keybuf[48];
+
+	if (!OidIsValid(databaseoid) || !OidIsValid(taskoid) ||
+		!OidIsValid(checkpointoid))
+		return false;
+
+	snprintf(keybuf, sizeof(keybuf), "checkpoint_oid=%u;",
+			 checkpointoid);
+
+	rel = table_open(QxTraceRelationId, AccessShareLock);
+	scan = table_beginscan_catalog(rel, 0, NULL);
+	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	{
+		Form_pg_qx_trace form = (Form_pg_qx_trace) GETSTRUCT(tup);
+		char	   *name;
+		char	   *detail;
+
+		if (form->qxtracedbid != databaseoid ||
+			form->qxtracetaskid != taskoid)
+			continue;
+
+		name = qx_catalog_heap_text_attr(rel, tup,
+										 Anum_pg_qx_trace_qxtracename);
+		if (name == NULL || strcmp(name, QX_RECOVERY_SEMANTIC_REPLAY_TRACE) != 0)
+		{
+			if (name != NULL)
+				pfree(name);
+			continue;
+		}
+		pfree(name);
+
+		detail = qx_catalog_heap_text_attr(rel, tup,
+										   Anum_pg_qx_trace_qxtracedetail);
+		if (detail != NULL)
+		{
+			if (strstr(detail, keybuf) != NULL)
+				found = true;
+			pfree(detail);
+		}
+
+		if (found)
+			break;
+	}
+	table_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	return found;
 }
 
 bool

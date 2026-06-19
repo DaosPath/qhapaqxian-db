@@ -17,6 +17,7 @@ typedef struct QxRuntimePolicy
 	bool		readonly_rootfs;
 	char	   *image_ref;
 	char	   *seccomp_mode;
+	char	   *cgroup_mode;
 	char	   *oci_profile;
 	char	   *kernel_ref;
 	char	   *initrd_ref;
