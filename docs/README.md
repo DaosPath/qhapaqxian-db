@@ -1,5 +1,7 @@
 # QhapaqXian DB Documentation Map
 
+![QhapaqXian DB stage map](assets/qhapaqxian-stage-map.svg)
+
 This file is the canonical map of the repository documentation tree.
 
 Use these documents in this order:
@@ -38,7 +40,7 @@ Recommended reading paths:
   - [stage-9/README.md](./stage-9/README.md)
   - [stage-16/README.md](./stage-16/README.md)
   - [stage-22/README.md](./stage-22/README.md)
-  - [stage-23/README.md](./stage-23/README.md) through [stage-32/README.md](./stage-32/README.md)
+  - [stage-23/README.md](./stage-23/README.md) through [stage-35/README.md](./stage-35/README.md)
 - Operations and maintenance:
   - [bootstrap-plan.md](./bootstrap-plan.md)
   - [patch-ledger.md](./patch-ledger.md)
@@ -54,3 +56,9 @@ Interpretation rules:
 - if two documents conflict on current state, [STATUS.md](../STATUS.md) wins
 - if two documents conflict on target design, the blueprint or the relevant ADR wins
 - older stage docs are additive history; they do not override the current-state ledger
+
+Stage normalization status:
+- stages 2-12 use the early bootstrap shape and remain historical context
+- stages 13-21 cover security/runtime bootstrap and should be read with the current stage matrix open
+- stages 22-35 are the current runtime/observability spine and are the preferred implementation trail
+- new stage docs should follow [stage-template.md](./stage-template.md)

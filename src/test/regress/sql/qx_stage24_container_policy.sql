@@ -16,4 +16,8 @@ SELECT pg_qx_policy_compile_container(
   'network:deny|privilege_escalation:deny|cgroup_mode:host|image:alpine:3.20'
 ) LIKE '%cgroup=host%' AS cgroup_tag_honored;
 
+SELECT pg_qx_policy_compile_container(
+  'network:deny|privilege_escalation:deny|seccomp_mode:strict|cgroup_mode:isolated|image:alpine:3.20'
+) LIKE '%seccomp=strict%cgroup=isolated%' AS hardened_policy_profile;
+
 SELECT pg_qx_policy_validate_image('alpine:3.20');

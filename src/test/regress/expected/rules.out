@@ -2142,6 +2142,14 @@ UNION ALL
            FROM pg_stat_qx_stat_history h
           WHERE (h.scope = 'recovery'::text)) AS last_snapshot_at
    FROM pg_qx_stat_get_recovery_stats() stats(startup_scan_count bigint, failover_rebuild_count bigint, tasks_requeued bigint, attempts_fenced bigint, tasks_requeue_suppressed bigint, attempts_fence_suppressed bigint);
+pg_stat_qx_operator_export| SELECT surface,
+    entity_count,
+    execution_count,
+    verified_receipts,
+    rejected_receipts,
+    last_snapshot_at,
+    jsonb_build_object('surface', surface, 'entity_count', entity_count, 'execution_count', execution_count, 'verified_receipts', verified_receipts, 'rejected_receipts', rejected_receipts, 'last_snapshot_at', last_snapshot_at) AS export_payload
+   FROM pg_stat_qx_operator_dashboard d;
 pg_stat_qx_principals| SELECT p.oid AS principal_oid,
     n.nspname AS schemaname,
     p.qxprincipalname AS principal_name,

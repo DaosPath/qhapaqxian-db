@@ -177,6 +177,20 @@ WHERE surface = 'providers';
  t
 (1 row)
 
+SELECT export_payload ? 'surface' AS dashboard_export_visible
+FROM pg_stat_qx_operator_export
+WHERE surface = 'providers';
+ dashboard_export_visible 
+--------------------------
+ t
+(1 row)
+
+SELECT pg_qx_stat_prune_history(now() + interval '1 day') > 0 AS history_pruned;
+ history_pruned 
+----------------
+ t
+(1 row)
+
 SELECT pg_qx_stat_reset('provider');
  pg_qx_stat_reset 
 ------------------

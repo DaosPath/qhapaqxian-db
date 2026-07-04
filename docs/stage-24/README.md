@@ -26,6 +26,9 @@ Policy compilation (Stage 24 gap closure):
 - `readonly_rootfs` defaults to `true` for container launches;
 - `seccomp_mode` is `no-new-privileges` unless privilege escalation is allowed
   or an explicit `seccomp_mode:` / `seccomp:` tag overrides it;
+- accepted seccomp modes are `no-new-privileges`, `runtime-default`,
+  `strict`, and `unconfined`;
+- accepted cgroup modes are `private`, `isolated`, and `host`;
 - `QX_CONTAINER_IMAGE_ALLOWLIST` is enforced through
   `qx_runtime_policy_validate_image_ref()` before launch;
 - compiled policy fields are emitted in `QxContainerBackendRequest` launch
@@ -74,8 +77,8 @@ Post-stage integration note:
   `PATH`;
 - WSL may call Docker Desktop through Windows `docker.exe` and
   `DOCKER_HOST=npipe:////./pipe/dockerDesktopLinuxEngine`;
-- the remaining gap is not "fake container launch" anymore, but deeper OCI
-  ownership such as full rootless OCI profiles, cgroup namespaces, and richer
-  container lifecycle supervision.
+- the remaining gap is not "fake container launch" anymore; the compiler now
+  exposes hardened seccomp/cgroup modes, while full rootless OCI profile
+  materialization and kernel-level namespace ownership remain future work.
 - operational setup and validation commands live in
   `../real-runtime-backends.md`.

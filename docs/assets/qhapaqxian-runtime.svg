@@ -1,0 +1,57 @@
+<svg width="1120" height="420" viewBox="0 0 1120 420" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">QhapaqXian DB runtime architecture</title>
+  <desc id="desc">Native agent SQL flows through catalogs, policy, scheduler, runtime backends, receipts, and operator observability.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1120" y2="420" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0F172A"/>
+      <stop offset="0.55" stop-color="#123247"/>
+      <stop offset="1" stop-color="#0B3B2E"/>
+    </linearGradient>
+    <linearGradient id="gold" x1="48" y1="32" x2="1036" y2="370" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F8D56B"/>
+      <stop offset="1" stop-color="#E58E26"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="14" stdDeviation="12" flood-color="#020617" flood-opacity="0.32"/>
+    </filter>
+  </defs>
+  <rect width="1120" height="420" rx="28" fill="url(#bg)"/>
+  <path d="M64 300L196 126L310 252L420 108L548 260L664 128L800 262L924 114L1056 300" stroke="url(#gold)" stroke-width="12" stroke-linecap="round" stroke-linejoin="round" opacity="0.28"/>
+  <text x="56" y="74" fill="#F8FAFC" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="34" font-weight="800">QhapaqXian DB</text>
+  <text x="56" y="110" fill="#BAE6FD" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="17">PostgreSQL fork with native agent runtime semantics</text>
+  <g filter="url(#shadow)" font-family="Inter,Segoe UI,Arial,sans-serif">
+    <rect x="58" y="164" width="170" height="86" rx="18" fill="#F8FAFC"/>
+    <text x="82" y="198" fill="#0F172A" font-size="18" font-weight="800">Agent SQL</text>
+    <text x="82" y="224" fill="#475569" font-size="13">CREATE AGENT</text>
+    <text x="82" y="242" fill="#475569" font-size="13">RUN TASK</text>
+    <rect x="276" y="164" width="170" height="86" rx="18" fill="#ECFEFF"/>
+    <text x="300" y="198" fill="#0F172A" font-size="18" font-weight="800">Catalogs</text>
+    <text x="300" y="224" fill="#475569" font-size="13">session / task</text>
+    <text x="300" y="242" fill="#475569" font-size="13">trace / checkpoint</text>
+    <rect x="494" y="164" width="170" height="86" rx="18" fill="#F0FDF4"/>
+    <text x="518" y="198" fill="#0F172A" font-size="18" font-weight="800">Policy</text>
+    <text x="518" y="224" fill="#475569" font-size="13">capabilities</text>
+    <text x="518" y="242" fill="#475569" font-size="13">seccomp / cgroup</text>
+    <rect x="712" y="164" width="170" height="86" rx="18" fill="#FFF7ED"/>
+    <text x="736" y="198" fill="#0F172A" font-size="18" font-weight="800">Runtime</text>
+    <text x="736" y="224" fill="#475569" font-size="13">host / Docker</text>
+    <text x="736" y="242" fill="#475569" font-size="13">QEMU microVM</text>
+    <rect x="930" y="164" width="132" height="86" rx="18" fill="#FEF2F2"/>
+    <text x="954" y="198" fill="#0F172A" font-size="18" font-weight="800">Ops</text>
+    <text x="954" y="224" fill="#475569" font-size="13">SLO views</text>
+    <text x="954" y="242" fill="#475569" font-size="13">export JSON</text>
+  </g>
+  <g stroke="#E0F2FE" stroke-width="4" stroke-linecap="round" opacity="0.78">
+    <path d="M232 207H272"/>
+    <path d="M450 207H490"/>
+    <path d="M668 207H708"/>
+    <path d="M886 207H926"/>
+  </g>
+  <g fill="#F8D56B" opacity="0.95">
+    <circle cx="252" cy="207" r="5"/>
+    <circle cx="470" cy="207" r="5"/>
+    <circle cx="688" cy="207" r="5"/>
+    <circle cx="906" cy="207" r="5"/>
+  </g>
+  <text x="56" y="344" fill="#E2E8F0" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="15">Current focus: real runtime backends, durable observability, shared supervisor leases, and operator export surfaces.</text>
+</svg>

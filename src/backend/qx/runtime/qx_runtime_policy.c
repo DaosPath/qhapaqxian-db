@@ -16,6 +16,7 @@ static bool qx_runtime_policy_tag_value(const char *serialized,
 										const char *prefix,
 										char *dest, size_t destlen);
 static bool qx_runtime_policy_parse_bool_tag(const char *value, bool default_value);
+static bool qx_runtime_policy_mode_is(const char *value, const char *expected);
 
 void
 qx_runtime_policy_init(QxRuntimePolicy *policy)
@@ -126,6 +127,13 @@ qx_runtime_policy_parse_bool_tag(const char *value, bool default_value)
 		return false;
 
 	return default_value;
+}
+
+static bool
+qx_runtime_policy_mode_is(const char *value, const char *expected)
+{
+	return value != NULL && expected != NULL &&
+		pg_strcasecmp(value, expected) == 0;
 }
 
 void
@@ -315,8 +323,10 @@ qx_runtime_policy_compile_container(QxRuntimePolicy *policy)
 		else
 			policy->seccomp_mode = pstrdup("no-new-privileges");
 	}
-	else if (pg_strcasecmp(policy->seccomp_mode, "unconfined") != 0 &&
-			 pg_strcasecmp(policy->seccomp_mode, "no-new-privileges") != 0)
+	else if (!qx_runtime_policy_mode_is(policy->seccomp_mode, "unconfined") &&
+			 !qx_runtime_policy_mode_is(policy->seccomp_mode, "no-new-privileges") &&
+			 !qx_runtime_policy_mode_is(policy->seccomp_mode, "runtime-default") &&
+			 !qx_runtime_policy_mode_is(policy->seccomp_mode, "strict"))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("unsupported container seccomp mode \"%s\"",
@@ -324,8 +334,9 @@ qx_runtime_policy_compile_container(QxRuntimePolicy *policy)
 
 	if (policy->cgroup_mode == NULL || policy->cgroup_mode[0] == '\0')
 		policy->cgroup_mode = pstrdup("private");
-	else if (pg_strcasecmp(policy->cgroup_mode, "host") != 0 &&
-			 pg_strcasecmp(policy->cgroup_mode, "private") != 0)
+	else if (!qx_runtime_policy_mode_is(policy->cgroup_mode, "host") &&
+			 !qx_runtime_policy_mode_is(policy->cgroup_mode, "private") &&
+			 !qx_runtime_policy_mode_is(policy->cgroup_mode, "isolated"))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("unsupported container cgroup mode \"%s\"",

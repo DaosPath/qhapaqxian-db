@@ -2573,6 +2573,25 @@ UNION ALL
                                                   attempts_fence_suppressed bigint);
 
 
+CREATE VIEW pg_stat_qx_operator_export WITH (security_barrier) AS
+    SELECT
+        d.surface,
+        d.entity_count,
+        d.execution_count,
+        d.verified_receipts,
+        d.rejected_receipts,
+        d.last_snapshot_at,
+        jsonb_build_object(
+            'surface', d.surface,
+            'entity_count', d.entity_count,
+            'execution_count', d.execution_count,
+            'verified_receipts', d.verified_receipts,
+            'rejected_receipts', d.rejected_receipts,
+            'last_snapshot_at', d.last_snapshot_at
+        ) AS export_payload
+    FROM pg_stat_qx_operator_dashboard d;
+
+
 GRANT SELECT ON pg_stat_qx_agents TO PUBLIC;
 GRANT SELECT ON pg_stat_qx_sessions TO PUBLIC;
 GRANT SELECT ON pg_stat_qx_tasks TO PUBLIC;
@@ -2593,6 +2612,7 @@ GRANT SELECT ON pg_stat_qx_runtime_classes TO PUBLIC;
 GRANT SELECT ON pg_stat_qx_stat_history TO PUBLIC;
 GRANT SELECT ON pg_stat_qx_slo_providers TO PUBLIC;
 GRANT SELECT ON pg_stat_qx_operator_dashboard TO PUBLIC;
+GRANT SELECT ON pg_stat_qx_operator_export TO PUBLIC;
 
 REVOKE ALL ON pg_qx_agent FROM PUBLIC;
 REVOKE ALL ON pg_qx_session FROM PUBLIC;
@@ -2620,3 +2640,4 @@ REVOKE ALL ON FUNCTION pg_qx_test_run_scheduler_worker_tick() FROM PUBLIC;
 REVOKE ALL ON FUNCTION pg_qx_policy_compile_container(text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION pg_qx_policy_validate_image(text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION pg_qx_policy_validate_microvm_assets(text, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION pg_qx_stat_prune_history(timestamptz) FROM PUBLIC;

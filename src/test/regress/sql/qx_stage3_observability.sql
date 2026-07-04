@@ -142,6 +142,12 @@ SELECT entity_count > 0 AND last_snapshot_at IS NOT NULL AS dashboard_providers_
 FROM pg_stat_qx_operator_dashboard
 WHERE surface = 'providers';
 
+SELECT export_payload ? 'surface' AS dashboard_export_visible
+FROM pg_stat_qx_operator_export
+WHERE surface = 'providers';
+
+SELECT pg_qx_stat_prune_history(now() + interval '1 day') > 0 AS history_pruned;
+
 SELECT pg_qx_stat_reset('provider');
 
 SELECT COALESCE(max(submit_count), 0) = 0 AS provider_stats_cleared

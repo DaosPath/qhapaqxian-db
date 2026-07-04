@@ -1,0 +1,49 @@
+<svg width="1120" height="220" viewBox="0 0 1120 220" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">QhapaqXian DB stage map</title>
+  <desc id="desc">Stage progression from language, catalogs, security, runtimes, scheduler, recovery, observability, to supervisor hardening.</desc>
+  <rect width="1120" height="220" rx="24" fill="#F8FAFC"/>
+  <path d="M70 112H1048" stroke="#CBD5E1" stroke-width="8" stroke-linecap="round"/>
+  <g font-family="Inter,Segoe UI,Arial,sans-serif">
+    <g>
+      <circle cx="102" cy="112" r="30" fill="#0F766E"/>
+      <text x="102" y="119" text-anchor="middle" fill="white" font-size="19" font-weight="800">2</text>
+      <text x="102" y="166" text-anchor="middle" fill="#334155" font-size="13">language</text>
+    </g>
+    <g>
+      <circle cx="226" cy="112" r="30" fill="#0369A1"/>
+      <text x="226" y="119" text-anchor="middle" fill="white" font-size="19" font-weight="800">4</text>
+      <text x="226" y="166" text-anchor="middle" fill="#334155" font-size="13">catalogs</text>
+    </g>
+    <g>
+      <circle cx="350" cy="112" r="30" fill="#7C3AED"/>
+      <text x="350" y="119" text-anchor="middle" fill="white" font-size="19" font-weight="800">16</text>
+      <text x="350" y="166" text-anchor="middle" fill="#334155" font-size="13">runtime</text>
+    </g>
+    <g>
+      <circle cx="474" cy="112" r="30" fill="#B45309"/>
+      <text x="474" y="119" text-anchor="middle" fill="white" font-size="19" font-weight="800">22</text>
+      <text x="474" y="166" text-anchor="middle" fill="#334155" font-size="13">classes</text>
+    </g>
+    <g>
+      <circle cx="598" cy="112" r="30" fill="#BE123C"/>
+      <text x="598" y="119" text-anchor="middle" fill="white" font-size="19" font-weight="800">24</text>
+      <text x="598" y="166" text-anchor="middle" fill="#334155" font-size="13">container</text>
+    </g>
+    <g>
+      <circle cx="722" cy="112" r="30" fill="#0E7490"/>
+      <text x="722" y="119" text-anchor="middle" fill="white" font-size="19" font-weight="800">25</text>
+      <text x="722" y="166" text-anchor="middle" fill="#334155" font-size="13">microVM</text>
+    </g>
+    <g>
+      <circle cx="846" cy="112" r="30" fill="#15803D"/>
+      <text x="846" y="119" text-anchor="middle" fill="white" font-size="19" font-weight="800">34</text>
+      <text x="846" y="166" text-anchor="middle" fill="#334155" font-size="13">observe</text>
+    </g>
+    <g>
+      <circle cx="970" cy="112" r="34" fill="#111827"/>
+      <text x="970" y="119" text-anchor="middle" fill="white" font-size="19" font-weight="800">35+</text>
+      <text x="970" y="166" text-anchor="middle" fill="#334155" font-size="13">supervisor</text>
+    </g>
+  </g>
+  <text x="56" y="48" fill="#0F172A" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="22" font-weight="800">Bootstrap stage spine</text>
+</svg>

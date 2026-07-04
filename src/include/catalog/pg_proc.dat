@@ -12302,5 +12302,9 @@
   proname => 'pg_qx_test_fence_backend_leases', provolatile => 'v',
   prorettype => 'void', proargtypes => 'oid',
   prosrc => 'pg_qx_test_fence_backend_leases' },
+{ oid => '9229', descr => 'prune durable QX stat history older than cutoff',
+  proname => 'pg_qx_stat_prune_history', provolatile => 'v',
+  proparallel => 'r', proisstrict => 't', prorettype => 'int8',
+  proargtypes => 'timestamptz', prosrc => 'pg_qx_stat_prune_history' },
 
 ]

@@ -33,8 +33,11 @@ write paths behind `qx_catalog` helpers.
 
 ## Stage 35 follow-up (supervisor + cgroup)
 
-- container policy compilation now emits `cgroup=host|private` in the OCI
+- container policy compilation now emits `cgroup=host|private|isolated` in the OCI
   profile and forwards `cgroup_mode` through launch requests to the runner;
+- seccomp compilation now accepts `no-new-privileges`, `runtime-default`,
+  `strict`, and `unconfined`, so hardened profiles can be asserted without
+  Docker availability;
 - the tool runner applies `--cgroupns host|private` on real Docker launches;
 - `pg_qx_backend_supervisor_list()`, `pg_qx_stat_get_backend_supervisor_stats()`,
   and `pg_stat_qx_backend_supervisor` expose shared-memory active backend leases and
@@ -47,7 +50,7 @@ write paths behind `qx_catalog` helpers.
 - Full cgroup namespace ownership beyond Docker CLI flags.
 - External container/microVM termination and orphan-process reaping beyond
   shared lease register/release/fence.
-- Historical/SLO accounting and operator dashboards (Stage 34 follow-up).
+- External graphical operator UI beyond the Stage 34 SQL export surface.
 
 ## Why this stage matters
 
@@ -77,6 +80,6 @@ catalog writes now follow the same consolidation direction as Stage 32 reads.
 
 ## Next stage handoff
 
-- Deepen OCI cgroup/seccomp policy compilation and external VM lifecycle
-  ownership beyond the shared-memory supervisor registry.
-- Add historical stats persistence on top of the Stage 34 collector surfaces.
+- Materialize full OCI/rootless profiles and kernel-level namespace ownership.
+- Add external VM/container termination/reaping beyond shared-memory fence
+  accounting when a portable process-control plane is available.

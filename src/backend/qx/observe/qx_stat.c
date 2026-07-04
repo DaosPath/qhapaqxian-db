@@ -1347,6 +1347,39 @@ pg_qx_stat_snapshot(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64(written);
 }
 
+Datum
+pg_qx_stat_prune_history(PG_FUNCTION_ARGS)
+{
+	TimestampTz cutoff;
+	Relation	rel;
+	TableScanDesc scan;
+	HeapTuple	tup;
+	int64		removed = 0;
+
+	cutoff = PG_GETARG_TIMESTAMPTZ(0);
+
+	rel = table_open(QxStatHistoryRelationId, RowExclusiveLock);
+	scan = table_beginscan_catalog(rel, 0, NULL);
+
+	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	{
+		Form_pg_qx_stat_history row = (Form_pg_qx_stat_history) GETSTRUCT(tup);
+
+		if (row->qxstathistorydbid != MyDatabaseId)
+			continue;
+		if (row->qxstathistorycaptured >= cutoff)
+			continue;
+
+		CatalogTupleDelete(rel, &tup->t_self);
+		removed++;
+	}
+
+	table_endscan(scan);
+	table_close(rel, RowExclusiveLock);
+
+	PG_RETURN_INT64(removed);
+}
+
 typedef struct QxStatHistorySrfState
 {
 	Relation	rel;

@@ -19,6 +19,8 @@ SRFs, collector-backed views, and a minimal historical/SLO operator layer.
 - `pg_qx_stat_snapshot(text scope)` captures live counters for
   `provider`, `principal`, `runtime_class`, `scheduler`, `recovery`, or `all`;
 - `pg_qx_stat_get_history(text scope, timestamptz since)` reads durable rows;
+- `pg_qx_stat_prune_history(timestamptz cutoff)` removes old rows for the
+  current database so operators can enforce retention from SQL or a scheduler;
 - `pg_stat_qx_stat_history` exposes the history SRF to operators.
 
 ## SLO and dashboard surfaces
@@ -27,14 +29,17 @@ SRFs, collector-backed views, and a minimal historical/SLO operator layer.
   coverage percentages from live collector counters;
 - `pg_stat_qx_operator_dashboard` rolls up entity counts, execution totals,
   receipt outcomes, and the latest snapshot timestamp per surface.
+- `pg_stat_qx_operator_export` adds a stable JSONB payload per dashboard
+  surface for downstream operator UIs or export jobs.
 
 ## Tests
 
 - `src/test/regress/sql/qx_stage3_observability.sql` asserts collector reset
-  behavior, snapshot/history persistence, SLO visibility, and dashboard rows.
+  behavior, snapshot/history persistence, SLO visibility, dashboard rows,
+  JSON export visibility, and history pruning.
 
 ## Intentional deferrals
 
-- long-horizon retention policy and automatic snapshot scheduling remain open;
-- external operator UI/export formats remain future work on top of the SQL
-  dashboard surfaces landed here.
+- automatic snapshot scheduling remains open;
+- external graphical operator UI remains future work, but the SQL export
+  contract is now present.
